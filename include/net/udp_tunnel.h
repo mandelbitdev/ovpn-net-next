@@ -221,7 +221,7 @@ static inline void udp_tunnel_encap_enable(struct sock *sk)
 
 static inline void udp_tunnel_encap_disable(struct sock *sk)
 {
-	if (udp_test_and_set_bit(ENCAP_ENABLED, sk))
+	if (!udp_test_and_clear_bit(ENCAP_ENABLED, sk))
 		return;
 
 #if IS_ENABLED(CONFIG_IPV6)
