@@ -134,8 +134,21 @@ drop_noovpn:
 static bool ovpn_route_key_equal(const struct ovpn_route_key *a,
 				 const struct ovpn_route_key *b)
 {
-	return a->oif == b->oif && a->mark == b->mark &&
-	       a->sport == b->sport;
+	if (unlikely(a->oif != b->oif || a->mark != b->mark ||
+		     a->sport != b->sport || a->family != b->family ||
+		     a->saddr_from_sock != b->saddr_from_sock))
+		return false;
+
+	switch (a->family) {
+	case AF_INET:
+		return a->saddr.ipv4 == b->saddr.ipv4;
+#if IS_ENABLED(CONFIG_IPV6)
+	case AF_INET6:
+		return ipv6_addr_equal(&a->saddr.ipv6, &b->saddr.ipv6);
+#endif
+	default:
+		return true;
+	}
 }
 
 /**
@@ -217,14 +230,14 @@ static bool ovpn_dst_cache_current(const struct ovpn_peer *peer,
 static int ovpn_udp4_output(struct ovpn_peer *peer, struct ovpn_bind *bind,
 			    struct dst_cache *cache, struct sock *sk,
 			    struct sk_buff *skb,
-			    const struct ovpn_route_key *key)
+			    struct ovpn_route_key *key)
 {
 	struct sockaddr_storage remote;
 	struct in_addr local = {};
 	bool reset_local = false;
 	struct rtable *rt;
 	struct flowi4 fl = {
-		.saddr = bind->local.ipv4.s_addr,
+		.saddr = key->saddr.ipv4,
 		.daddr = bind->remote.in4.sin_addr.s_addr,
 		.fl4_sport = key->sport,
 		.fl4_dport = bind->remote.in4.sin_port,
@@ -239,19 +252,24 @@ static int ovpn_udp4_output(struct ovpn_peer *peer, struct ovpn_bind *bind,
 	if (rt)
 		goto transmit;
 
-	if (fl.saddr && unlikely(!inet_confirm_addr(sock_net(sk), NULL, 0,
-						    fl.saddr, RT_SCOPE_HOST))) {
+	if (!key->saddr_from_sock && fl.saddr &&
+	    unlikely(!inet_confirm_addr(sock_net(sk), NULL, 0, fl.saddr,
+					RT_SCOPE_HOST))) {
 		/* The learned local address is not usable anymore.
 		 * Retry with source address autoselection.
 		 */
 		fl.saddr = 0;
+		key->saddr.ipv4 = 0;
 		reset_local = true;
+		ovpn_dst_cache_check_key(peer, cache, key);
 	}
 
 	rt = ip_route_output_flow(sock_net(sk), &fl, sk);
-	if (IS_ERR(rt) && PTR_ERR(rt) == -EINVAL) {
+	if (IS_ERR(rt) && PTR_ERR(rt) == -EINVAL && !key->saddr_from_sock) {
 		fl.saddr = 0;
+		key->saddr.ipv4 = 0;
 		reset_local = true;
+		ovpn_dst_cache_check_key(peer, cache, key);
 
 		rt = ip_route_output_flow(sock_net(sk), &fl, sk);
 	}
@@ -314,7 +332,7 @@ err:
 static int ovpn_udp6_output(struct ovpn_peer *peer, struct ovpn_bind *bind,
 			    struct dst_cache *cache, struct sock *sk,
 			    struct sk_buff *skb,
-			    const struct ovpn_route_key *key)
+			    struct ovpn_route_key *key)
 {
 	struct in6_addr local = in6addr_any;
 	struct sockaddr_storage remote;
@@ -323,7 +341,7 @@ static int ovpn_udp6_output(struct ovpn_peer *peer, struct ovpn_bind *bind,
 	int ret;
 
 	struct flowi6 fl = {
-		.saddr = bind->local.ipv6,
+		.saddr = key->saddr.ipv6,
 		.daddr = bind->remote.in6.sin6_addr,
 		.fl6_sport = key->sport,
 		.fl6_dport = bind->remote.in6.sin6_port,
@@ -337,13 +355,15 @@ static int ovpn_udp6_output(struct ovpn_peer *peer, struct ovpn_bind *bind,
 	if (dst)
 		goto transmit;
 
-	if (!ipv6_addr_any(&fl.saddr) &&
+	if (!key->saddr_from_sock && !ipv6_addr_any(&fl.saddr) &&
 	    unlikely(!ipv6_chk_addr(sock_net(sk), &fl.saddr, NULL, 0))) {
 		/* The learned local address is not usable anymore.
 		 * Retry with source address autoselection.
 		 */
 		fl.saddr = in6addr_any;
+		key->saddr.ipv6 = in6addr_any;
 		reset_local = true;
+		ovpn_dst_cache_check_key(peer, cache, key);
 	}
 
 	dst = ip6_dst_lookup_flow(sock_net(sk), sk, &fl, NULL);
@@ -401,12 +421,13 @@ err:
 #endif
 
 /**
- * ovpn_udp_output - transmit skb using udp-tunnel
+ * ovpn_udp_output - complete route key and transmit skb using udp-tunnel
  * @peer: the destination peer
  * @cache: dst cache
  * @sk: the socket to send the packet over
  * @skb: the packet to send
- * @key: route key snapshot used for cache validation and flow lookup
+ * @key: route key snapshot used for cache validation and flow lookup; source
+ *       address, source origin and family are filled by this function
  *
  * rcu_read_lock should be held on entry.
  * On return, the skb is consumed.
@@ -417,6 +438,7 @@ static int ovpn_udp_output(struct ovpn_peer *peer, struct dst_cache *cache,
 			   struct sock *sk, struct sk_buff *skb,
 			   struct ovpn_route_key *key)
 {
+	const u8 sk_userlocks = READ_ONCE(sk->sk_userlocks);
 	struct ovpn_bind *bind;
 	int ret;
 
@@ -435,10 +457,32 @@ static int ovpn_udp_output(struct ovpn_peer *peer, struct dst_cache *cache,
 
 	switch (bind->remote.in4.sin_family) {
 	case AF_INET:
+		key->family = AF_INET;
+		if (sk_userlocks & SOCK_BINDADDR_LOCK) {
+			key->saddr.ipv4 = READ_ONCE(sk->sk_rcv_saddr);
+			key->saddr_from_sock = true;
+		} else {
+			key->saddr.ipv4 = bind->local.ipv4.s_addr;
+			key->saddr_from_sock = false;
+		}
+		ovpn_dst_cache_check_key(peer, cache, key);
 		ret = ovpn_udp4_output(peer, bind, cache, sk, skb, key);
 		break;
 #if IS_ENABLED(CONFIG_IPV6)
 	case AF_INET6:
+		key->family = AF_INET6;
+		if (sk_userlocks & SOCK_BINDADDR_LOCK) {
+			/* concurrent socket reconfiguration may race with TX
+			 * but serializing that rare case would add locking to
+			 * the per-packet fast path
+			 */
+			key->saddr.ipv6 = data_race(sk->sk_v6_rcv_saddr);
+			key->saddr_from_sock = true;
+		} else {
+			key->saddr.ipv6 = bind->local.ipv6;
+			key->saddr_from_sock = false;
+		}
+		ovpn_dst_cache_check_key(peer, cache, key);
 		ret = ovpn_udp6_output(peer, bind, cache, sk, skb, key);
 		break;
 #endif
@@ -472,8 +516,6 @@ void ovpn_udp_send_skb(struct ovpn_peer *peer, struct sock *sk,
 	skb->mark = key.mark;
 	/* no checksum performed at this layer */
 	skb->ip_summed = CHECKSUM_NONE;
-
-	ovpn_dst_cache_check_key(peer, &peer->dst_cache, &key);
 
 	/* crypto layer -> transport (UDP) */
 	ret = ovpn_udp_output(peer, &peer->dst_cache, sk, skb, &key);
