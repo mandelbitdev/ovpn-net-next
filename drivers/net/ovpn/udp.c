@@ -134,7 +134,8 @@ drop_noovpn:
 static bool ovpn_route_key_equal(const struct ovpn_route_key *a,
 				 const struct ovpn_route_key *b)
 {
-	return a->mark == b->mark && a->sport == b->sport;
+	return a->oif == b->oif && a->mark == b->mark &&
+	       a->sport == b->sport;
 }
 
 /**
@@ -229,6 +230,7 @@ static int ovpn_udp4_output(struct ovpn_peer *peer, struct ovpn_bind *bind,
 		.fl4_dport = bind->remote.in4.sin_port,
 		.flowi4_proto = sk->sk_protocol,
 		.flowi4_mark = key->mark,
+		.flowi4_oif = key->oif,
 	};
 	int ret;
 
@@ -327,7 +329,7 @@ static int ovpn_udp6_output(struct ovpn_peer *peer, struct ovpn_bind *bind,
 		.fl6_dport = bind->remote.in6.sin6_port,
 		.flowi6_proto = sk->sk_protocol,
 		.flowi6_mark = key->mark,
-		.flowi6_oif = bind->remote.in6.sin6_scope_id,
+		.flowi6_oif = bind->remote.in6.sin6_scope_id ?: key->oif,
 	};
 
 	local_bh_disable();
@@ -460,6 +462,7 @@ void ovpn_udp_send_skb(struct ovpn_peer *peer, struct sock *sk,
 		       struct sk_buff *skb)
 {
 	struct ovpn_route_key key = {
+		.oif = READ_ONCE(sk->sk_bound_dev_if),
 		.mark = READ_ONCE(sk->sk_mark),
 		.sport = READ_ONCE(inet_sk(sk)->inet_sport),
 	};
