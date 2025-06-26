@@ -135,7 +135,8 @@ static bool ovpn_route_key_equal(const struct ovpn_route_key *a,
 				 const struct ovpn_route_key *b)
 {
 	if (unlikely(a->oif != b->oif || a->mark != b->mark ||
-		     a->sport != b->sport || a->family != b->family))
+		     a->sport != b->sport || a->family != b->family ||
+		     a->saddr_from_sock != b->saddr_from_sock))
 		return false;
 
 	switch (a->family) {
@@ -195,7 +196,8 @@ static void ovpn_dst_cache_check_key(struct ovpn_peer *peer,
  * The remote endpoint is immutable within a bind object; remote changes
  * replace peer->bind. Therefore @bind identity covers remote address, port and
  * scope changes. Until bind->local becomes immutable too, compare it against
- * @key because it can still be updated in place.
+ * @key when the source address was learned from the bind. When the source
+ * address comes from the socket, bind->local changes do not affect this lookup.
  *
  * Note: peer->lock must be held.
  *
@@ -217,6 +219,12 @@ static bool ovpn_dst_cache_current(const struct ovpn_peer *peer,
 	if (curr_bind != bind)
 		return false;
 
+	if (!ovpn_route_key_equal(key, &peer->route_key))
+		return false;
+
+	if (key->saddr_from_sock)
+		return true;
+
 	/* local is mutated in place so comparing the bind ptr is not enough */
 	switch (key->family) {
 	case AF_INET:
@@ -233,7 +241,7 @@ static bool ovpn_dst_cache_current(const struct ovpn_peer *peer,
 		return false;
 	}
 
-	return !local_changed && ovpn_route_key_equal(key, &peer->route_key);
+	return !local_changed;
 }
 
 /**
@@ -268,8 +276,9 @@ static int ovpn_udp4_output(struct ovpn_peer *peer, struct ovpn_bind *bind,
 	if (rt)
 		goto transmit;
 
-	if (fl.saddr && unlikely(!inet_confirm_addr(sock_net(sk), NULL, 0,
-						    fl.saddr, RT_SCOPE_HOST))) {
+	if (!key->saddr_from_sock && fl.saddr &&
+	    unlikely(!inet_confirm_addr(sock_net(sk), NULL, 0, fl.saddr,
+					RT_SCOPE_HOST))) {
 		/* we may end up here when the cached address is not usable
 		 * anymore. In this case we reset address/cache and perform a
 		 * new look up
@@ -280,16 +289,18 @@ static int ovpn_udp4_output(struct ovpn_peer *peer, struct ovpn_bind *bind,
 		bind->local.ipv4.s_addr = 0;
 		spin_unlock_bh(&peer->lock);
 		dst_cache_reset(cache);
+		ovpn_dst_cache_check_key(peer, cache, key);
 	}
 
 	rt = ip_route_output_flow(sock_net(sk), &fl, sk);
-	if (IS_ERR(rt) && PTR_ERR(rt) == -EINVAL) {
+	if (IS_ERR(rt) && PTR_ERR(rt) == -EINVAL && !key->saddr_from_sock) {
 		fl.saddr = 0;
 		key->saddr.ipv4 = 0;
 		spin_lock_bh(&peer->lock);
 		bind->local.ipv4.s_addr = 0;
 		spin_unlock_bh(&peer->lock);
 		dst_cache_reset(cache);
+		ovpn_dst_cache_check_key(peer, cache, key);
 
 		rt = ip_route_output_flow(sock_net(sk), &fl, sk);
 	}
@@ -353,7 +364,7 @@ static int ovpn_udp6_output(struct ovpn_peer *peer, struct ovpn_bind *bind,
 	if (dst)
 		goto transmit;
 
-	if (!ipv6_addr_any(&fl.saddr) &&
+	if (!key->saddr_from_sock && !ipv6_addr_any(&fl.saddr) &&
 	    unlikely(!ipv6_chk_addr(sock_net(sk), &fl.saddr, NULL, 0))) {
 		/* we may end up here when the cached address is not usable
 		 * anymore. In this case we reset address/cache and perform a
@@ -365,6 +376,7 @@ static int ovpn_udp6_output(struct ovpn_peer *peer, struct ovpn_bind *bind,
 		bind->local.ipv6 = in6addr_any;
 		spin_unlock_bh(&peer->lock);
 		dst_cache_reset(cache);
+		ovpn_dst_cache_check_key(peer, cache, key);
 	}
 
 	dst = ip6_dst_lookup_flow(sock_net(sk), sk, &fl, NULL);
@@ -404,13 +416,13 @@ err:
 #endif
 
 /**
- * ovpn_udp_output - transmit skb using udp-tunnel
+ * ovpn_udp_output - complete route key and transmit skb using udp-tunnel
  * @peer: the destination peer
  * @cache: dst cache
  * @sk: the socket to send the packet over
  * @skb: the packet to send
  * @key: route key snapshot used for cache validation and flow lookup; source
- *       address and family are filled by this function
+ *       address, source origin and family are filled by this function
  *
  * rcu_read_lock should be held on entry.
  * On return, the skb is consumed.
@@ -421,6 +433,7 @@ static int ovpn_udp_output(struct ovpn_peer *peer, struct dst_cache *cache,
 			   struct sock *sk, struct sk_buff *skb,
 			   struct ovpn_route_key *key)
 {
+	const u8 sk_userlocks = READ_ONCE(sk->sk_userlocks);
 	struct ovpn_bind *bind;
 	int ret;
 
@@ -441,13 +454,29 @@ static int ovpn_udp_output(struct ovpn_peer *peer, struct dst_cache *cache,
 
 	switch (bind->remote.in4.sin_family) {
 	case AF_INET:
-		key->saddr.ipv4 = READ_ONCE(bind->local.ipv4.s_addr);
+		if (sk_userlocks & SOCK_BINDADDR_LOCK) {
+			key->saddr.ipv4 = READ_ONCE(sk->sk_rcv_saddr);
+			key->saddr_from_sock = true;
+		} else {
+			key->saddr.ipv4 = READ_ONCE(bind->local.ipv4.s_addr);
+			key->saddr_from_sock = false;
+		}
 		ovpn_dst_cache_check_key(peer, cache, key);
 		ret = ovpn_udp4_output(peer, bind, cache, sk, skb, key);
 		break;
 #if IS_ENABLED(CONFIG_IPV6)
 	case AF_INET6:
-		key->saddr.ipv6 = data_race(bind->local.ipv6);
+		if (sk_userlocks & SOCK_BINDADDR_LOCK) {
+			/* concurrent socket reconfiguration may race with TX
+			 * but serializing that rare case would add locking to
+			 * the per-packet fast path
+			 */
+			key->saddr.ipv6 = data_race(sk->sk_v6_rcv_saddr);
+			key->saddr_from_sock = true;
+		} else {
+			key->saddr.ipv6 = data_race(bind->local.ipv6);
+			key->saddr_from_sock = false;
+		}
 		ovpn_dst_cache_check_key(peer, cache, key);
 		ret = ovpn_udp6_output(peer, bind, cache, sk, skb, key);
 		break;

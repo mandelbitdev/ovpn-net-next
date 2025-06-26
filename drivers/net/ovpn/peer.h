@@ -24,6 +24,7 @@
  * @mark: fwmark used for route lookup
  * @sport: UDP source port used for route lookup
  * @family: address family of @saddr
+ * @saddr_from_sock: true if @saddr was taken from the socket bound address
  * @saddr: local address used for route lookup
  */
 struct ovpn_route_key {
@@ -31,6 +32,7 @@ struct ovpn_route_key {
 	u32 mark;
 	__be16 sport;
 	sa_family_t family;
+	bool saddr_from_sock;
 	union {
 		__be32 ipv4;
 		struct in6_addr ipv6;
