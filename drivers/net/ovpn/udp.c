@@ -153,6 +153,7 @@ static int ovpn_udp4_output(struct ovpn_peer *peer, struct ovpn_bind *bind,
 		.fl4_dport = bind->remote.in4.sin_port,
 		.flowi4_proto = sk->sk_protocol,
 		.flowi4_mark = sk->sk_mark,
+		.flowi4_oif = sk->sk_bound_dev_if,
 	};
 	int ret;
 
@@ -230,7 +231,8 @@ static int ovpn_udp6_output(struct ovpn_peer *peer, struct ovpn_bind *bind,
 		.fl6_dport = bind->remote.in6.sin6_port,
 		.flowi6_proto = sk->sk_protocol,
 		.flowi6_mark = sk->sk_mark,
-		.flowi6_oif = bind->remote.in6.sin6_scope_id,
+		.flowi6_oif = sk->sk_bound_dev_if ?:
+				      bind->remote.in6.sin6_scope_id,
 	};
 
 	local_bh_disable();
