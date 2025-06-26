@@ -20,12 +20,14 @@
 
 /**
  * struct ovpn_route_key - route key used for the peer dst cache
+ * @oif: output interface index used for route lookup
  * @mark: fwmark used for route lookup
  * @sport: UDP source port used for route lookup
  * @family: address family of @saddr
  * @saddr: local address used for route lookup
  */
 struct ovpn_route_key {
+	int oif;
 	u32 mark;
 	__be16 sport;
 	sa_family_t family;
