@@ -24,6 +24,7 @@ TEST_PROGS = test.sh \
 	test-chachapoly.sh \
 	test-tcp.sh \
 	test-float.sh \
+	test-mark.sh \
 	test-close-socket.sh \
 	test-close-socket-tcp.sh
 
