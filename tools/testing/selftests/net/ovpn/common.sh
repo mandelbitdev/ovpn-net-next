@@ -107,7 +107,7 @@ compare_ntfs() {
 
 		kill -TERM ${listener_pids[$1]} || true
 		wait ${listener_pids[$1]} || true
-		printf "Cheking notifications for peer ${1}... "
+		printf "Checking notifications for peer ${1}... "
 		diff <(jq -s "${JQ_FILTER}" ${expexted}) \
 			<(jq -s "${JQ_FILTER}" ${received})
 		echo "OK"
