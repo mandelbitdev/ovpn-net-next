@@ -52,7 +52,7 @@ ip netns exec peer0 nft 'add table inet filter'
 ip netns exec peer0 nft 'add chain inet filter output { type filter hook output priority 0; policy accept; }'
 ip netns exec peer0 nft add rule inet filter output meta mark == ${MARK} counter drop
 
-DROP_COUNTER=$(ip netns exec peer0 nft list chain inet filter output | grep counter | awk '{ print $6 }')
+DROP_COUNTER=$(ip netns exec peer0 nft list chain inet filter output | sed -n 's/.*packets \([0-9]*\).*/\1/p')
 sleep 1
 
 # ping should fail
@@ -65,7 +65,7 @@ for p in $(seq 1 3); do
 done
 
 # check if the final nft counter matches our counter
-TOTAL_COUNT=$(ip netns exec peer0 nft list chain inet filter output | grep counter | awk '{ print $5 }')
+TOTAL_COUNT=$(ip netns exec peer0 nft list chain inet filter output | sed -n 's/.*packets \([0-9]*\).*/\1/p')
 [ ${DROP_COUNTER} -eq ${TOTAL_COUNT} ] || exit 1
 
 echo "Removing the drop rule"
