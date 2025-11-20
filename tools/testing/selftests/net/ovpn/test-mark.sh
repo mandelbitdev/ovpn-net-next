@@ -39,7 +39,7 @@ ovpn_mark_prepare_network() {
 
 	ovpn_cmd_ok "create server-side multi-peer with fwmark" \
 		ip netns exec ovpn_peer0 "${OVPN_CLI}" new_multi_peer tun0 \
-			any 1 ASYMM "${OVPN_UDP_PEERS_FILE}" "${MARK}"
+			any any 1 ASYMM "${OVPN_UDP_PEERS_FILE}" "${MARK}"
 	for p in $(seq 1 3); do
 		ovpn_cmd_ok "install server key for peer ${p}" \
 			ip netns exec ovpn_peer0 "${OVPN_CLI}" new_key tun0 \
