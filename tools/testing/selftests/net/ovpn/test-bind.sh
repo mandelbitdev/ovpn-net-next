@@ -10,6 +10,7 @@
 set -eE
 
 OVPN_PROTO=UDP
+BIND_TYPE=${BIND_TYPE:-"DEV"}
 
 source ./common.sh
 
@@ -62,8 +63,9 @@ ovpn_bind_prepare_network() {
 	ovpn_cmd_ok "bring up peer2 second underlay link" \
 		ip -n ovpn_peer2 link set veth2 up
 
-	# Some test cases intentionally bind peer1 to a device that does not
-	# match the route-selected underlay, so allow asymmetric underlay paths.
+	# Some test cases intentionally bind peer1 to a device or address that
+	# does not match the route-selected underlay, so allow asymmetric
+	# underlay paths.
 	ovpn_cmd_ok "disable peer1 global rp_filter" \
 		ip netns exec ovpn_peer1 sysctl -w \
 			net.ipv4.conf.all.rp_filter=0
@@ -110,8 +112,10 @@ ovpn_bind_prepare_network() {
 ovpn_bind_configure_peers() {
 	local dev1="$1"
 	local dev2="$2"
-	local raddr4_peer1="$3"
-	local raddr4_peer2="$4"
+	local laddr4_peer1="$3"
+	local laddr4_peer2="$4"
+	local raddr4_peer1="$5"
+	local raddr4_peer2="$6"
 
 	ip netns exec ovpn_peer1 "${OVPN_CLI}" del_peer tun1 1 \
 		>/dev/null 2>&1 || true
@@ -121,15 +125,16 @@ ovpn_bind_configure_peers() {
 	# Close any active userspace socket before installing a new peer pair.
 	ovpn_kill_cli
 
-	ovpn_cmd_ok "create peer1 bound peer on ${dev1}" \
+	ovpn_cmd_ok "create peer1 bound peer" \
 		ip netns exec ovpn_peer1 "${OVPN_CLI}" new_peer tun1 \
-			"${dev1}" 1 10 1 "${raddr4_peer1}" 1
+			"${dev1}" 1 10 "${laddr4_peer1}" 1 "${raddr4_peer1}" 1
 	ovpn_cmd_ok "install peer1 key" \
 		ip netns exec ovpn_peer1 "${OVPN_CLI}" new_key tun1 1 1 0 \
 			"${OVPN_ALG}" 0 data64.key
-	ovpn_cmd_ok "create peer2 bound peer on ${dev2}" \
+	ovpn_cmd_ok "create peer2 bound peer" \
 		ip netns exec ovpn_peer2 "${OVPN_CLI}" new_peer tun2 \
-			"${dev2}" 10 1 1 "${raddr4_peer2}" 1
+			"${dev2}" 10 1 "${laddr4_peer2}" 1 \
+			"${raddr4_peer2}" 1
 	ovpn_cmd_ok "install peer2 key" \
 		ip netns exec ovpn_peer2 "${OVPN_CLI}" new_key tun2 10 1 0 \
 			"${OVPN_ALG}" 1 data64.key
@@ -153,7 +158,7 @@ ovpn_bind_start_capture() {
 	OVPN_BIND_TCPDUMP_PIDS+=("${pid}")
 }
 
-ovpn_bind_run_positive_case() {
+ovpn_bind_run_dev_positive_case() {
 	local dev1="$1"
 	local dev2="$2"
 	local raddr4_peer1="$3"
@@ -165,8 +170,8 @@ ovpn_bind_run_positive_case() {
 	local header2="0x4800000a"
 	local ping_start_delay="0.3"
 
-	ovpn_bind_configure_peers "${dev1}" "${dev2}" "${raddr4_peer1}" \
-		"${raddr4_peer2}"
+	ovpn_bind_configure_peers "${dev1}" "${dev2}" any any \
+		"${raddr4_peer1}" "${raddr4_peer2}"
 	filter="$(printf '(%s) or (%s)' \
 		"$(ovpn_build_capture_filter "${header1}" "${raddr4_peer1}")" \
 		"$(ovpn_build_capture_filter "${header2}" "${raddr4_peer2}")")"
@@ -192,7 +197,7 @@ ovpn_bind_run_positive_case() {
 	OVPN_BIND_TCPDUMP_PIDS=("${OVPN_BIND_TCPDUMP_PIDS[@]:1}")
 }
 
-ovpn_bind_run_sender_negative_case() {
+ovpn_bind_run_dev_sender_negative_case() {
 	local dev1="$1"
 	local raddr4_peer1="$2"
 	local raddr4_peer2="$3"
@@ -201,7 +206,7 @@ ovpn_bind_run_sender_negative_case() {
 	local header="0x4800000a"
 	local ping_start_delay="0.3"
 
-	ovpn_bind_configure_peers "${dev1}" any "${raddr4_peer1}" \
+	ovpn_bind_configure_peers "${dev1}" any any any "${raddr4_peer1}" \
 		"${raddr4_peer2}"
 	filter="$(ovpn_build_capture_filter "${header}" "${raddr4_peer1}")"
 
@@ -217,7 +222,7 @@ ovpn_bind_run_sender_negative_case() {
 	OVPN_BIND_TCPDUMP_PIDS=("${OVPN_BIND_TCPDUMP_PIDS[@]:1}")
 }
 
-ovpn_bind_run_receiver_negative_case() {
+ovpn_bind_run_dev_receiver_negative_case() {
 	local dev2="$1"
 	local raddr4_peer1="$2"
 	local raddr4_peer2="$3"
@@ -226,7 +231,7 @@ ovpn_bind_run_receiver_negative_case() {
 	local header="0x4800000a"
 	local ping_start_delay="0.3"
 
-	ovpn_bind_configure_peers any "${dev2}" "${raddr4_peer1}" \
+	ovpn_bind_configure_peers any "${dev2}" any any "${raddr4_peer1}" \
 		"${raddr4_peer2}"
 	filter="$(ovpn_build_capture_filter "${header}" "${raddr4_peer1}")"
 
@@ -242,40 +247,138 @@ ovpn_bind_run_receiver_negative_case() {
 	OVPN_BIND_TCPDUMP_PIDS=("${OVPN_BIND_TCPDUMP_PIDS[@]:1}")
 }
 
+ovpn_bind_run_addr_positive_case() {
+	local laddr4_peer1="$1"
+	local raddr4_peer1="$2"
+	local raddr4_peer2="$3"
+	local expected_dev="$4"
+	local unexpected_dev="$5"
+	local filter
+	local header="0x4800000a"
+	local ping_start_delay="0.3"
+
+	ovpn_bind_configure_peers any any "${laddr4_peer1}" any \
+		"${raddr4_peer1}" "${raddr4_peer2}"
+	filter="$(printf '(%s) and src host %s' \
+		"$(ovpn_build_capture_filter "${header}" "${raddr4_peer1}")" \
+		"${laddr4_peer1}")"
+
+	# The route-selected device must carry peer1 data packets with the
+	# explicitly bound local address as outer source address.
+	ovpn_bind_start_capture "${expected_dev}" 1 "${filter}"
+
+	# The other underlay device must not carry peer1 data packets with the
+	# explicitly bound local address.
+	ovpn_bind_start_capture "${unexpected_dev}" 1 "${filter}"
+
+	sleep "${ping_start_delay}"
+	ovpn_cmd_ok "send tunnel traffic from peer1 to peer2" \
+		ip netns exec ovpn_peer1 ping -qfc 10 -w 3 5.5.5.2
+	ovpn_cmd_ok "capture bound source on ${expected_dev}" \
+		wait "${OVPN_BIND_TCPDUMP_PIDS[0]}"
+	OVPN_BIND_TCPDUMP_PIDS=("${OVPN_BIND_TCPDUMP_PIDS[@]:1}")
+
+	ovpn_cmd_fail "capture bound source on ${unexpected_dev}" \
+		wait "${OVPN_BIND_TCPDUMP_PIDS[0]}"
+	OVPN_BIND_TCPDUMP_PIDS=("${OVPN_BIND_TCPDUMP_PIDS[@]:1}")
+}
+
+ovpn_bind_run_addr_receiver_positive_case() {
+	local laddr4_peer2="$1"
+	local raddr4_peer1="$2"
+	local raddr4_peer2="$3"
+	local expected_dev="$4"
+	local unexpected_dev="$5"
+	local filter
+	local header="0x4800000a"
+	local ping_start_delay="0.3"
+
+	ovpn_bind_configure_peers any any any "${laddr4_peer2}" \
+		"${raddr4_peer1}" "${raddr4_peer2}"
+	filter="$(printf '(%s) and dst host %s' \
+		"$(ovpn_build_capture_filter "${header}" "${raddr4_peer1}")" \
+		"${raddr4_peer1}")"
+
+	# The destination-matching underlay device must carry peer1 data
+	# packets to the address peer2 is bound to.
+	ovpn_bind_start_capture "${expected_dev}" 1 "${filter}"
+
+	# The other underlay device must not carry those packets.
+	ovpn_bind_start_capture "${unexpected_dev}" 1 "${filter}"
+
+	sleep "${ping_start_delay}"
+	ovpn_cmd_ok "send tunnel traffic from peer1 to peer2" \
+		ip netns exec ovpn_peer1 ping -qfc 10 -w 3 5.5.5.2
+	ovpn_cmd_ok "capture bound destination on ${expected_dev}" \
+		wait "${OVPN_BIND_TCPDUMP_PIDS[0]}"
+	OVPN_BIND_TCPDUMP_PIDS=("${OVPN_BIND_TCPDUMP_PIDS[@]:1}")
+
+	ovpn_cmd_fail "capture bound destination on ${unexpected_dev}" \
+		wait "${OVPN_BIND_TCPDUMP_PIDS[0]}"
+	OVPN_BIND_TCPDUMP_PIDS=("${OVPN_BIND_TCPDUMP_PIDS[@]:1}")
+}
+
+ovpn_bind_run_dev_tests() {
+	ktap_set_plan 9
+
+	ovpn_run_stage "setup network topology" ovpn_bind_prepare_network
+	ovpn_run_stage "peer1 bind_dev=veth1 routes over veth1" \
+		ovpn_bind_run_dev_positive_case \
+		veth1 any 10.10.10.2 10.10.10.1 veth1 veth2
+	ovpn_run_stage "peer1 bind_dev=veth2 routes over veth2" \
+		ovpn_bind_run_dev_positive_case \
+		veth2 any 20.20.20.2 20.20.20.1 veth2 veth1
+	ovpn_run_stage "peer2 bind_dev=veth1 replies over veth1" \
+		ovpn_bind_run_dev_positive_case \
+		any veth1 10.10.10.2 10.10.10.1 veth1 veth2
+	ovpn_run_stage "peer2 bind_dev=veth2 replies over veth2" \
+		ovpn_bind_run_dev_positive_case \
+		any veth2 20.20.20.2 20.20.20.1 veth2 veth1
+	ovpn_run_stage "peer1 bind_dev=veth1 blocks veth2 egress" \
+		ovpn_bind_run_dev_sender_negative_case \
+		veth1 20.20.20.2 20.20.20.1 veth2
+	ovpn_run_stage "peer1 bind_dev=veth2 blocks veth1 egress" \
+		ovpn_bind_run_dev_sender_negative_case \
+		veth2 10.10.10.2 10.10.10.1 veth1
+	ovpn_run_stage "peer2 bind_dev=veth1 rejects veth2 ingress" \
+		ovpn_bind_run_dev_receiver_negative_case \
+		veth1 20.20.20.2 20.20.20.1 veth2
+	ovpn_run_stage "peer2 bind_dev=veth2 rejects veth1 ingress" \
+		ovpn_bind_run_dev_receiver_negative_case \
+		veth2 10.10.10.2 10.10.10.1 veth1
+}
+
+ovpn_bind_run_addr_tests() {
+	ktap_set_plan 5
+
+	ovpn_run_stage "setup network topology" ovpn_bind_prepare_network
+	ovpn_run_stage "peer1 bind_addr=10.10.10.1 sends from 10.10.10.1 \
+		via veth2" ovpn_bind_run_addr_positive_case \
+		10.10.10.1 20.20.20.2 10.10.10.1 veth2 veth1
+	ovpn_run_stage "peer1 bind_addr=20.20.20.1 sends from 20.20.20.1 \
+		via veth1" ovpn_bind_run_addr_positive_case \
+		20.20.20.1 10.10.10.2 20.20.20.1 veth1 veth2
+	ovpn_run_stage "peer2 bind_addr=10.10.10.2 accepts dst 10.10.10.2 \
+		via veth1" ovpn_bind_run_addr_receiver_positive_case \
+		10.10.10.2 10.10.10.2 10.10.10.1 veth1 veth2
+	ovpn_run_stage "peer2 bind_addr=20.20.20.2 accepts dst 20.20.20.2 \
+		via veth2" ovpn_bind_run_addr_receiver_positive_case \
+		20.20.20.2 20.20.20.2 20.20.20.1 veth2 veth1
+}
+
 trap ovpn_test_exit EXIT
 trap ovpn_stage_err ERR
 
 ktap_print_header
-ktap_set_plan 9
 
 ovpn_cleanup
 modprobe -q ovpn || true
 
-ovpn_run_stage "setup network topology" ovpn_bind_prepare_network
-ovpn_run_stage "peer1 bind_dev=veth1 routes over veth1" \
-	ovpn_bind_run_positive_case \
-	veth1 any 10.10.10.2 10.10.10.1 veth1 veth2
-ovpn_run_stage "peer1 bind_dev=veth2 routes over veth2" \
-	ovpn_bind_run_positive_case \
-	veth2 any 20.20.20.2 20.20.20.1 veth2 veth1
-ovpn_run_stage "peer2 bind_dev=veth1 replies over veth1" \
-	ovpn_bind_run_positive_case \
-	any veth1 10.10.10.2 10.10.10.1 veth1 veth2
-ovpn_run_stage "peer2 bind_dev=veth2 replies over veth2" \
-	ovpn_bind_run_positive_case \
-	any veth2 20.20.20.2 20.20.20.1 veth2 veth1
-ovpn_run_stage "peer1 bind_dev=veth1 blocks veth2 egress" \
-	ovpn_bind_run_sender_negative_case \
-	veth1 20.20.20.2 20.20.20.1 veth2
-ovpn_run_stage "peer1 bind_dev=veth2 blocks veth1 egress" \
-	ovpn_bind_run_sender_negative_case \
-	veth2 10.10.10.2 10.10.10.1 veth1
-ovpn_run_stage "peer2 bind_dev=veth1 rejects veth2 ingress" \
-	ovpn_bind_run_receiver_negative_case \
-	veth1 20.20.20.2 20.20.20.1 veth2
-ovpn_run_stage "peer2 bind_dev=veth2 rejects veth1 ingress" \
-	ovpn_bind_run_receiver_negative_case \
-	veth2 10.10.10.2 10.10.10.1 veth1
+if [ "${BIND_TYPE}" = "ADDR" ]; then
+	ovpn_bind_run_addr_tests
+else
+	ovpn_bind_run_dev_tests
+fi
 
 ovpn_test_finished=1
 ktap_finished

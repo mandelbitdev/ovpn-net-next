@@ -105,7 +105,7 @@ struct ovpn_ctx {
 	sa_family_t sa_family;
 
 	unsigned long peer_id, tx_id;
-	unsigned long lport;
+	const char *laddr, *lport;
 
 	union {
 		struct sockaddr_in in4;
@@ -471,43 +471,13 @@ static int ovpn_parse_key_direction(const char *dir, struct ovpn_ctx *ctx)
 	return 0;
 }
 
-static int ovpn_socket(struct ovpn_ctx *ctx, sa_family_t family, int proto)
+static int ovpn_socket(struct ovpn_ctx *ctx, sa_family_t family, int type)
 {
-	struct sockaddr_storage local_sock = { 0 };
-	struct sockaddr_in6 *in6;
-	struct sockaddr_in *in;
-	int ret, s, sock_type;
-	size_t sock_len;
+	int ret, s;
 
-	if (proto == IPPROTO_UDP)
-		sock_type = SOCK_DGRAM;
-	else if (proto == IPPROTO_TCP)
-		sock_type = SOCK_STREAM;
-	else
-		return -EINVAL;
-
-	s = socket(family, sock_type, 0);
+	s = socket(family, type, 0);
 	if (s < 0) {
 		perror("cannot create socket");
-		return -1;
-	}
-
-	switch (family) {
-	case AF_INET:
-		in = (struct sockaddr_in *)&local_sock;
-		in->sin_family = family;
-		in->sin_port = htons(ctx->lport);
-		in->sin_addr.s_addr = htonl(INADDR_ANY);
-		sock_len = sizeof(*in);
-		break;
-	case AF_INET6:
-		in6 = (struct sockaddr_in6 *)&local_sock;
-		in6->sin6_family = family;
-		in6->sin6_port = htons(ctx->lport);
-		in6->sin6_addr = in6addr_any;
-		sock_len = sizeof(*in6);
-		break;
-	default:
 		return -1;
 	}
 
@@ -517,13 +487,13 @@ static int ovpn_socket(struct ovpn_ctx *ctx, sa_family_t family, int proto)
 
 	if (ret < 0) {
 		perror("setsockopt for SO_REUSEADDR");
-		return ret;
+		goto close;
 	}
 
 	ret = setsockopt(s, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
 	if (ret < 0) {
 		perror("setsockopt for SO_REUSEPORT");
-		return ret;
+		goto close;
 	}
 
 	if (ctx->mark != 0) {
@@ -531,62 +501,106 @@ static int ovpn_socket(struct ovpn_ctx *ctx, sa_family_t family, int proto)
 				 sizeof(ctx->mark));
 		if (ret < 0) {
 			perror("setsockopt for SO_MARK");
-			return ret;
+			goto close;
 		}
 	}
 
 	if (family == AF_INET6) {
 		opt = 0;
-		if (setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &opt,
-			       sizeof(opt))) {
+		ret = setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &opt,
+				 sizeof(opt));
+		if (ret < 0) {
 			perror("failed to set IPV6_V6ONLY");
-			return -1;
+			goto close;
 		}
 	}
 
 	if (ctx->bind_dev) {
-		if (setsockopt(s, SOL_SOCKET, SO_BINDTODEVICE, ctx->bind_dev,
-			       strlen(ctx->bind_dev) + 1) != 0) {
+		ret = setsockopt(s, SOL_SOCKET, SO_BINDTODEVICE, ctx->bind_dev,
+				 strlen(ctx->bind_dev) + 1);
+		if (ret < 0) {
 			perror("setsockopt for SO_BINDTODEVICE");
-			goto err_socket;
+			goto close;
 		}
 	}
 
-	ret = bind(s, (struct sockaddr *)&local_sock, sock_len);
-	if (ret < 0) {
-		perror("cannot bind socket");
-		goto err_socket;
+	return s;
+close:
+	close(s);
+	return ret;
+}
+
+static int ovpn_bind_socket(struct ovpn_ctx *ctx, sa_family_t family,
+			    int socktype)
+{
+	struct addrinfo *list_ai, *curr_ai;
+	struct addrinfo hints;
+	int ret, socket;
+
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV |
+			 (socktype == SOCK_STREAM ? 0 : AI_V4MAPPED) |
+			 (ctx->laddr ? 0 : AI_PASSIVE);
+	hints.ai_family = family;
+	hints.ai_socktype = socktype;
+	ret = getaddrinfo(ctx->laddr, ctx->lport, &hints, &list_ai);
+	if (ret) {
+		fprintf(stderr,
+			"laddr %s, lport %s, getaddrinfo on local address: %s\n",
+			ctx->laddr, ctx->lport, gai_strerror(ret));
+		return ret;
 	}
 
-	ctx->socket = s;
-	ctx->sa_family = family;
-	return 0;
+	for (curr_ai = list_ai; curr_ai; curr_ai = curr_ai->ai_next) {
+		socket = ovpn_socket(ctx, family, socktype);
+		if (socket < 0)
+			continue;
 
-err_socket:
-	close(s);
-	return -1;
+		ret = bind(socket, curr_ai->ai_addr, curr_ai->ai_addrlen);
+		if (ret == 0)
+			break;
+
+		close(socket);
+	}
+
+	freeaddrinfo(list_ai);
+
+	if (ret < 0) {
+		perror("cannot setup socket\n");
+		return ret;
+	}
+
+	return socket;
 }
 
 static int ovpn_udp_socket(struct ovpn_ctx *ctx, sa_family_t family)
 {
-	return ovpn_socket(ctx, family, IPPROTO_UDP);
+	int socket = ovpn_bind_socket(ctx, family, SOCK_DGRAM);
+
+	if (socket < 0)
+		return socket;
+
+	ctx->sa_family = family;
+	ctx->socket = socket;
+	return 0;
 }
 
 static int ovpn_listen(struct ovpn_ctx *ctx, sa_family_t family)
 {
-	int ret;
+	int ret, socket = ovpn_bind_socket(ctx, family, SOCK_STREAM);
 
-	ret = ovpn_socket(ctx, family, IPPROTO_TCP);
-	if (ret < 0)
-		return ret;
+	if (socket < 0)
+		return socket;
 
-	ret = listen(ctx->socket, 10);
+	ret = listen(socket, 10);
 	if (ret < 0) {
 		perror("listen");
-		close(ctx->socket);
+		close(socket);
 		return -1;
 	}
 
+	ctx->sa_family = family;
+	ctx->socket = socket;
 	return 0;
 }
 
@@ -621,18 +635,13 @@ err:
 	return ret;
 }
 
-static int ovpn_connect(struct ovpn_ctx *ovpn)
+static int ovpn_connect(struct ovpn_ctx *ctx)
 {
+	const sa_family_t family = ctx->remote.in4.sin_family;
 	socklen_t socklen;
-	int s, ret;
+	int ret, socket;
 
-	s = socket(ovpn->remote.in4.sin_family, SOCK_STREAM, 0);
-	if (s < 0) {
-		perror("cannot create socket");
-		return -1;
-	}
-
-	switch (ovpn->remote.in4.sin_family) {
+	switch (family) {
 	case AF_INET:
 		socklen = sizeof(struct sockaddr_in);
 		break;
@@ -643,20 +652,22 @@ static int ovpn_connect(struct ovpn_ctx *ovpn)
 		return -EOPNOTSUPP;
 	}
 
-	ret = connect(s, (struct sockaddr *)&ovpn->remote, socklen);
+	socket = ovpn_socket(ctx, family, SOCK_STREAM);
+	if (socket < 0)
+		return socket;
+
+	ret = connect(socket, (struct sockaddr *)&ctx->remote, socklen);
 	if (ret < 0) {
 		perror("connect");
-		goto err;
+		close(socket);
+		return ret;
 	}
 
 	fprintf(stderr, "connected\n");
 
-	ovpn->socket = s;
-
+	ctx->sa_family = family;
+	ctx->socket = socket;
 	return 0;
-err:
-	close(s);
-	return ret;
 }
 
 static int ovpn_new_peer(struct ovpn_ctx *ovpn, bool is_tcp)
@@ -1712,7 +1723,7 @@ static void usage(const char *cmd)
 		"\tkey_file: file containing the symmetric key for encryption\n");
 
 	fprintf(stderr,
-		"* new_peer <iface> <dev> <peer_id> <tx_id> <lport> <raddr> <rport> [vpnaddr]: add new peer\n");
+		"* new_peer <iface> <dev> <peer_id> <tx_id> <laddr> <lport> <raddr> <rport> [vpnaddr]: add new peer\n");
 	fprintf(stderr, "\tiface: ovpn interface name\n");
 	fprintf(stderr,
 		"\tdev: transport interface name to bind to, supports 'any'\n");
@@ -1720,16 +1731,20 @@ static void usage(const char *cmd)
 		"\tpeer_id: peer ID found in data packets received from this peer\n");
 	fprintf(stderr,
 		"\ttx_id: peer ID to be used when sending to this peer, 'none' for symmetric peer ID\n");
+	fprintf(stderr,
+		"\tladdr: local UDP address to bind to, supports 'any'\n");
 	fprintf(stderr, "\tlport: local UDP port to bind to\n");
 	fprintf(stderr, "\traddr: peer IP address\n");
 	fprintf(stderr, "\trport: peer UDP port\n");
 	fprintf(stderr, "\tvpnaddr: peer VPN IP\n");
 
 	fprintf(stderr,
-		"* new_multi_peer <iface> <dev> <lport> <id_type> <peers_file> [mark]: add multiple peers as listed in the file\n");
+		"* new_multi_peer <iface> <dev> <laddr> <lport> <id_type> <peers_file> [mark]: add multiple peers as listed in the file\n");
 	fprintf(stderr, "\tiface: ovpn interface name\n");
 	fprintf(stderr,
 		"\tdev: transport interface name to bind to, supports 'any'\n");
+	fprintf(stderr,
+		"\tladdr: local UDP address to bind to, supports 'any'\n");
 	fprintf(stderr, "\tlport: local UDP port to bind to\n");
 	fprintf(stderr, "\tid_type:\n");
 	fprintf(stderr,
@@ -2224,11 +2239,8 @@ static int ovpn_parse_cmd_args(struct ovpn_ctx *ovpn, int argc, char *argv[])
 		if (argc < 6)
 			return -EINVAL;
 
-		ovpn->lport = strtoul(argv[3], NULL, 10);
-		if (errno == ERANGE || ovpn->lport > 65535) {
-			fprintf(stderr, "lport value out of range\n");
-			return -1;
-		}
+		ovpn->laddr = NULL;
+		ovpn->lport = argv[3];
 
 		if (strcmp(argv[4], "SYMM") == 0) {
 			ovpn->asymm_id = false;
@@ -2271,52 +2283,46 @@ static int ovpn_parse_cmd_args(struct ovpn_ctx *ovpn, int argc, char *argv[])
 		}
 		break;
 	case CMD_NEW_PEER:
-		if (argc < 9)
+		if (argc < 10)
 			return -EINVAL;
 
 		ovpn->bind_dev = strcmp(argv[3], "any") == 0 ? NULL : argv[3];
 
 		ovpn->asymm_id = strcmp(argv[5], "none");
 
-		ovpn->lport = strtoul(argv[6], NULL, 10);
-		if (errno == ERANGE || ovpn->lport > 65535) {
-			fprintf(stderr, "lport value out of range\n");
-			return -1;
-		}
+		ovpn->laddr = strcmp(argv[6], "any") == 0 ? NULL : argv[6];
+		ovpn->lport = argv[7];
 
-		const char *vpnip = (argc > 9) ? argv[9] : NULL;
+		const char *vpnip = (argc > 10) ? argv[10] : NULL;
 
-		ret = ovpn_parse_new_peer(ovpn, argv[4], argv[5], argv[7],
-					  argv[8], vpnip);
+		ret = ovpn_parse_new_peer(ovpn, argv[4], argv[5], argv[8],
+					  argv[9], vpnip);
 		if (ret < 0)
 			return -1;
 		break;
 	case CMD_NEW_MULTI_PEER:
-		if (argc < 7)
+		if (argc < 8)
 			return -EINVAL;
 
 		ovpn->bind_dev = strcmp(argv[3], "any") == 0 ? NULL : argv[3];
 
-		ovpn->lport = strtoul(argv[4], NULL, 10);
-		if (errno == ERANGE || ovpn->lport > 65535) {
-			fprintf(stderr, "lport value out of range\n");
-			return -1;
-		}
+		ovpn->laddr = strcmp(argv[4], "any") == 0 ? NULL : argv[4];
+		ovpn->lport = argv[5];
 
-		if (!strcmp(argv[5], "SYMM")) {
+		if (!strcmp(argv[6], "SYMM")) {
 			ovpn->asymm_id = false;
-		} else if (!strcmp(argv[5], "ASYMM")) {
+		} else if (!strcmp(argv[6], "ASYMM")) {
 			ovpn->asymm_id = true;
 		} else {
-			fprintf(stderr, "Cannot parse id type: %s\n", argv[5]);
+			fprintf(stderr, "Cannot parse id type: %s\n", argv[6]);
 			return -1;
 		}
 
-		ovpn->peers_file = argv[6];
+		ovpn->peers_file = argv[7];
 
 		ovpn->mark = 0;
-		if (argc > 7) {
-			ovpn->mark = strtoul(argv[7], NULL, 10);
+		if (argc > 8) {
+			ovpn->mark = strtoul(argv[8], NULL, 10);
 			if (errno == ERANGE || ovpn->mark > UINT32_MAX) {
 				fprintf(stderr, "mark value out of range\n");
 				return -1;
