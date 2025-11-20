@@ -213,12 +213,13 @@ ovpn_add_peer() {
 	local peer_ns
 	local server_ns="ovpn_peer0"
 	M_ID=${labels[OVPN_SYMMETRIC_ID]}
+	local dev=${2:-"any"}
 
 	if [ "${OVPN_PROTO}" == "UDP" ]; then
 		if [ ${1} -eq 0 ]; then
-			ip netns exec "${server_ns}" ${OVPN_CLI} \
-				new_multi_peer tun0 1 ${M_ID} \
-				${OVPN_UDP_PEERS_FILE}
+			ip netns exec "${server_ns}" "${OVPN_CLI}" \
+				new_multi_peer tun0 "${dev}" 1 "${M_ID}" \
+				"${OVPN_UDP_PEERS_FILE}"
 
 			for p in $(seq 1 ${OVPN_NUM_PEERS}); do
 				ip netns exec "${server_ns}" ${OVPN_CLI} \
@@ -241,9 +242,9 @@ ovpn_add_peer() {
 				${OVPN_UDP_PEERS_FILE})
 			LPORT=$(awk "NR == ${1} {print \$6}" \
 				${OVPN_UDP_PEERS_FILE})
-			ip netns exec "${peer_ns}" ${OVPN_CLI} new_peer \
-				tun${1} ${PEER_ID} ${TX_ID} ${LPORT} ${RADDR} \
-				${RPORT}
+			ip netns exec "${peer_ns}" "${OVPN_CLI}" new_peer \
+				tun"${1}" "${dev}" "${PEER_ID}" "${TX_ID}" \
+				"${LPORT}" "${RADDR}" "${RPORT}"
 			ip netns exec "${peer_ns}" ${OVPN_CLI} new_key tun${1} \
 				${PEER_ID} 1 0 ${OVPN_ALG} 1 data64.key
 		fi
@@ -334,11 +335,18 @@ ovpn_cleanup_peer_ns() {
 	ip netns del "${peer}" 2>/dev/null || true
 }
 
+ovpn_kill_cli() {
+	local name
+
+	name="$(basename "${OVPN_CLI}")"
+	killall "${name}" 2>/dev/null || pkill -x "${name}" 2>/dev/null || true
+}
+
 ovpn_cleanup() {
 	local peer
 
 	# some ovpn-cli processes sleep in background so they need manual poking
-	killall "$(basename "${OVPN_CLI}")" 2>/dev/null || true
+	ovpn_kill_cli
 
 	for peer in "${!OVPN_LISTENER_PIDS[@]}"; do
 		ovpn_stop_listener "${peer}" 2>/dev/null
