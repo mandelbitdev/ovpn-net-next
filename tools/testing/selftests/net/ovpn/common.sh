@@ -17,6 +17,9 @@ fi
 ALG=${ALG:-aes}
 PROTO=${PROTO:-UDP}
 FLOAT=${FLOAT:-0}
+SYMMETRIC_ID=${SYMMETRIC_ID:-0}
+
+export ID_OFFSET=$(( 9 * (SYMMETRIC_ID == 0) ))
 
 JQ_FILTER='map(select(.msg.peer | has("remote-ipv6") | not))
 | map(del(.msg.ifindex)) | sort_by(.msg.peer.id)[]'
@@ -78,26 +81,37 @@ setup_listener() {
 }
 
 add_peer() {
+	labels=("ASYMM" "SYMM")
+	M_ID=${labels[SYMMETRIC_ID]}
+
 	if [ "${PROTO}" == "UDP" ]; then
 		if [ ${1} -eq 0 ]; then
-			ip netns exec peer0 ${OVPN_CLI} new_multi_peer tun0 1 ${UDP_PEERS_FILE}
+			ip netns exec peer0 ${OVPN_CLI} new_multi_peer tun0 1 \
+				${M_ID} ${UDP_PEERS_FILE}
 
 			for p in $(seq 1 ${NUM_PEERS}); do
 				ip netns exec peer0 ${OVPN_CLI} new_key tun0 ${p} 1 0 ${ALG} 0 \
 					data64.key
 			done
 		else
-			RADDR=$(awk "NR == ${1} {print \$2}" ${UDP_PEERS_FILE})
-			RPORT=$(awk "NR == ${1} {print \$3}" ${UDP_PEERS_FILE})
-			LPORT=$(awk "NR == ${1} {print \$5}" ${UDP_PEERS_FILE})
-			ip netns exec peer${1} ${OVPN_CLI} new_peer tun${1} ${1} ${LPORT} \
-				${RADDR} ${RPORT}
-			ip netns exec peer${1} ${OVPN_CLI} new_key tun${1} ${1} 1 0 ${ALG} 1 \
-				data64.key
+			if [ "$SYMMETRIC_ID" -eq 1 ]; then
+				PEER_ID=${1}
+				TX_ID="none"
+			else
+				PEER_ID=$(awk "NR == ${1} {print \$2}" ${UDP_PEERS_FILE})
+				TX_ID=${1}
+			fi
+			RADDR=$(awk "NR == ${1} {print \$3}" ${UDP_PEERS_FILE})
+			RPORT=$(awk "NR == ${1} {print \$4}" ${UDP_PEERS_FILE})
+			LPORT=$(awk "NR == ${1} {print \$6}" ${UDP_PEERS_FILE})
+			ip netns exec peer${1} ${OVPN_CLI} new_peer tun${1} \
+				${PEER_ID} ${TX_ID} ${LPORT} ${RADDR} ${RPORT}
+			ip netns exec peer${1} ${OVPN_CLI} new_key tun${1} \
+				${PEER_ID} 1 0 ${ALG} 1 data64.key
 		fi
 	else
 		if [ ${1} -eq 0 ]; then
-			(ip netns exec peer0 ${OVPN_CLI} listen tun0 1 ${TCP_PEERS_FILE} && {
+			(ip netns exec peer0 ${OVPN_CLI} listen tun0 1 ${M_ID} ${TCP_PEERS_FILE} && {
 				for p in $(seq 1 ${NUM_PEERS}); do
 					ip netns exec peer0 ${OVPN_CLI} new_key tun0 ${p} 1 0 \
 						${ALG} 0 data64.key
@@ -105,15 +119,24 @@ add_peer() {
 			}) &
 			sleep 5
 		else
-			ip netns exec peer${1} ${OVPN_CLI} connect tun${1} ${1} 10.10.${1}.1 1 \
-				data64.key
+			if [ "${SYMMETRIC_ID}" -eq 1 ]; then
+				PEER_ID=${1}
+				TX_ID="none"
+			else
+				PEER_ID=$(awk "NR == ${1} {print \$2}" ${TCP_PEERS_FILE})
+				TX_ID=${1}
+			fi
+			ip netns exec peer${1} ${OVPN_CLI} connect tun${1} \
+				${PEER_ID} ${TX_ID} 10.10.${1}.1 1 data64.key
 		fi
 	fi
 }
 
 compare_ntfs() {
 	if [ ${#tmp_jsons[@]} -gt 0 ]; then
-		[ "$FLOAT" == 1 ] && suffix="-float"
+		suffix=""
+		[ "$SYMMETRIC_ID" == 1 ] && suffix="${suffix}-symm"
+		[ "$FLOAT" == 1 ] && suffix="${suffix}-float"
 		expected="json/peer${1}${suffix}.json"
 		received="${tmp_jsons[$1]}"
 
