@@ -136,6 +136,7 @@ struct ovpn_ctx {
 
 	bool asymm_id;
 	uint32_t mark;
+	const char *bind_dev;
 
 	const char *peers_file;
 };
@@ -539,6 +540,14 @@ static int ovpn_socket(struct ovpn_ctx *ctx, sa_family_t family, int proto)
 		if (setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &opt,
 			       sizeof(opt))) {
 			perror("failed to set IPV6_V6ONLY");
+			return -1;
+		}
+	}
+
+	if (ctx->bind_dev) {
+		if (setsockopt(s, SOL_SOCKET, SO_BINDTODEVICE, ctx->bind_dev,
+			       strlen(ctx->bind_dev) + 1) != 0) {
+			perror("setsockopt for SO_BINDTODEVICE");
 			return -1;
 		}
 	}
@@ -1701,8 +1710,10 @@ static void usage(const char *cmd)
 		"\tkey_file: file containing the symmetric key for encryption\n");
 
 	fprintf(stderr,
-		"* new_peer <iface> <peer_id> <tx_id> <lport> <raddr> <rport> [vpnaddr]: add new peer\n");
+		"* new_peer <iface> <dev> <peer_id> <tx_id> <lport> <raddr> <rport> [vpnaddr]: add new peer\n");
 	fprintf(stderr, "\tiface: ovpn interface name\n");
+	fprintf(stderr,
+		"\tdev: transport interface name to bind to, supports 'any'\n");
 	fprintf(stderr,
 		"\tpeer_id: peer ID found in data packets received from this peer\n");
 	fprintf(stderr,
@@ -1713,8 +1724,10 @@ static void usage(const char *cmd)
 	fprintf(stderr, "\tvpnaddr: peer VPN IP\n");
 
 	fprintf(stderr,
-		"* new_multi_peer <iface> <lport> <id_type> <peers_file> [mark]: add multiple peers as listed in the file\n");
+		"* new_multi_peer <iface> <dev> <lport> <id_type> <peers_file> [mark]: add multiple peers as listed in the file\n");
 	fprintf(stderr, "\tiface: ovpn interface name\n");
+	fprintf(stderr,
+		"\tdev: transport interface name to bind to, supports 'any'\n");
 	fprintf(stderr, "\tlport: local UDP port to bind to\n");
 	fprintf(stderr, "\tid_type:\n");
 	fprintf(stderr, "\t\t- SYMM for ignoring the TX peer ID from the peers_file\n");
@@ -2257,45 +2270,49 @@ static int ovpn_parse_cmd_args(struct ovpn_ctx *ovpn, int argc, char *argv[])
 		if (argc < 8)
 			return -EINVAL;
 
-		ovpn->asymm_id = strcmp(argv[4], "none");
+		ovpn->bind_dev = strcmp(argv[3], "any") == 0 ? NULL : argv[3];
 
-		ovpn->lport = strtoul(argv[5], NULL, 10);
+		ovpn->asymm_id = strcmp(argv[5], "none");
+
+		ovpn->lport = strtoul(argv[6], NULL, 10);
 		if (errno == ERANGE || ovpn->lport > 65535) {
 			fprintf(stderr, "lport value out of range\n");
 			return -1;
 		}
 
-		const char *vpnip = (argc > 8) ? argv[8] : NULL;
+		const char *vpnip = (argc > 9) ? argv[9] : NULL;
 
-		ret = ovpn_parse_new_peer(ovpn, argv[3], argv[4], argv[6],
-					  argv[7], vpnip);
+		ret = ovpn_parse_new_peer(ovpn, argv[4], argv[5], argv[7],
+					  argv[8], vpnip);
 		if (ret < 0)
 			return -1;
 		break;
 	case CMD_NEW_MULTI_PEER:
-		if (argc < 6)
+		if (argc < 7)
 			return -EINVAL;
 
-		ovpn->lport = strtoul(argv[3], NULL, 10);
+		ovpn->bind_dev = strcmp(argv[3], "any") == 0 ? NULL : argv[3];
+
+		ovpn->lport = strtoul(argv[4], NULL, 10);
 		if (errno == ERANGE || ovpn->lport > 65535) {
 			fprintf(stderr, "lport value out of range\n");
 			return -1;
 		}
 
-		if (!strcmp(argv[4], "SYMM")) {
+		if (!strcmp(argv[5], "SYMM")) {
 			ovpn->asymm_id = false;
-		} else if (!strcmp(argv[4], "ASYMM")) {
+		} else if (!strcmp(argv[5], "ASYMM")) {
 			ovpn->asymm_id = true;
 		} else {
-			fprintf(stderr, "Cannot parse id type: %s\n", argv[4]);
+			fprintf(stderr, "Cannot parse id type: %s\n", argv[5]);
 			return -1;
 		}
 
-		ovpn->peers_file = argv[5];
+		ovpn->peers_file = argv[6];
 
 		ovpn->mark = 0;
-		if (argc > 6) {
-			ovpn->mark = strtoul(argv[6], NULL, 10);
+		if (argc > 7) {
+			ovpn->mark = strtoul(argv[7], NULL, 10);
 			if (errno == ERANGE || ovpn->mark > UINT32_MAX) {
 				fprintf(stderr, "mark value out of range\n");
 				return -1;
