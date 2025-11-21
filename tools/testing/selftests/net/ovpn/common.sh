@@ -87,7 +87,7 @@ add_peer() {
 	if [ "${PROTO}" == "UDP" ]; then
 		if [ ${1} -eq 0 ]; then
 			ip netns exec peer0 ${OVPN_CLI} new_multi_peer tun0 \
-				any 1 ${M_ID} ${UDP_PEERS_FILE}
+				any any 1 ${M_ID} ${UDP_PEERS_FILE}
 
 			for p in $(seq 1 ${NUM_PEERS}); do
 				ip netns exec peer0 ${OVPN_CLI} new_key tun0 \
@@ -105,7 +105,7 @@ add_peer() {
 			RPORT=$(awk "NR == ${1} {print \$4}" ${UDP_PEERS_FILE})
 			LPORT=$(awk "NR == ${1} {print \$6}" ${UDP_PEERS_FILE})
 			ip netns exec peer${1} ${OVPN_CLI} new_peer tun${1} \
-				any ${PEER_ID} ${TX_ID} ${LPORT} \
+				any ${PEER_ID} ${TX_ID} any ${LPORT} \
 				${RADDR} ${RPORT}
 			ip netns exec peer${1} ${OVPN_CLI} new_key tun${1} \
 				${PEER_ID} 1 0 ${ALG} 1 data64.key

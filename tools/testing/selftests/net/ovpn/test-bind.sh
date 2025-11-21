@@ -59,16 +59,17 @@ ip -n peer2 link set tun2 up
 
 run_bind_test() {
 	dev=${1}
-	raddr4_peer1=${2}
-	raddr4_peer2=${3}
+	laddr=${2}
+	raddr4_peer1=${3}
+	raddr4_peer2=${4}
 
 	bind_cleanup
 
-	ip netns exec peer1 "${OVPN_CLI}" new_peer tun1 "${dev}" 1 10 1 \
-		"${raddr4_peer1}" 1
+	ip netns exec peer1 "${OVPN_CLI}" new_peer tun1 "${dev}" 1 10 \
+		"${laddr}" 1 "${raddr4_peer1}" 1
 	ip netns exec peer1 "${OVPN_CLI}" new_key tun1 1 1 0 "${ALG}" 0 \
 		data64.key
-	ip netns exec peer2 "${OVPN_CLI}" new_peer tun2 "${dev}" 10 1 1 \
+	ip netns exec peer2 "${OVPN_CLI}" new_peer tun2 "${dev}" 10 1 any 1 \
 		"${raddr4_peer2}" 1
 	ip netns exec peer2 "${OVPN_CLI}" new_key tun2 10 1 0 "${ALG}" 1 \
 		data64.key
@@ -76,11 +77,15 @@ run_bind_test() {
 	ip netns exec peer1 "${OVPN_CLI}" set_peer tun1 1 60 120
 	ip netns exec peer2 "${OVPN_CLI}" set_peer tun2 10 60 120
 
-	timeout 2 ip netns exec peer1 tcpdump -i veth1 udp port 1 -n -q \
-		> /tmp/ovpn-bind1.log 2>/dev/null &
+	if [ "${laddr}" != "any" ]; then
+		host="and src host ${laddr}"
+	fi
+
+	timeout 2 ip netns exec peer1 tcpdump -nqi veth1 udp "${host}" and \
+		port 1 > /tmp/ovpn-bind1.log 2>/dev/null &
 	tcpdump1_pid=$!
-	timeout 2 ip netns exec peer1 tcpdump -i veth2 udp port 1 -n -q \
-		> /tmp/ovpn-bind2.log 2>/dev/null &
+	timeout 2 ip netns exec peer1 tcpdump -nqi veth2 udp "${host}" and \
+		port 1 > /tmp/ovpn-bind2.log 2>/dev/null &
 	tcpdump2_pid=$!
 
 	sleep 0.5
@@ -91,18 +96,27 @@ run_bind_test() {
 	wait ${tcpdump2_pid} || true
 }
 
-# test without SO_BINDTODEVICE (traffic flows through veth2 because of the /32
-# routing rule)
+# test without binding to local address or interface (traffic flows through
+# veth2 with src 20.20.20.1 because of the /32 routing rule)
 echo "No binding"
-run_bind_test any 10.10.10.2 10.10.10.1
+run_bind_test any any 10.10.10.2 10.10.10.1
 [ "$(grep -c -i udp /tmp/ovpn-bind1.log)" -eq 0 ]
 [ "$(grep -c -i udp /tmp/ovpn-bind2.log)" -ge 100 ]
+[ "$(grep -c "10.10.10.1\.1 >" /tmp/ovpn-bind2.log)" -eq 0 ]
+[ "$(grep -c "20.20.20.1\.1 >" /tmp/ovpn-bind2.log)" -ge 50 ]
 
 # test with SO_BINDTODEVICE to veth1 (overrides route rule)
 echo "Bind to veth1"
-run_bind_test veth1 10.10.10.2 10.10.10.1
+run_bind_test veth1 any 10.10.10.2 10.10.10.1
 [ "$(grep -c -i udp /tmp/ovpn-bind1.log)" -ge 100 ]
 [ "$(grep -c -i udp /tmp/ovpn-bind2.log)" -eq 0 ]
+
+# test with binding to local address 10.10.10.1
+echo "Bind to 10.10.10.1"
+run_bind_test any 10.10.10.1 10.10.10.2 10.10.10.1
+[ "$(grep -c -i udp /tmp/ovpn-bind1.log)" -eq 0 ]
+[ "$(grep -c "10.10.10.1\.1 >" /tmp/ovpn-bind2.log)" -ge 50 ]
+[ "$(grep -c "20.20.20.1\.1 >" /tmp/ovpn-bind2.log)" -eq 0 ]
 
 bind_cleanup
 cleanup
