@@ -23,7 +23,16 @@ endif
 LDLIBS += $(NL_LDLIBS)
 
 
-TEST_FILES = common.sh
+TEST_FILES = \
+	check_requirements.py \
+	common.sh \
+	data64.key \
+	requirements.txt \
+	tcp_peers.txt \
+	udp_peers.txt \
+	../../../../net/ynl/pyynl/cli.py \
+	json
+# end of TEST_FILES
 
 TEST_PROGS := \
 	test-chachapoly.sh \
