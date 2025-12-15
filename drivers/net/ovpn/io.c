@@ -344,6 +344,119 @@ static void ovpn_send(struct ovpn_priv *ovpn, struct sk_buff *skb,
 	ovpn_peer_put(peer);
 }
 
+/**
+ * ovpn_skb_list_clone - clone a (chain of) skb(s)
+ * @src: original skb or list of skbs (chained through skb->next) to clone
+ * @gfp: kernel flag for memory allocation
+ *
+ * Return: a cloned skb list on success or NULL on allocation failure
+ */
+static struct sk_buff *ovpn_skb_list_clone(struct sk_buff *src, gfp_t gfp)
+{
+	struct sk_buff *curr, *next, *nskb, *out = NULL;
+	struct sk_buff **pskb;
+
+	pskb = &out;
+	skb_list_walk_safe(src, curr, next) {
+		nskb = skb_clone(curr, gfp);
+		if (unlikely(!nskb)) {
+			kfree_skb_list(out);
+			return NULL;
+		}
+
+		*pskb = nskb;
+		pskb = &nskb->next;
+	}
+
+	*pskb = NULL;
+	return out;
+}
+
+/**
+ * ovpn_send_multicast - send skb to all connected peers
+ * @ovpn: the openvpn instance where the peers collection is found
+ * @skb: the (list of) skb(s) to send
+ * @tx_bytes: the number of bytes to send (for stats update)
+ *
+ * This function tries to send a multi/broadcast message to all the connected
+ * peers.
+ *
+ * Note that this function takes ownership of @skb.
+ */
+static void ovpn_send_multicast(struct ovpn_priv *ovpn, struct sk_buff *skb,
+				unsigned int tx_bytes)
+{
+	unsigned int num_peers, actual_peers, i;
+	struct ovpn_peer **peers = NULL;
+	struct ovpn_peer *peer;
+	struct sk_buff *clone;
+	int bucket;
+
+	/* count peers */
+	num_peers = 0;
+	rcu_read_lock();
+	hash_for_each_rcu(ovpn->peers->by_id, bucket, peer, hash_entry_id)
+		num_peers++;
+	rcu_read_unlock();
+
+	if (unlikely(num_peers == 0))
+		goto no_peers;
+
+	peers = kmalloc_array(num_peers, sizeof(*peers), GFP_ATOMIC);
+	if (unlikely(!peers)) {
+		net_warn_ratelimited("%s: failed to allocate multicast peers array\n",
+				     netdev_name(ovpn->dev));
+		goto no_peers;
+	}
+
+	/* collect peer references */
+	actual_peers = 0;
+	rcu_read_lock();
+	hash_for_each_rcu(ovpn->peers->by_id, bucket, peer, hash_entry_id) {
+		/* peer added between passes: some peer won't receive skb */
+		if (unlikely(actual_peers >= num_peers))
+			break;
+
+		if (likely(ovpn_peer_hold(peer)))
+			peers[actual_peers++] = peer;
+	}
+	rcu_read_unlock();
+
+	/* all peers vanished or failed hold between passes */
+	if (unlikely(!actual_peers))
+		goto no_peers;
+
+	/* send clones to all peers except the last */
+	for (i = 0; i < actual_peers - 1; ++i) {
+		clone = ovpn_skb_list_clone(skb, GFP_ATOMIC);
+		if (unlikely(!clone)) {
+			net_warn_ratelimited("%s: failed to clone skb list for peer %u\n",
+					     netdev_name(ovpn->dev),
+					     peers[i]->id);
+			dev_dstats_tx_dropped(ovpn->dev);
+			ovpn_peer_put(peers[i]);
+			continue;
+		}
+
+		ovpn_peer_stats_increment_tx(&peers[i]->vpn_stats, tx_bytes);
+		ovpn_send(ovpn, clone, peers[i]);
+	}
+
+	/* send original to last peer */
+	ovpn_peer_stats_increment_tx(&peers[actual_peers - 1]->vpn_stats,
+				     tx_bytes);
+	ovpn_send(ovpn, skb, peers[actual_peers - 1]);
+
+	kfree(peers);
+	return;
+
+no_peers:
+	kfree(peers);
+	dev_dstats_tx_dropped(ovpn->dev);
+	skb_tx_error(skb);
+	kfree_skb_list(skb);
+}
+
 /* Send user data to the network
  */
 netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
@@ -354,6 +467,7 @@ netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
 	unsigned int tx_bytes = 0;
 	struct ovpn_peer *peer;
 	__be16 proto;
+	bool mbcast;
 	int ret;
 
 	/* reset netfilter state */
@@ -365,8 +479,8 @@ netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
 		goto drop_no_peer;
 
 	/* retrieve peer serving the destination IP of this packet */
-	peer = ovpn_peer_get_by_dst(ovpn, skb);
-	if (unlikely(!peer)) {
+	peer = ovpn_peer_get_by_dst(ovpn, skb, &mbcast);
+	if (unlikely(!peer && !mbcast)) {
 		switch (skb->protocol) {
 		case htons(ETH_P_IP):
 			net_dbg_ratelimited("%s: no peer to send data to dst=%pI4\n",
@@ -420,18 +534,26 @@ netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
 	 * incremented the counter for each failure in the loop
 	 */
 	if (unlikely(skb_queue_empty(&skb_list))) {
-		ovpn_peer_put(peer);
+		if (peer)
+			ovpn_peer_put(peer);
 		return NETDEV_TX_OK;
 	}
 	skb_list.prev->next = NULL;
 
-	ovpn_peer_stats_increment_tx(&peer->vpn_stats, tx_bytes);
-	ovpn_send(ovpn, skb_list.next, peer);
+	/* unicast */
+	if (likely(peer)) {
+		ovpn_peer_stats_increment_tx(&peer->vpn_stats, tx_bytes);
+		ovpn_send(ovpn, skb_list.next, peer);
+		return NETDEV_TX_OK;
+	}
 
+	/* multicast; ovpn_send_multicast consumes skb_list */
+	ovpn_send_multicast(ovpn, skb_list.next, tx_bytes);
 	return NETDEV_TX_OK;
 
 drop:
-	ovpn_peer_put(peer);
+	if (peer)
+		ovpn_peer_put(peer);
 drop_no_peer:
 	dev_dstats_tx_dropped(ovpn->dev);
 	skb_tx_error(skb);
