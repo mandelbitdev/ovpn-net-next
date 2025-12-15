@@ -9,6 +9,45 @@ set -e
 
 source ./common.sh
 
+mbcast_ping() {
+	local mode=$1
+	local mbcast_timeout=3
+	local p
+	local pid
+	local filter
+	local ping_cmd=()
+	local pids=()
+
+	case "${mode}" in
+	bcast)
+		filter='icmp and dst host 5.5.5.255'
+		ping_cmd=(ip netns exec peer0 ping -qbc 1 -w 1 -I tun0 5.5.5.255)
+		;;
+	mcast4)
+		filter='icmp and dst host 224.0.0.1'
+		ping_cmd=(ip netns exec peer0 ping -qc 1 -w 1 -I tun0 224.0.0.1)
+		;;
+	mcast6)
+		filter='icmp6 and dst host ff02::1'
+		ping_cmd=(ip netns exec peer0 ping -6 -qc 1 -w 1 -I tun0 ff02::1)
+		;;
+	esac
+
+	for p in $(seq 1 "${NUM_PEERS}"); do
+		timeout "${mbcast_timeout}" ip netns exec peer"${p}" \
+			tcpdump --immediate-mode -p -ni tun"${p}" -c 1 \
+			"${filter}" >/dev/null 2>&1 &
+		pids+=($!)
+	done
+
+	sleep 1
+	"${ping_cmd[@]}" || true
+
+	for pid in "${pids[@]}"; do
+		wait "${pid}"
+	done
+}
+
 cleanup
 
 modprobe -q ovpn || true
@@ -89,6 +128,15 @@ fi
 ip netns exec peer0 iperf3 -1 -s &
 sleep 1
 ip netns exec peer1 iperf3 -Z -t 3 -c 5.5.5.1
+
+echo "Checking bcast support"
+mbcast_ping bcast
+
+echo "Checking mcast4 support"
+mbcast_ping mcast4
+
+echo "Checking mcast6 support"
+mbcast_ping mcast6
 
 echo "Adding secondary key and then swap:"
 for p in $(seq 1 ${NUM_PEERS}); do
