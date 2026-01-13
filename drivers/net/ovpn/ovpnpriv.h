@@ -39,7 +39,6 @@ struct ovpn_peer_collection {
  * @lock: protect this object
  * @peers: data structures holding multi-peer references
  * @peer: in P2P mode, this is the only remote peer
- * @gro_cells: pointer to the Generic Receive Offload cell
  * @keepalive_work: struct used to schedule keepalive periodic job
  */
 struct ovpn_priv {
@@ -48,7 +47,6 @@ struct ovpn_priv {
 	spinlock_t lock; /* protect writing to the ovpn_priv object */
 	struct ovpn_peer_collection *peers;
 	struct ovpn_peer __rcu *peer;
-	struct gro_cells gro_cells;
 	struct delayed_work keepalive_work;
 };
 
