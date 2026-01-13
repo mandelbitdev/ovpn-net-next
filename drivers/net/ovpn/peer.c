@@ -10,6 +10,7 @@
 #include <linux/skbuff.h>
 #include <linux/list.h>
 #include <linux/hashtable.h>
+#include <net/hotdata.h>
 #include <net/ip6_route.h>
 
 #include "ovpnpriv.h"
@@ -82,6 +83,53 @@ static void ovpn_peer_keepalive_send(struct work_struct *work)
 	local_bh_enable();
 }
 
+bool ovpn_enqueue_encap(struct ovpn_peer *peer, struct sk_buff *skb)
+{
+	if (skb_queue_len(&peer->encap_q) >=
+	    READ_ONCE(net_hotdata.max_backlog))
+		return false;
+
+	skb_queue_tail(&peer->encap_q, skb);
+	napi_schedule(&peer->napi);
+	return true;
+}
+
+static int ovpn_peer_encap_poll(struct napi_struct *napi, int budget)
+{
+	struct ovpn_peer *peer = container_of(napi, struct ovpn_peer, napi);
+	struct sk_buff *skb;
+	int work = 0;
+
+	while (work < budget && (skb = skb_dequeue(&peer->encap_q))) {
+		ovpn_recv(peer, skb);
+		++work;
+	}
+
+	if (work < budget)
+		napi_complete_done(napi, work);
+
+	return work;
+}
+
+static int ovpn_peer_napi_init(struct ovpn_peer *peer, struct net_device *dev)
+{
+	skb_queue_head_init(&peer->encap_q);
+
+	set_bit(NAPI_STATE_NO_BUSY_POLL, &peer->napi.state);
+	netif_napi_add(dev, &peer->napi, ovpn_peer_encap_poll);
+	napi_enable(&peer->napi);
+
+	return 0;
+}
+
+static void ovpn_peer_napi_uninit(struct ovpn_peer *peer)
+{
+	napi_disable(&peer->napi);
+	netif_napi_del(&peer->napi);
+
+	__skb_queue_purge(&peer->encap_q);
+}
+
 /**
  * ovpn_peer_new - allocate and initialize a new peer object
  * @ovpn: the openvpn instance inside which the peer should be created
@@ -118,6 +166,17 @@ struct ovpn_peer *ovpn_peer_new(struct ovpn_priv *ovpn, u32 id)
 		netdev_err(ovpn->dev,
 			   "cannot initialize dst cache for peer %u\n",
 			   peer->id);
+		kfree(peer);
+		return ERR_PTR(ret);
+	}
+
+	ret = ovpn_peer_napi_init(peer, ovpn->dev);
+	if (ret < 0) {
+		netdev_err(ovpn->dev,
+			   "cannot initialize NAPI for peer %u\n",
+			   peer->id);
+		ovpn_peer_napi_uninit(peer);
+		dst_cache_destroy(&peer->dst_cache);
 		kfree(peer);
 		return ERR_PTR(ret);
 	}
@@ -350,6 +409,7 @@ static void ovpn_peer_release_rcu(struct rcu_head *head)
  */
 void ovpn_peer_release(struct ovpn_peer *peer)
 {
+	ovpn_peer_napi_uninit(peer);
 	ovpn_crypto_state_release(&peer->crypto);
 	spin_lock_bh(&peer->lock);
 	ovpn_bind_reset(peer, NULL);

@@ -45,6 +45,8 @@
  * @crypto: the crypto configuration (ciphers, keys, etc..)
  * @dst_cache: cache for dst_entry used to send to peer
  * @bind: remote peer binding
+ * @encap_q: queue of encapsulated packets awaiting processing/decapsulation
+ * @napi: NAPI context for handling packet reception
  * @keepalive_interval: seconds after which a new keepalive should be sent
  * @keepalive_xmit_exp: future timestamp when next keepalive should be sent
  * @last_sent: timestamp of the last successfully sent packet
@@ -98,6 +100,8 @@ struct ovpn_peer {
 	struct ovpn_crypto_state crypto;
 	struct dst_cache dst_cache;
 	struct ovpn_bind __rcu *bind;
+	struct sk_buff_head encap_q;
+	struct napi_struct napi;
 	unsigned long keepalive_interval;
 	unsigned long keepalive_xmit_exp;
 	time64_t last_sent;
@@ -151,6 +155,8 @@ struct ovpn_peer *ovpn_peer_get_by_dst(struct ovpn_priv *ovpn,
 void ovpn_peer_hash_vpn_ip(struct ovpn_peer *peer);
 bool ovpn_peer_check_by_src(struct ovpn_priv *ovpn, struct sk_buff *skb,
 			    struct ovpn_peer *peer);
+
+bool ovpn_enqueue_encap(struct ovpn_peer *peer, struct sk_buff *skb);
 
 void ovpn_peer_keepalive_set(struct ovpn_peer *peer, u32 interval, u32 timeout);
 void ovpn_peer_keepalive_work(struct work_struct *work);

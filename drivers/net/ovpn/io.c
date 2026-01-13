@@ -59,9 +59,6 @@ static bool ovpn_is_keepalive(struct sk_buff *skb)
  */
 static void ovpn_netdev_write(struct ovpn_peer *peer, struct sk_buff *skb)
 {
-	unsigned int pkt_len;
-	int ret;
-
 	/*
 	 * GSO state from the transport layer is not valid for the tunnel/data
 	 * path. Reset all GSO fields to prevent any further GSO processing
@@ -88,14 +85,12 @@ static void ovpn_netdev_write(struct ovpn_peer *peer, struct sk_buff *skb)
 	skb_reset_transport_header(skb);
 	skb_reset_inner_headers(skb);
 
+	/* update RX stats with the size of decrypted packet */
+	ovpn_peer_stats_increment_rx(&peer->vpn_stats, skb->len);
+	dev_dstats_rx_add(peer->ovpn->dev, skb->len);
+
 	/* cause packet to be "received" by the interface */
-	pkt_len = skb->len;
-	ret = gro_cells_receive(&peer->ovpn->gro_cells, skb);
-	if (likely(ret == NET_RX_SUCCESS)) {
-		/* update RX stats with the size of decrypted packet */
-		ovpn_peer_stats_increment_rx(&peer->vpn_stats, pkt_len);
-		dev_dstats_rx_add(peer->ovpn->dev, pkt_len);
-	}
+	napi_gro_receive(&peer->napi, skb);
 }
 
 void ovpn_decrypt_post(void *data, int ret)
