@@ -879,13 +879,24 @@ bool ovpn_peer_check_by_src(struct ovpn_priv *ovpn, struct sk_buff *skb,
 
 	switch (skb->protocol) {
 	case htons(ETH_P_IP):
-		addr4 = ovpn_nexthop_from_rt4(ovpn, ip_hdr(skb)->saddr);
+		/* avoid the route lookup when the source is the peer's own vpn
+		 * address, but still confirm current table ownership below
+		 */
+		addr4 = ip_hdr(skb)->saddr;
+		if (addr4 != peer->vpn_addrs.ipv4.s_addr ||
+		    peer->vpn_addrs.ipv4.s_addr == htonl(INADDR_ANY))
+			addr4 = ovpn_nexthop_from_rt4(ovpn, addr4);
+
 		rcu_read_lock();
 		match = (peer == ovpn_peer_get_by_vpn_addr4(ovpn, addr4));
 		rcu_read_unlock();
 		break;
 	case htons(ETH_P_IPV6):
-		addr6 = ovpn_nexthop_from_rt6(ovpn, ipv6_hdr(skb)->saddr);
+		addr6 = ipv6_hdr(skb)->saddr;
+		if (!ipv6_addr_equal(&addr6, &peer->vpn_addrs.ipv6) ||
+		    ipv6_addr_any(&peer->vpn_addrs.ipv6))
+			addr6 = ovpn_nexthop_from_rt6(ovpn, addr6);
+
 		rcu_read_lock();
 		match = (peer == ovpn_peer_get_by_vpn_addr6(ovpn, &addr6));
 		rcu_read_unlock();
