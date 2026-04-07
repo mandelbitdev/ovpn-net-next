@@ -83,6 +83,8 @@ static void ovpn_net_uninit(struct net_device *dev)
 	struct ovpn_priv *ovpn = netdev_priv(dev);
 
 	disable_delayed_work_sync(&ovpn->keepalive_work);
+	disable_work_sync(&ovpn->bcast.work);
+	skb_queue_purge(&ovpn->bcast.queue);
 	ovpn_peers_free(ovpn, NULL, OVPN_DEL_PEER_REASON_TEARDOWN);
 	gro_cells_destroy(&ovpn->gro_cells);
 }
@@ -176,7 +178,7 @@ static void ovpn_setup(struct net_device *dev)
 	dev->max_mtu = IP_MAX_MTU - OVPN_HEAD_ROOM;
 
 	dev->type = ARPHRD_NONE;
-	dev->flags = IFF_POINTOPOINT | IFF_NOARP;
+	dev->flags = IFF_POINTOPOINT | IFF_NOARP | IFF_MULTICAST;
 	dev->priv_flags |= IFF_NO_QUEUE;
 	/* when routing packets to a LAN behind a client, we rely on the
 	 * route entry that originally brought the packet into ovpn, so
@@ -213,6 +215,9 @@ static int ovpn_newlink(struct net_device *dev,
 	ovpn->mode = mode;
 	spin_lock_init(&ovpn->lock);
 	INIT_DELAYED_WORK(&ovpn->keepalive_work, ovpn_peer_keepalive_work);
+
+	skb_queue_head_init(&ovpn->bcast.queue);
+	INIT_WORK(&ovpn->bcast.work, ovpn_bcast_work);
 
 	/* Set carrier explicitly after registration, this way state is
 	 * clearly defined.

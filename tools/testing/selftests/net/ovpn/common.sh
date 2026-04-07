@@ -173,6 +173,11 @@ ovpn_setup_ns() {
 	if [ -n "${3}" ]; then
 		ip -n "${peer}" link set mtu ${3} dev tun${1}
 	fi
+	# Multicast support floods locally generated MLD reports to all peers,
+	# inflating test-mark.sh's drop counter. Disable automatic IPv6
+	# link-local address generation on test tunnels to avoid this
+	# background traffic.
+	ip -n "${peer}" link set dev tun${1} addrgenmode none
 	ip -n "${peer}" link set tun${1} up
 }
 
