@@ -723,6 +723,8 @@ static void ovpn_peer_remove(struct ovpn_peer *peer,
  * ovpn_peer_get_by_dst - Lookup peer to send skb to
  * @ovpn: the private data representing the current VPN session
  * @skb: the skb to extract the destination address from
+ * @bcast: set to true if the packet is a broadcast or a multicast
+ *	   and flooding to all peers is required, false otherwise
  *
  * This function takes a tunnel packet and looks up the peer to send it to
  * after encapsulation. The skb is expected to be the in-tunnel packet, without
@@ -730,14 +732,19 @@ static void ovpn_peer_remove(struct ovpn_peer *peer,
  *
  * Assume that the IP header is accessible in the skb data.
  *
- * Return: the peer if found or NULL otherwise.
+ * Return: if found, a peer with a reference held. Otherwise NULL, with *@bcast
+ *	   set to true to flood all peers or false if no peer was found
  */
-struct ovpn_peer *ovpn_peer_get_by_dst(struct ovpn_priv *ovpn,
-				       struct sk_buff *skb)
+struct ovpn_peer *ovpn_peer_get_by_dst(struct ovpn_priv *ovpn, struct sk_buff *skb,
+				       bool *bcast)
 {
 	struct ovpn_peer *peer = NULL;
+	const struct rtable *rt;
+	unsigned int addr_type;
 	struct in6_addr addr6;
 	__be32 addr4;
+
+	*bcast = false;
 
 	/* in P2P mode, no matter the destination, packets are always sent to
 	 * the single peer listening on the other side
@@ -756,10 +763,29 @@ struct ovpn_peer *ovpn_peer_get_by_dst(struct ovpn_priv *ovpn,
 	case htons(ETH_P_IP):
 		addr4 = ovpn_nexthop_from_skb4(skb);
 		peer = ovpn_peer_get_by_vpn_addr4(ovpn, addr4);
+
+		if (peer)
+			break;
+
+		/* Reuse the route's classification when available. Otherwise, use
+		 * inet_dev_addr_type() to also detect subnet-directed broadcasts,
+		 * which ipv4_is_lbcast() and ipv4_is_multicast() cannot identify.
+		 */
+		rt = skb_rtable(skb);
+		addr_type = rt ? rt->rt_type :
+				 inet_dev_addr_type(dev_net(ovpn->dev),
+						    ovpn->dev, addr4);
+		*bcast = addr_type == RTN_BROADCAST || addr_type == RTN_MULTICAST;
 		break;
 	case htons(ETH_P_IPV6):
 		addr6 = ovpn_nexthop_from_skb6(skb);
 		peer = ovpn_peer_get_by_vpn_addr6(ovpn, &addr6);
+
+		if (peer)
+			break;
+
+		if (ipv6_addr_is_multicast(&addr6))
+			*bcast = true;
 		break;
 	}
 

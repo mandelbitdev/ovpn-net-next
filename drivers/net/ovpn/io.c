@@ -8,6 +8,7 @@
  */
 
 #include <crypto/aead.h>
+#include <linux/igmp.h>
 #include <linux/netdevice.h>
 #include <linux/skbuff.h>
 #include <net/gro_cells.h>
@@ -105,6 +106,161 @@ static void ovpn_netdev_write(struct ovpn_peer *peer, struct sk_buff *skb)
 	local_bh_enable();
 }
 
+/**
+ * ovpn_mcast_mld_offset - compute the offset to the MLD payload in an IPv6 packet
+ * @skb: the packet to inspect
+ * @offsetp: pointer to store the computed offset
+ *
+ * RFC 9777, section 5, requires a Hop-by-Hop Router Alert option for MLD.
+ * Verify it and locate the following ICMPv6 header.
+ *
+ * Caller must ensure that the IPv6 header is linearized.
+ *
+ * Return: true if the offset was computed successfully, false otherwise
+ */
+static bool ovpn_mcast_mld_offset(const struct sk_buff *skb, unsigned int *offsetp)
+{
+	unsigned int offset = sizeof(struct ipv6hdr);
+	struct ipv6_opt_hdr _hopopt, *hopopt;
+	unsigned int len;
+
+	if (ipv6_hdr(skb)->nexthdr != IPPROTO_HOPOPTS)
+		return false;
+
+	hopopt = skb_header_pointer(skb, offset, sizeof(_hopopt), &_hopopt);
+	if (!hopopt || hopopt->nexthdr != IPPROTO_ICMPV6)
+		return false;
+
+	len = ipv6_optlen(hopopt);
+	if (ntohs(ipv6_hdr(skb)->payload_len) < len + sizeof(struct icmp6hdr))
+		return false;
+
+	const unsigned int opt_end = offset + len;
+
+	offset += sizeof(_hopopt);
+	while (offset < opt_end) {
+		const u8 *opt;
+		u8 _opt[4];
+
+		opt = skb_header_pointer(skb, offset,
+					 min_t(unsigned int, sizeof(_opt), opt_end - offset),
+					 _opt);
+		if (!opt)
+			return false;
+
+		if (opt[0] == IPV6_TLV_PAD1) {
+			offset++;
+			continue;
+		}
+
+		if (opt_end < offset + 2)
+			return false;
+
+		len = 2 + opt[1];
+		if (len + offset > opt_end)
+			return false;
+
+		if (opt[0] == IPV6_TLV_ROUTERALERT) {
+			/* MLD Router Alert: two-byte value, both bytes zero. */
+			if (len != sizeof(_opt) || opt[2] || opt[3])
+				return false;
+			*offsetp = opt_end;
+			return true;
+		}
+		offset += len;
+	}
+
+	return false;
+}
+
+/**
+ * ovpn_mcast_is_control - identify multicast control traffic exempt from RPF
+ * @skb: the packet to inspect
+ *
+ * Caller must ensure that IP/IPv6 headers are linearized.
+ *
+ * Return: true if the skb contains IGMP or MLD traffic exempt from RPF,
+ *         false otherwise
+ */
+static bool ovpn_mcast_is_control(const struct sk_buff *skb)
+{
+	unsigned int offset;
+	struct icmp6hdr _ih, *ih;
+	int addr_type;
+
+	if (skb->protocol == htons(ETH_P_IP)) {
+		const struct igmphdr *igmp;
+		struct igmphdr _igmp;
+
+		/* RFC 9776, section 4.2.14, permits IGMP reports to use
+		 * 0.0.0.0 before acquiring an IP address. RFC 4541, section
+		 * 2.1.1, also permits proxy queries with this source address.
+		 * Unicast sources must pass the normal RPF check.
+		 */
+		if (ip_hdr(skb)->protocol != IPPROTO_IGMP ||
+		    ip_hdr(skb)->saddr != 0)
+			return false;
+
+		if (ip_is_fragment(ip_hdr(skb)))
+			return false;
+
+		offset = ip_hdrlen(skb);
+		if (offset < sizeof(struct iphdr) ||
+		    ntohs(ip_hdr(skb)->tot_len) < offset + sizeof(_igmp))
+			return false;
+
+		igmp = skb_header_pointer(skb, offset, sizeof(_igmp), &_igmp);
+		if (!igmp)
+			return false;
+
+		switch (igmp->type) {
+		case IGMP_HOST_MEMBERSHIP_QUERY:
+		case IGMP_HOST_MEMBERSHIP_REPORT:
+		case IGMPV2_HOST_MEMBERSHIP_REPORT:
+		case IGMPV3_HOST_MEMBERSHIP_REPORT:
+		/* IGMPv2 Leave has no specified zero-source exception.
+		 * Leave messages remain subject to RPF.
+		 */
+			return true;
+		default:
+			return false;
+		}
+	}
+
+	/* RFC 9777, section 5, requires a Hop Limit of 1 for MLD. */
+	if (skb->protocol != htons(ETH_P_IPV6) || ipv6_hdr(skb)->hop_limit != 1)
+		return false;
+
+	addr_type = ipv6_addr_type(&ipv6_hdr(skb)->saddr);
+	if (addr_type != IPV6_ADDR_ANY &&
+	    addr_type != (IPV6_ADDR_UNICAST | IPV6_ADDR_LINKLOCAL))
+		return false;
+
+	if (!ovpn_mcast_mld_offset(skb, &offset))
+		return false;
+
+	ih = skb_header_pointer(skb, offset, sizeof(_ih), &_ih);
+	if (!ih)
+		return false;
+	switch (ih->icmp6_type) {
+	case ICMPV6_MGM_QUERY:
+		/* RFC 3590, section 4, and RFC 9777, section 5.1.14
+		 * require link-local query sources.
+		 */
+		return addr_type != IPV6_ADDR_ANY;
+	case ICMPV6_MGM_REPORT:
+	case ICMPV6_MGM_REDUCTION:
+	case ICMPV6_MLD2_REPORT:
+		/* RFC 3590, section 4, and RFC 9777, section 5.2.14, also
+		 * permit unspecified sources for reports and Done messages
+		 * before a link-local address is available.
+		 */
+		return true;
+	}
+
+	return false;
+}
+
 void ovpn_decrypt_post(void *data, int ret)
 {
 	struct ovpn_crypto_key_slot *ks;
@@ -183,8 +339,13 @@ void ovpn_decrypt_post(void *data, int ret)
 	}
 	skb->protocol = proto;
 
-	/* perform Reverse Path Filtering (RPF) */
-	if (unlikely(!ovpn_peer_check_by_src(peer->ovpn, skb, peer))) {
+	/* perform Reverse Path Filtering (RPF).
+	 * IGMP/MLD protocols may use source addresses
+	 * that differ from the peer's VPN address
+	 * so we bypass RPF in that case
+	 */
+	if (unlikely(!ovpn_peer_check_by_src(peer->ovpn, skb, peer) &&
+		     !ovpn_mcast_is_control(skb))) {
 		if (skb->protocol == htons(ETH_P_IPV6))
 			net_dbg_ratelimited("%s: RPF dropped packet from peer %u, src: %pI6c\n",
 					    netdev_name(peer->ovpn->dev),
@@ -332,7 +493,9 @@ static bool ovpn_encrypt_one(struct ovpn_peer *peer, struct sk_buff *skb)
 	return true;
 }
 
-/* send skb to connected peer, if any */
+/* send skb to connected peer, if any. The caller must hold and
+ * release its peer reference
+ */
 static void ovpn_send(struct ovpn_priv *ovpn, struct sk_buff *skb,
 		      struct ovpn_peer *peer)
 {
@@ -347,8 +510,70 @@ static void ovpn_send(struct ovpn_priv *ovpn, struct sk_buff *skb,
 			kfree_skb(curr);
 		}
 	}
+}
 
-	ovpn_peer_put(peer);
+/**
+ * ovpn_bcast_work - drain broadcast/multicast queue and transmit to all peers
+ * @work: broadcast work item
+ *
+ * Context: Process context. May sleep.
+ */
+void ovpn_bcast_work(struct work_struct *work)
+{
+	struct ovpn_priv *ovpn = container_of_const(work, struct ovpn_priv, bcast.work);
+	struct sk_buff *skb, *to_send;
+	struct ovpn_peer *peer, *next;
+	struct sk_buff_head skb_list;
+	LLIST_HEAD(peer_list);
+	int bkt;
+
+	__skb_queue_head_init(&skb_list);
+	spin_lock_bh(&ovpn->bcast.queue.lock);
+	skb_queue_splice_init(&ovpn->bcast.queue, &skb_list);
+	spin_unlock_bh(&ovpn->bcast.queue.lock);
+
+	if (skb_queue_empty(&skb_list))
+		return;
+
+	/* hold one peer_list snapshot for this batch. Packets queued meanwhile
+	 * trigger another run, which picks up peer membership changes
+	 */
+	rcu_read_lock();
+	hash_for_each_rcu(ovpn->peers->by_id, bkt, peer, hash_entry_id) {
+		if (likely(ovpn_peer_hold(peer)))
+			llist_add(&peer->bcast_entry, &peer_list);
+	}
+	rcu_read_unlock();
+
+	while ((skb = __skb_dequeue(&skb_list))) {
+		if (unlikely(llist_empty(&peer_list))) {
+			ovpn_dev_dstats_tx_dropped(ovpn->dev);
+			skb_tx_error(skb);
+			kfree_skb(skb);
+			cond_resched();
+			continue;
+		}
+
+		llist_for_each_entry(peer, peer_list.first, bcast_entry) {
+			if (likely(peer->bcast_entry.next))
+				to_send = skb_clone(skb, GFP_KERNEL);
+			else
+				to_send = skb;
+
+			if (likely(to_send)) {
+				ovpn_peer_stats_increment_tx(&peer->vpn_stats, skb->len);
+				local_bh_disable();
+				ovpn_send(ovpn, to_send, peer);
+				local_bh_enable();
+			} else {
+				ovpn_dev_dstats_tx_dropped(ovpn->dev);
+			}
+			cond_resched();
+		}
+	}
+
+	llist_for_each_entry_safe(peer, next, peer_list.first, bcast_entry)
+		ovpn_peer_put(peer);
 }
 
 /* Send user data to the network
@@ -362,6 +587,7 @@ netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
 	struct ovpn_peer *peer;
 	__be16 proto;
 	int ret;
+	bool bcast = false;
 
 	/* reset netfilter state */
 	nf_reset_ct(skb);
@@ -372,8 +598,8 @@ netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
 		goto drop_no_peer;
 
 	/* retrieve peer serving the destination IP of this packet */
-	peer = ovpn_peer_get_by_dst(ovpn, skb);
-	if (unlikely(!peer)) {
+	peer = ovpn_peer_get_by_dst(ovpn, skb, &bcast);
+	if (unlikely(!peer && !bcast)) {
 		switch (skb->protocol) {
 		case htons(ETH_P_IP):
 			net_dbg_ratelimited("%s: no peer to send data to dst=%pI4\n",
@@ -418,9 +644,29 @@ netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
 			continue;
 		}
 
+		if (unlikely(bcast)) {
+			spin_lock(&ovpn->bcast.queue.lock);
+			if (unlikely(skb_queue_len(&ovpn->bcast.queue) >= OVPN_BCAST_MAX_QLEN)) {
+				spin_unlock(&ovpn->bcast.queue.lock);
+				ovpn_dev_dstats_tx_dropped(ovpn->dev);
+				skb_tx_error(curr);
+				kfree_skb(curr);
+				continue;
+			}
+			__skb_queue_tail(&ovpn->bcast.queue, curr);
+			spin_unlock(&ovpn->bcast.queue.lock);
+			continue;
+		}
+
 		/* only count what we actually send */
 		tx_bytes += curr->len;
 		__skb_queue_tail(&skb_list, curr);
+	}
+
+	if (unlikely(bcast)) {
+		if (!skb_queue_empty(&ovpn->bcast.queue))
+			queue_work(ovpn_wq, &ovpn->bcast.work);
+		return NETDEV_TX_OK;
 	}
 
 	/* no segments survived: don't jump to 'drop' because we already
@@ -434,11 +680,13 @@ netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
 
 	ovpn_peer_stats_increment_tx(&peer->vpn_stats, tx_bytes);
 	ovpn_send(ovpn, skb_list.next, peer);
+	ovpn_peer_put(peer);
 
 	return NETDEV_TX_OK;
 
 drop:
-	ovpn_peer_put(peer);
+	if (peer)
+		ovpn_peer_put(peer);
 drop_no_peer:
 	ovpn_dev_dstats_tx_dropped(ovpn->dev);
 	skb_tx_error(skb);
@@ -452,8 +700,8 @@ drop_no_peer:
  * @data: message content
  * @len: message length
  *
- * Assumes that caller holds a reference to peer, which will be
- * passed to ovpn_send()
+ * Assumes that caller holds a reference to peer, which
+ * is released here after ovpn_send()
  */
 void ovpn_xmit_special(struct ovpn_peer *peer, const void *data,
 		       const unsigned int len)
@@ -478,4 +726,5 @@ void ovpn_xmit_special(struct ovpn_peer *peer, const void *data,
 	__skb_put_data(skb, data, len);
 
 	ovpn_send(ovpn, skb, peer);
+	ovpn_peer_put(peer);
 }
