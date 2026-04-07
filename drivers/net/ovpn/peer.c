@@ -718,23 +718,49 @@ static void ovpn_peer_remove(struct ovpn_peer *peer,
 	llist_add(&peer->release_entry, release_list);
 }
 
+static void ovpn_peer_list_get_all(struct ovpn_priv *ovpn,
+				   struct llist_head *list)
+{
+	struct ovpn_peer *peer;
+	int bkt;
+
+	rcu_read_lock();
+	hash_for_each_rcu(ovpn->peers->by_id, bkt, peer, hash_entry_id) {
+		if (ovpn_peer_hold(peer))
+			llist_add(&peer->mcast_entry, list);
+	}
+	rcu_read_unlock();
+}
+
 /**
- * ovpn_peer_get_by_dst - Lookup peer to send skb to
+ * TO DO: At the moment the list contain all the peers,
+ * after IGMP snooping is implemented we want to select only the peers
+ * subscribed to a specific multicast group.
+ */
+static void ovpn_peer_list_get_by_mcast_group(struct ovpn_priv *ovpn,
+					      struct llist_head *list)
+{
+	ovpn_peer_list_get_all(ovpn, list);
+}
+
+/**
+ * ovpn_peer_list_get_by_dst - Lookup peers to send skb to
  * @ovpn: the private data representing the current VPN session
  * @skb: the skb to extract the destination address from
+ * @list: the head of the list to fill with the target peers
  *
- * This function takes a tunnel packet and looks up the peer to send it to
- * after encapsulation. The skb is expected to be the in-tunnel packet, without
- * any OpenVPN related header.
+ * This function takes a tunnel packet and looks up the peers to send it to
+ * after encapsulation and add them to `list'. The skb is expected to be the
+ * in-tunnel packet, without any OpenVPN related header.
  *
  * Assume that the IP header is accessible in the skb data.
  *
- * Return: the peer if found or NULL otherwise.
  */
-struct ovpn_peer *ovpn_peer_get_by_dst(struct ovpn_priv *ovpn,
-				       struct sk_buff *skb)
+void ovpn_peer_list_get_by_dst(struct ovpn_priv *ovpn, struct sk_buff *skb,
+			       struct llist_head *list)
 {
 	struct ovpn_peer *peer = NULL;
+	unsigned int addr_type;
 	struct in6_addr addr6;
 	__be32 addr4;
 
@@ -744,29 +770,45 @@ struct ovpn_peer *ovpn_peer_get_by_dst(struct ovpn_priv *ovpn,
 	if (ovpn->mode == OVPN_MODE_P2P) {
 		rcu_read_lock();
 		peer = rcu_dereference(ovpn->peer);
-		if (unlikely(peer && !ovpn_peer_hold(peer)))
-			peer = NULL;
+		if (likely(peer && ovpn_peer_hold(peer)))
+			llist_add(&peer->mcast_entry, list);
 		rcu_read_unlock();
-		return peer;
+		return;
 	}
 
-	rcu_read_lock();
 	switch (skb->protocol) {
 	case htons(ETH_P_IP):
 		addr4 = ovpn_nexthop_from_skb4(skb);
+		rcu_read_lock();
 		peer = ovpn_peer_get_by_vpn_addr4(ovpn, addr4);
-		break;
+
+		if (peer)
+			break;
+
+		rcu_read_unlock();
+		addr_type = inet_dev_addr_type(dev_net(ovpn->dev), ovpn->dev, addr4);
+		if (addr_type == RTN_MULTICAST)
+			ovpn_peer_list_get_by_mcast_group(ovpn, list);
+		else if (addr_type == RTN_BROADCAST)
+			ovpn_peer_list_get_all(ovpn, list);
+		return;
 	case htons(ETH_P_IPV6):
 		addr6 = ovpn_nexthop_from_skb6(skb);
+		rcu_read_lock();
 		peer = ovpn_peer_get_by_vpn_addr6(ovpn, &addr6);
-		break;
+
+		if (peer)
+			break;
+
+		rcu_read_unlock();
+		if (ipv6_addr_is_multicast(&addr6))
+			ovpn_peer_list_get_by_mcast_group(ovpn, list);
+		return;
 	}
 
-	if (unlikely(peer && !ovpn_peer_hold(peer)))
-		peer = NULL;
+	if (likely(peer && ovpn_peer_hold(peer)))
+		llist_add(&peer->mcast_entry, list);
 	rcu_read_unlock();
-
-	return peer;
 }
 
 /**

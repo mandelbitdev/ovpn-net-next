@@ -351,15 +351,39 @@ static void ovpn_send(struct ovpn_priv *ovpn, struct sk_buff *skb,
 	ovpn_peer_put(peer);
 }
 
+static struct sk_buff *ovpn_skb_list_clone(struct sk_buff *skb)
+{
+	struct sk_buff *copy, *curr, *next, *head = NULL, *prev = NULL;
+
+	skb_list_walk_safe(skb, curr, next) {
+		copy = skb_clone(curr, GFP_ATOMIC);
+		if (unlikely(!copy)) {
+			kfree_skb_list(head);
+			return NULL;
+		}
+
+		if (unlikely(!head))
+			head = copy;
+		else
+			prev->next = copy;
+
+		prev = copy;
+	}
+
+	return head;
+}
+
 /* Send user data to the network
  */
 netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
 {
 	struct ovpn_priv *ovpn = netdev_priv(dev);
-	struct sk_buff *segments, *curr, *next;
+	struct sk_buff *segments, *curr, *next, *to_send;
 	struct sk_buff_head skb_list;
-	unsigned int tx_bytes = 0;
+	struct llist_head mcast_list;
+	struct llist_node *node, *n;
 	struct ovpn_peer *peer;
+	unsigned int tx_bytes = 0;
 	__be16 proto;
 	int ret;
 
@@ -372,8 +396,9 @@ netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
 		goto drop_no_peer;
 
 	/* retrieve peer serving the destination IP of this packet */
-	peer = ovpn_peer_get_by_dst(ovpn, skb);
-	if (unlikely(!peer)) {
+	init_llist_head(&mcast_list);
+	ovpn_peer_list_get_by_dst(ovpn, skb, &mcast_list);
+	if (unlikely(llist_empty(&mcast_list))) {
 		switch (skb->protocol) {
 		case htons(ETH_P_IP):
 			net_dbg_ratelimited("%s: no peer to send data to dst=%pI4\n",
@@ -427,18 +452,34 @@ netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
 	 * incremented the counter for each failure in the loop
 	 */
 	if (unlikely(skb_queue_empty(&skb_list))) {
-		ovpn_peer_put(peer);
+		llist_for_each_safe(node, n, mcast_list.first) {
+			peer = llist_entry(node, struct ovpn_peer, mcast_entry);
+			ovpn_peer_put(peer);
+		}
 		return NETDEV_TX_OK;
 	}
 	skb_list.prev->next = NULL;
 
-	ovpn_peer_stats_increment_tx(&peer->vpn_stats, tx_bytes);
-	ovpn_send(ovpn, skb_list.next, peer);
+	llist_for_each_safe(node, n, mcast_list.first) {
+		peer = llist_entry(node, struct ovpn_peer, mcast_entry);
+
+		to_send = n ? ovpn_skb_list_clone(skb_list.next) : skb_list.next;
+		if (likely(to_send)) {
+			ovpn_peer_stats_increment_tx(&peer->vpn_stats, tx_bytes);
+			ovpn_send(ovpn, to_send, peer);
+		} else {
+			dev_dstats_tx_dropped(ovpn->dev);
+			ovpn_peer_put(peer);
+		}
+	}
 
 	return NETDEV_TX_OK;
 
 drop:
-	ovpn_peer_put(peer);
+	llist_for_each_safe(node, n, mcast_list.first) {
+		peer = llist_entry(node, struct ovpn_peer, mcast_entry);
+		ovpn_peer_put(peer);
+	}
 drop_no_peer:
 	dev_dstats_tx_dropped(ovpn->dev);
 	skb_tx_error(skb);
