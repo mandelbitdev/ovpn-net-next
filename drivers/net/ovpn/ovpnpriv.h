@@ -36,6 +36,13 @@ struct ovpn_peer_collection {
 	struct hlist_nulls_head by_transp_addr[1 << 12];
 };
 
+#define OVPN_BCAST_MAX_QLEN 1000
+
+struct ovpn_bcast {
+	struct sk_buff_head queue;
+	struct work_struct work;
+};
+
 /**
  * struct ovpn_priv - per ovpn interface state
  * @dev: the actual netdev representing the tunnel
@@ -45,6 +52,7 @@ struct ovpn_peer_collection {
  * @peer: in P2P mode, this is the only remote peer
  * @gro_cells: pointer to the Generic Receive Offload cell
  * @keepalive_work: struct used to schedule keepalive periodic job
+ * @bcast: struct used to queue and transmit broadcast messages
  */
 struct ovpn_priv {
 	struct net_device *dev;
@@ -54,6 +62,7 @@ struct ovpn_priv {
 	struct ovpn_peer __rcu *peer;
 	struct gro_cells gro_cells;
 	struct delayed_work keepalive_work;
+	struct ovpn_bcast bcast;
 };
 
 #endif /* _NET_OVPN_OVPNSTRUCT_H_ */
