@@ -173,6 +173,9 @@ ovpn_setup_ns() {
 	if [ -n "${3}" ]; then
 		ip -n "${peer}" link set mtu ${3} dev tun${1}
 	fi
+	# Disable automatic IPv6 link-local address generation
+	# to keep packet counts predictable.
+	ip -n "${peer}" link set dev tun${1} addrgenmode none
 	ip -n "${peer}" link set tun${1} up
 }
 
