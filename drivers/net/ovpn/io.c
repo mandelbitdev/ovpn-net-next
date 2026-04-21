@@ -17,6 +17,7 @@
 #include "ovpnpriv.h"
 #include "peer.h"
 #include "io.h"
+#include "mcast.h"
 #include "bind.h"
 #include "crypto.h"
 #include "crypto_aead.h"
@@ -183,8 +184,12 @@ void ovpn_decrypt_post(void *data, int ret)
 	}
 	skb->protocol = proto;
 
-	/* perform Reverse Path Filtering (RPF) */
-	if (unlikely(!ovpn_peer_check_by_src(peer->ovpn, skb, peer))) {
+	/* perform Reverse Path Filtering (RPF).
+	 * snoop IGMP/MLD before RPF: these control protocols may use source
+	 * addresses that differ from the peer's VPN address
+	 */
+	if (likely(!ovpn_mcast_snoop_skb(peer, skb)) &&
+	    unlikely(!ovpn_peer_check_by_src(peer->ovpn, skb, peer))) {
 		if (skb->protocol == htons(ETH_P_IPV6))
 			net_dbg_ratelimited("%s: RPF dropped packet from peer %u, src: %pI6c\n",
 					    netdev_name(peer->ovpn->dev),

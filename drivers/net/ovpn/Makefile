@@ -12,6 +12,7 @@ ovpn-y += crypto.o
 ovpn-y += crypto_aead.o
 ovpn-y += main.o
 ovpn-y += io.o
+ovpn-y += mcast.o
 ovpn-y += netlink.o
 ovpn-y += netlink-gen.o
 ovpn-y += peer.o

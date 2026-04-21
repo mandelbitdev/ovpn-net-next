@@ -18,6 +18,7 @@
 #include "crypto.h"
 #include "io.h"
 #include "main.h"
+#include "mcast.h"
 #include "netlink.h"
 #include "peer.h"
 #include "socket.h"
@@ -733,17 +734,6 @@ static void ovpn_peer_list_get_all(struct ovpn_priv *ovpn,
 }
 
 /**
- * TO DO: At the moment the list contain all the peers,
- * after IGMP snooping is implemented we want to select only the peers
- * subscribed to a specific multicast group.
- */
-static void ovpn_peer_list_get_by_mcast_group(struct ovpn_priv *ovpn,
-					      struct llist_head *list)
-{
-	ovpn_peer_list_get_all(ovpn, list);
-}
-
-/**
  * ovpn_peer_list_get_by_dst - Lookup peers to send skb to
  * @ovpn: the private data representing the current VPN session
  * @skb: the skb to extract the destination address from
@@ -787,10 +777,13 @@ void ovpn_peer_list_get_by_dst(struct ovpn_priv *ovpn, struct sk_buff *skb,
 
 		rcu_read_unlock();
 		addr_type = inet_dev_addr_type(dev_net(ovpn->dev), ovpn->dev, addr4);
-		if (addr_type == RTN_MULTICAST)
-			ovpn_peer_list_get_by_mcast_group(ovpn, list);
-		else if (addr_type == RTN_BROADCAST)
+		if (addr_type == RTN_MULTICAST) {
+			ipv6_addr_set_v4mapped(addr4, &addr6);
+			if (!ovpn_peer_list_get_by_mcast_group(ovpn, &addr6, list))
+				ovpn_peer_list_get_all(ovpn, list);
+		} else if (addr_type == RTN_BROADCAST) {
 			ovpn_peer_list_get_all(ovpn, list);
+		}
 		return;
 	case htons(ETH_P_IPV6):
 		addr6 = ovpn_nexthop_from_skb6(skb);
@@ -801,8 +794,10 @@ void ovpn_peer_list_get_by_dst(struct ovpn_priv *ovpn, struct sk_buff *skb,
 			break;
 
 		rcu_read_unlock();
-		if (ipv6_addr_is_multicast(&addr6))
-			ovpn_peer_list_get_by_mcast_group(ovpn, list);
+		if (ipv6_addr_is_multicast(&addr6) &&
+		    !ovpn_peer_list_get_by_mcast_group(ovpn, &addr6, list)) {
+			ovpn_peer_list_get_all(ovpn, list);
+		}
 		return;
 	}
 
@@ -1152,6 +1147,8 @@ int ovpn_peer_del(struct ovpn_peer *peer, enum ovpn_del_peer_reason reason)
 {
 	LLIST_HEAD(release_list);
 	int ret = -EOPNOTSUPP;
+
+	ovpn_mcast_leave_all(peer);
 
 	spin_lock_bh(&peer->ovpn->lock);
 	switch (peer->ovpn->mode) {

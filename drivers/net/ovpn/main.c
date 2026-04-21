@@ -19,6 +19,7 @@
 
 #include "ovpnpriv.h"
 #include "main.h"
+#include "mcast.h"
 #include "netlink.h"
 #include "io.h"
 #include "peer.h"
@@ -30,6 +31,7 @@ static void ovpn_priv_free(struct net_device *net)
 {
 	struct ovpn_priv *ovpn = netdev_priv(net);
 
+	ovpn_mcast_cleanup(ovpn);
 	kfree(ovpn->peers);
 }
 
@@ -190,6 +192,7 @@ static int ovpn_newlink(struct net_device *dev,
 	ovpn->dev = dev;
 	ovpn->mode = mode;
 	spin_lock_init(&ovpn->lock);
+	hash_init(ovpn->mcast_table);
 	INIT_DELAYED_WORK(&ovpn->keepalive_work, ovpn_peer_keepalive_work);
 
 	/* Set carrier explicitly after registration, this way state is

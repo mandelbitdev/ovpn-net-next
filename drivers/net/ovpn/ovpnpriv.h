@@ -50,6 +50,7 @@ struct ovpn_priv {
 	struct ovpn_peer __rcu *peer;
 	struct gro_cells gro_cells;
 	struct delayed_work keepalive_work;
+	DECLARE_HASHTABLE(mcast_table, 8);
 };
 
 #endif /* _NET_OVPN_OVPNSTRUCT_H_ */
