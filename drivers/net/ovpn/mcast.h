@@ -22,6 +22,7 @@ void ovpn_mcast_leave_all(struct ovpn_peer *peer);
 bool ovpn_peer_list_get_by_mcast_group(struct ovpn_priv *ovpn,
 				       const struct in6_addr *group_addr,
 				       struct llist_head *list);
+bool ovpn_mcast_is_control(struct sk_buff *skb);
 bool ovpn_mcast_snoop_skb(struct ovpn_peer *peer, struct sk_buff *skb);
 
 #endif /* _NET_OVPN_MCAST_H_ */

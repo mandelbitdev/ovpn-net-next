@@ -358,12 +358,49 @@ bool ovpn_mcast_snoop_skb(struct ovpn_peer *peer, struct sk_buff *skb)
 {
 	if (peer->ovpn->mode != OVPN_MODE_MP)
 		return false;
+
 	if (skb->protocol == htons(ETH_P_IP)) {
 		if (ip_hdr(skb)->protocol == IPPROTO_IGMP)
 			return ovpn_mcast_snoop_igmp(peer, skb);
 	} else if (skb->protocol == htons(ETH_P_IPV6)) {
-		if (ipv6_hdr(skb)->nexthdr == IPPROTO_ICMPV6)
-			return ovpn_mcast_snoop_mld(peer, skb);
+		return ovpn_mcast_snoop_mld(peer, skb);
 	}
+
+	return false;
+}
+
+/**
+ * ovpn_mcast_is_control - determine whether an skb is multicast control traffic
+ * @skb: the packet to inspect
+ *
+ * Return: true if the skb contains IGMP or MLD control traffic,
+ *         false otherwise
+ */
+bool ovpn_mcast_is_control(struct sk_buff *skb)
+{
+	unsigned int offset;
+	struct icmp6hdr *ih;
+
+	if (skb->protocol == htons(ETH_P_IP))
+		return ip_hdr(skb)->protocol == IPPROTO_IGMP;
+
+	if (skb->protocol != htons(ETH_P_IPV6))
+		return false;
+
+	if (!ovpn_mcast_mld_offset(skb, &offset))
+		return false;
+
+	if (!pskb_may_pull(skb, offset + sizeof(*ih)))
+		return false;
+
+	ih = (struct icmp6hdr *)(skb_network_header(skb) + offset);
+	switch (ih->icmp6_type) {
+	case ICMPV6_MGM_QUERY:
+	case ICMPV6_MGM_REPORT:
+	case ICMPV6_MGM_REDUCTION:
+	case ICMPV6_MLD2_REPORT:
+		return true;
+	}
+
 	return false;
 }

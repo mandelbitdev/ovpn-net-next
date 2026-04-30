@@ -779,8 +779,10 @@ void ovpn_peer_list_get_by_dst(struct ovpn_priv *ovpn, struct sk_buff *skb,
 		addr_type = inet_dev_addr_type(dev_net(ovpn->dev), ovpn->dev, addr4);
 		if (addr_type == RTN_MULTICAST) {
 			ipv6_addr_set_v4mapped(addr4, &addr6);
-			if (!ovpn_peer_list_get_by_mcast_group(ovpn, &addr6, list))
+			if (!ovpn_peer_list_get_by_mcast_group(ovpn, &addr6, list) &&
+			    ovpn_mcast_is_control(skb)) {
 				ovpn_peer_list_get_all(ovpn, list);
+			}
 		} else if (addr_type == RTN_BROADCAST) {
 			ovpn_peer_list_get_all(ovpn, list);
 		}
@@ -795,7 +797,8 @@ void ovpn_peer_list_get_by_dst(struct ovpn_priv *ovpn, struct sk_buff *skb,
 
 		rcu_read_unlock();
 		if (ipv6_addr_is_multicast(&addr6) &&
-		    !ovpn_peer_list_get_by_mcast_group(ovpn, &addr6, list)) {
+		    !ovpn_peer_list_get_by_mcast_group(ovpn, &addr6, list) &&
+		    ovpn_mcast_is_control(skb)) {
 			ovpn_peer_list_get_all(ovpn, list);
 		}
 		return;
