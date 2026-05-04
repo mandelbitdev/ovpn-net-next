@@ -269,12 +269,67 @@ static bool ovpn_mcast_mld_offset(struct sk_buff *skb, unsigned int *offsetp)
 }
 
 /**
+ * ovpn_mcast_snoop_mldv2 - inspect an MLDv2 report message
+ * @peer: the peer this packet was received from
+ * @skb: the packet to inspect
+ * @offset: bytes from the start of the network header to the start of the MLD group records
+ * @ngrec: number of group records
+ *
+ * Parse the MLDv2 report and update the multicast subscription table.
+ *
+ * Return: true if the packet was a recognized MLDv2 join/leave and was
+ *         consumed, false otherwise
+ */
+static bool ovpn_mcast_snoop_mldv2(struct ovpn_peer *peer, struct sk_buff *skb,
+				   unsigned int offset, const int ngrec)
+{
+	struct mld2_grec *grec;
+	int i;
+	__u16 nsrcs;
+	unsigned int rec_len;
+
+	for (i = 0; i < ngrec; i++) {
+		if (!pskb_may_pull(skb, offset + sizeof(*grec)))
+			return true;
+
+		grec = (struct mld2_grec *)(skb_network_header(skb) + offset);
+		nsrcs = ntohs(grec->grec_nsrcs);
+
+		rec_len = sizeof(*grec) + nsrcs * sizeof(struct in6_addr) +
+			  grec->grec_auxwords * 4;
+		offset += rec_len;
+
+		if (!pskb_may_pull(skb, offset))
+			return true;
+
+		/* recompute grec after potential head reallocation */
+		grec = (struct mld2_grec *)(skb_network_header(skb) + offset - rec_len);
+
+		/* In MLDv2 ASM, EXCLUDE mode with an empty source list means
+		 * "exclude nothing, receive everything" -> JOIN.
+		 * INCLUDE mode with an empty source list means
+		 * "include nothing, receive nothing" -> LEAVE.
+		 * See RFC 3810, section 4.
+		 */
+		if (nsrcs == 0 &&
+		    (grec->grec_type == MLD2_CHANGE_TO_INCLUDE ||
+		     grec->grec_type == MLD2_MODE_IS_INCLUDE)) {
+			ovpn_mcast_leave(peer->ovpn, peer, &grec->grec_mca);
+		} else {
+			ovpn_mcast_join(peer->ovpn, peer, &grec->grec_mca);
+		}
+	}
+
+	return true;
+}
+
+/**
  * ovpn_mcast_snoop_mld - inspect an IPv6 packet for MLD join/leave messages
  * @peer: the peer this packet was received from
  * @skb: the packet to inspect
  *
  * Parse the MLD header and update the multicast subscription table on
- * MLDv1 reports and done messages.
+ * MLDv1/v2 reports and done messages.
  *
  * Return: true if the packet was a recognized MLD join/leave and was
  *         consumed, false otherwise
@@ -293,6 +348,11 @@ static bool ovpn_mcast_snoop_mld(struct ovpn_peer *peer, struct sk_buff *skb)
 	mld = (struct mld_msg *)(skb_network_header(skb) + offset);
 
 	switch (mld->mld_type) {
+	case ICMPV6_MLD2_REPORT:
+		return ovpn_mcast_snoop_mldv2(peer, skb,
+			offset + sizeof(struct mld2_report),
+			ntohs(((struct mld2_report *)mld)->mld2r_ngrec)
+		);
 	case ICMPV6_MGM_REPORT:
 		ovpn_mcast_join(peer->ovpn, peer, &mld->mld_mca);
 		return true;
@@ -306,12 +366,70 @@ static bool ovpn_mcast_snoop_mld(struct ovpn_peer *peer, struct sk_buff *skb)
 }
 
 /**
+ * ovpn_mcast_snoop_igmpv3 - inspect an IGMPv3 report message
+ * @peer: the peer this packet was received from
+ * @skb: the packet to inspect
+ * @offset: bytes from the start of the network header to the start of the IGMP group records
+ * @ngrec: number of group records
+ *
+ * Parse the IGMPv3 report and update the multicast subscription table.
+ *
+ * Return: true if the packet was a recognized IGMPv3 join/leave and was
+ *         consumed, false otherwise
+ */
+static bool ovpn_mcast_snoop_igmpv3(struct ovpn_peer *peer, struct sk_buff *skb,
+				    unsigned int offset, const int ngrec)
+{
+	struct igmpv3_grec *grec;
+	struct in6_addr addr6;
+	int i;
+	unsigned int rec_len;
+	__u16 nsrcs;
+
+	for (i = 0; i < ngrec; i++) {
+		if (!pskb_may_pull(skb, offset + sizeof(*grec)))
+			return true;
+
+		grec = (struct igmpv3_grec *)(skb_network_header(skb) + offset);
+		nsrcs = ntohs(grec->grec_nsrcs);
+
+		rec_len = sizeof(*grec) + nsrcs * sizeof(__be32) +
+			  grec->grec_auxwords * 4;
+		offset += rec_len;
+
+		if (!pskb_may_pull(skb, offset))
+			return true;
+
+		/* recompute grec after potential head reallocation */
+		grec = (struct igmpv3_grec *)(skb_network_header(skb) + offset - rec_len);
+
+		/* In IGMPv3 ASM, EXCLUDE mode with an empty source list means
+		 * "exclude nothing, receive everything" -> JOIN.
+		 * INCLUDE mode with an empty source list means
+		 * "include nothing, receive nothing" -> LEAVE.
+		 * See RFC 3376, section 3.
+		 */
+		if (nsrcs == 0 &&
+		    (grec->grec_type == IGMPV3_CHANGE_TO_INCLUDE ||
+		     grec->grec_type == IGMPV3_MODE_IS_INCLUDE)) {
+			ipv6_addr_set_v4mapped(grec->grec_mca, &addr6);
+			ovpn_mcast_leave(peer->ovpn, peer, &addr6);
+		} else {
+			ipv6_addr_set_v4mapped(grec->grec_mca, &addr6);
+			ovpn_mcast_join(peer->ovpn, peer, &addr6);
+		}
+	}
+
+	return true;
+}
+
+/**
  * ovpn_mcast_snoop_igmp - inspect an IPv4 packet for IGMP join/leave messages
  * @peer: the peer this packet was received from
  * @skb: the packet to inspect
  *
  * Parse the IGMP header and update the multicast subscription table on
- * IGMPv2 membership reports and leave messages.
+ * IGMPv2/v3 membership reports and leave messages.
  *
  * Return: true if the packet was a recognized IGMP join/leave and was
  *         consumed, false otherwise
@@ -329,6 +447,11 @@ static bool ovpn_mcast_snoop_igmp(struct ovpn_peer *peer, struct sk_buff *skb)
 	ih = (struct igmphdr *)(skb_network_header(skb) + ihl);
 
 	switch (ih->type) {
+	case IGMPV3_HOST_MEMBERSHIP_REPORT:
+		return ovpn_mcast_snoop_igmpv3(peer, skb,
+			ihl + sizeof(struct igmpv3_report),
+			ntohs(((struct igmpv3_report *)ih)->ngrec)
+		);
 	case IGMPV2_HOST_MEMBERSHIP_REPORT:
 		ipv6_addr_set_v4mapped(ih->group, &addr6);
 		ovpn_mcast_join(peer->ovpn, peer, &addr6);
