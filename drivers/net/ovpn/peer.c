@@ -751,7 +751,7 @@ void ovpn_peer_list_get_by_dst(struct ovpn_priv *ovpn, struct sk_buff *skb,
 {
 	struct ovpn_peer *peer = NULL;
 	unsigned int addr_type;
-	struct in6_addr addr6;
+	struct in6_addr addr6, src;
 	__be32 addr4;
 
 	/* in P2P mode, no matter the destination, packets are always sent to
@@ -779,7 +779,8 @@ void ovpn_peer_list_get_by_dst(struct ovpn_priv *ovpn, struct sk_buff *skb,
 		addr_type = inet_dev_addr_type(dev_net(ovpn->dev), ovpn->dev, addr4);
 		if (addr_type == RTN_MULTICAST) {
 			ipv6_addr_set_v4mapped(addr4, &addr6);
-			if (!ovpn_peer_list_get_by_mcast_group(ovpn, &addr6, list) &&
+			ipv6_addr_set_v4mapped(ip_hdr(skb)->saddr, &src);
+			if (!ovpn_peer_list_get_by_mcast_group(ovpn, &addr6, list, &src) &&
 			    ovpn_mcast_is_control(skb)) {
 				ovpn_peer_list_get_all(ovpn, list);
 			}
@@ -797,7 +798,7 @@ void ovpn_peer_list_get_by_dst(struct ovpn_priv *ovpn, struct sk_buff *skb,
 
 		rcu_read_unlock();
 		if (ipv6_addr_is_multicast(&addr6) &&
-		    !ovpn_peer_list_get_by_mcast_group(ovpn, &addr6, list) &&
+		    !ovpn_peer_list_get_by_mcast_group(ovpn, &addr6, list, &ipv6_hdr(skb)->saddr) &&
 		    ovpn_mcast_is_control(skb)) {
 			ovpn_peer_list_get_all(ovpn, list);
 		}
