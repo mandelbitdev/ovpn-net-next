@@ -721,6 +721,76 @@ static inline void tcp_mark_urg(struct tcp_sock *tp, int flags)
 		tp->snd_up = tp->write_seq;
 }
 
+/**
+ * tcp_clamp_mss_option - clamp any existing TCP MSS option
+ * @skb: skb containing the TCP segment
+ * @th: TCP header in @skb
+ * @maxmss: upper bound for the TCP MSS option value
+ *
+ * Parse the TCP option block and lower any existing MSS option to @maxmss.
+ * The MSS value is never increased. If any MSS value is changed, the TCP
+ * checksum in @th is updated.
+ *
+ * The caller must ensure that @th and the complete TCP option block are
+ * present in the linear data area and writable.
+ *
+ * Return: 0 when at least one MSS option was handled, -ENOENT when no MSS
+ * option is present, or -EINVAL when the TCP option block is malformed before
+ * any MSS option is found.
+ */
+int tcp_clamp_mss_option(struct sk_buff *skb, struct tcphdr *th, u16 maxmss)
+{
+	int length = th->doff * 4 - sizeof(*th);
+	u8 *ptr = (u8 *)(th + 1);
+	bool found = false;
+	int ret = -ENOENT;
+	u16 oldmss;
+
+	while (length > 0) {
+		int opcode = *ptr++;
+		int opsize;
+
+		switch (opcode) {
+		case TCPOPT_EOL:
+			ret = -ENOENT;
+			goto out;
+		case TCPOPT_NOP:
+			length--;
+			continue;
+		default:
+			if (length < 2) {
+				ret = -EINVAL;
+				goto out;
+			}
+
+			opsize = *ptr++;
+			if (opsize < 2 || opsize > length) {
+				ret = -EINVAL;
+				goto out;
+			}
+
+			if (opcode == TCPOPT_MSS && opsize == TCPOLEN_MSS) {
+				found = true;
+				oldmss = get_unaligned_be16(ptr);
+				if (oldmss && oldmss > maxmss) {
+					put_unaligned_be16(maxmss, ptr);
+					inet_proto_csum_replace2(&th->check,
+								 skb,
+								 htons(oldmss),
+								 htons(maxmss),
+								 false);
+				}
+			}
+
+			ptr += opsize - 2;
+			length -= opsize;
+		}
+	}
+out:
+	return found ? 0 : ret;
+}
+EXPORT_SYMBOL_GPL(tcp_clamp_mss_option);
+
 /* If a not yet filled skb is pushed, do not send it if
  * we have data packets in Qdisc or NIC queues :
  * Because TX completion will happen shortly, it gives a chance

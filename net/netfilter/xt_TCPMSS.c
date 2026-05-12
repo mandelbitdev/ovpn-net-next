@@ -30,16 +30,6 @@ MODULE_DESCRIPTION("Xtables: TCP Maximum Segment Size (MSS) adjustment");
 MODULE_ALIAS("ipt_TCPMSS");
 MODULE_ALIAS("ip6t_TCPMSS");
 
-static inline unsigned int
-optlen(const u_int8_t *opt, unsigned int offset)
-{
-	/* Beware zero-length options: make finite progress */
-	if (opt[offset] <= TCPOPT_NOP || opt[offset+1] == 0)
-		return 1;
-	else
-		return opt[offset+1];
-}
-
 static u_int32_t tcpmss_reverse_mtu(struct net *net,
 				    const struct sk_buff *skb,
 				    unsigned int family)
@@ -77,7 +67,6 @@ tcpmss_mangle_packet(struct sk_buff *skb,
 	const struct xt_tcpmss_info *info = par->targinfo;
 	struct tcphdr *tcph;
 	int len, tcp_hdrlen;
-	unsigned int i;
 	__be16 oldval;
 	u16 newmss;
 	u8 *opt;
@@ -113,29 +102,8 @@ tcpmss_mangle_packet(struct sk_buff *skb,
 	} else
 		newmss = info->mss;
 
-	opt = (u_int8_t *)tcph;
-	for (i = sizeof(struct tcphdr); i <= tcp_hdrlen - TCPOLEN_MSS; i += optlen(opt, i)) {
-		if (opt[i] == TCPOPT_MSS && opt[i+1] == TCPOLEN_MSS) {
-			u_int16_t oldmss;
-
-			oldmss = (opt[i+2] << 8) | opt[i+3];
-
-			/* Never increase MSS, even when setting it, as
-			 * doing so results in problems for hosts that rely
-			 * on MSS being set correctly.
-			 */
-			if (oldmss <= newmss)
-				return 0;
-
-			opt[i+2] = (newmss & 0xff00) >> 8;
-			opt[i+3] = newmss & 0x00ff;
-
-			inet_proto_csum_replace2(&tcph->check, skb,
-						 htons(oldmss), htons(newmss),
-						 false);
-			return 0;
-		}
-	}
+	if (tcp_clamp_mss_option(skb, tcph, newmss) == 0)
+		return 0;
 
 	/* There is data after the header so the option can't be added
 	 * without moving it, and doing so may make the SYN packet
