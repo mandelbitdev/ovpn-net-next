@@ -184,6 +184,7 @@ static int ovpn_nl_peer_precheck(struct ovpn_priv *ovpn,
 				 struct nlattr **attrs)
 {
 	sa_family_t local_fam, remote_fam;
+	u16 mssfix;
 
 	if (NL_REQ_ATTR_CHECK(info->extack, info->attrs[OVPN_A_PEER], attrs,
 			      OVPN_A_PEER_ID))
@@ -263,6 +264,15 @@ static int ovpn_nl_peer_precheck(struct ovpn_priv *ovpn,
 		return -EINVAL;
 	}
 
+	if (attrs[OVPN_A_PEER_MSSFIX]) {
+		mssfix = nla_get_u16(attrs[OVPN_A_PEER_MSSFIX]);
+		if (mssfix > 0 && mssfix <= 20) {
+			NL_SET_ERR_MSG_FMT_MOD(info->extack,
+					       "mssfix must be 0 (disable) or at least 21");
+			return -EINVAL;
+		}
+	}
+
 	return 0;
 }
 
@@ -310,6 +320,10 @@ static int ovpn_nl_peer_modify(struct ovpn_peer *peer, struct genl_info *info,
 	 */
 	if (attrs[OVPN_A_PEER_TX_ID])
 		peer->tx_id = nla_get_u32(attrs[OVPN_A_PEER_TX_ID]);
+
+	if (attrs[OVPN_A_PEER_MSSFIX])
+		WRITE_ONCE(peer->mssfix,
+			   nla_get_u16(attrs[OVPN_A_PEER_MSSFIX]));
 
 	if (attrs[OVPN_A_PEER_VPN_IPV4]) {
 		rehash = true;
@@ -547,6 +561,7 @@ static int ovpn_nl_send_peer(struct sk_buff *skb, const struct genl_info *info,
 	int ret = -EMSGSIZE;
 	struct nlattr *attr;
 	__be16 local_port;
+	u16 mssfix;
 	void *hdr;
 	int id;
 
@@ -580,6 +595,10 @@ static int ovpn_nl_send_peer(struct sk_buff *skb, const struct genl_info *info,
 		goto err;
 
 	if (nla_put_u32(skb, OVPN_A_PEER_TX_ID, peer->tx_id))
+		goto err;
+
+	mssfix = READ_ONCE(peer->mssfix);
+	if (mssfix && nla_put_u16(skb, OVPN_A_PEER_MSSFIX, mssfix))
 		goto err;
 
 	if (peer->vpn_addrs.ipv4.s_addr != htonl(INADDR_ANY))

@@ -23,6 +23,7 @@
  * @dev_tracker: reference tracker for associated dev
  * @id: unique identifier, used to match incoming packets
  * @tx_id: identifier to be used in TX packets
+ * @mssfix: maximum IPv4 TCP MSS to advertise on tunnelled SYN packets
  * @vpn_addrs: IP addresses assigned over the tunnel
  * @vpn_addrs.ipv4: IPv4 assigned to peer on the tunnel
  * @vpn_addrs.ipv6: IPv6 assigned to peer on the tunnel
@@ -66,6 +67,7 @@ struct ovpn_peer {
 	netdevice_tracker dev_tracker;
 	u32 id;
 	u32 tx_id;
+	u16 mssfix;
 	struct {
 		struct in_addr ipv4;
 		struct in6_addr ipv6;

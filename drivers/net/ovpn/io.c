@@ -13,6 +13,7 @@
 #include <net/gro_cells.h>
 #include <net/gso.h>
 #include <net/ip.h>
+#include <net/tcp.h>
 
 #include "ovpnpriv.h"
 #include "peer.h"
@@ -54,12 +55,97 @@ static bool ovpn_is_keepalive(struct sk_buff *skb)
 	return !memcmp(skb->data, ovpn_keepalive_message, OVPN_KEEPALIVE_SIZE);
 }
 
+/**
+ * ovpn_apply_mssfix - clamp TCP MSS options on SYN packets
+ * @skb: skb to inspect and possibly modify
+ * @mssfix: maximum IPv4 MSS value to apply
+ *
+ * Verify that @skb carries a TCP SYN or SYN-ACK packet. If so, clamp any
+ * TCPOPT_MSS options to @mssfix for IPv4, or to @mssfix - 20 for IPv6 to
+ * account for the larger IPv6 header. MSS values are never increased.
+ *
+ * Notes:
+ * - the function assumes the IP header is fully linear; this is currently
+ *   guaranteed because both TX and RX paths call it only after
+ *   ovpn_ip_check_protocol, which linearizes the IP header;
+ * - MSS clamping is performed only when a valid TCPOPT_MSS option is present,
+ *   matching the behavior of OpenVPN userspace.
+ *
+ * Return: 0 on success or when no update is needed, -ENOMEM if the TCP
+ * header/options cannot be made writable, or a negative parse error for
+ * malformed packets.
+ */
+static int ovpn_apply_mssfix(struct sk_buff *skb, u16 mssfix)
+{
+	const unsigned int nhoff = skb_network_offset(skb);
+	const struct ipv6hdr *ipv6h;
+	const struct iphdr *iph;
+	struct tcphdr *th;
+	int thoff, thlen;
+	__be16 frag_off;
+	u16 maxmss;
+	u8 nexthdr;
+
+	switch (skb->protocol) {
+	case htons(ETH_P_IP):
+		iph = ip_hdr(skb);
+		if (unlikely(iph->ihl < 5))
+			return -EINVAL;
+		if (iph->protocol != IPPROTO_TCP ||
+		    unlikely(ip_is_fragment(iph)))
+			return 0;
+
+		thoff = nhoff + ip_hdrlen(skb);
+		maxmss = mssfix;
+		break;
+	case htons(ETH_P_IPV6):
+		ipv6h = ipv6_hdr(skb);
+		nexthdr = ipv6h->nexthdr;
+		thoff = ipv6_skip_exthdr(skb, nhoff + sizeof(struct ipv6hdr),
+					 &nexthdr, &frag_off);
+		if (unlikely(thoff < 0))
+			return thoff;
+		if (nexthdr != IPPROTO_TCP || unlikely(frag_off))
+			return 0;
+
+		maxmss = mssfix - 20;
+		break;
+	default:
+		return 0;
+	}
+
+	if (unlikely(skb->len < thoff + sizeof(struct tcphdr)))
+		return -EINVAL;
+
+	if (unlikely(skb_ensure_writable(skb, thoff + sizeof(struct tcphdr))))
+		return -ENOMEM;
+
+	th = (struct tcphdr *)(skb->data + thoff);
+	thlen = th->doff * 4;
+
+	if (unlikely(thlen < sizeof(*th)))
+		return -EINVAL;
+
+	if (likely(!th->syn))
+		return 0;
+
+	if (unlikely(skb->len < thoff + thlen))
+		return -EINVAL;
+
+	if (unlikely(skb_ensure_writable(skb, thoff + thlen)))
+		return -ENOMEM;
+
+	th = (struct tcphdr *)(skb->data + thoff);
+	return tcp_clamp_mss_option(skb, th, maxmss);
+}
+
 /* Called after decrypt to write the IP packet to the device.
  * This method is expected to manage/free the skb.
  */
 static void ovpn_netdev_write(struct ovpn_peer *peer, struct sk_buff *skb)
 {
 	unsigned int pkt_len;
+	u16 mssfix;
 	int ret;
 
 	/*
@@ -73,6 +159,16 @@ static void ovpn_netdev_write(struct ovpn_peer *peer, struct sk_buff *skb)
 	 * VPN, therefore we give other layers a chance to check that
 	 */
 	skb->ip_summed = CHECKSUM_NONE;
+
+	/* apply the MSS fix after resetting the checksum state in order to
+	 * avoid using stale metadata when updating the checksum
+	 */
+	mssfix = READ_ONCE(peer->mssfix);
+	if (mssfix && unlikely(ovpn_apply_mssfix(skb, mssfix) == -ENOMEM)) {
+		ovpn_dev_dstats_rx_dropped(peer->ovpn->dev);
+		kfree_skb(skb);
+		return;
+	}
 
 	/* skb hash for transport packet no longer valid after decapsulation */
 	skb_clear_hash(skb);
@@ -336,12 +432,20 @@ static bool ovpn_encrypt_one(struct ovpn_peer *peer, struct sk_buff *skb)
 static void ovpn_send(struct ovpn_priv *ovpn, struct sk_buff *skb,
 		      struct ovpn_peer *peer)
 {
+	const u16 mssfix = READ_ONCE(peer->mssfix);
 	struct sk_buff *curr, *next;
 
 	/* this might be a GSO-segmented skb list: process each skb
 	 * independently
 	 */
 	skb_list_walk_safe(skb, curr, next) {
+		if (mssfix &&
+		    unlikely(ovpn_apply_mssfix(curr, mssfix) == -ENOMEM)) {
+			ovpn_dev_dstats_tx_dropped(ovpn->dev);
+			kfree_skb(curr);
+			continue;
+		}
+
 		if (unlikely(!ovpn_encrypt_one(peer, curr))) {
 			ovpn_dev_dstats_tx_dropped(ovpn->dev);
 			kfree_skb(curr);
