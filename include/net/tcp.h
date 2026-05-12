@@ -538,6 +538,8 @@ void tcp_parse_options(const struct net *net, const struct sk_buff *skb,
 		       struct tcp_options_received *opt_rx,
 		       int estab, struct tcp_fastopen_cookie *foc);
 
+int tcp_clamp_mss_option(struct sk_buff *skb, struct tcphdr *th, u16 maxmss);
+
 /*
  *	BPF SKB-less helpers
  */
