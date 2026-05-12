@@ -13,6 +13,7 @@
 #include <net/gro_cells.h>
 #include <net/gso.h>
 #include <net/ip.h>
+#include <net/tcp.h>
 
 #include "ovpnpriv.h"
 #include "peer.h"
@@ -54,6 +55,67 @@ static bool ovpn_is_keepalive(struct sk_buff *skb)
 	return !memcmp(skb->data, ovpn_keepalive_message, OVPN_KEEPALIVE_SIZE);
 }
 
+static int ovpn_apply_mssfix(struct sk_buff *skb, u16 mssfix)
+{
+	const struct ipv6hdr *ipv6h;
+	const struct iphdr *iph;
+	struct tcphdr *th;
+	int thoff, thlen;
+	__be16 frag_off;
+	u16 maxmss;
+	u8 nexthdr;
+
+	switch (skb->protocol) {
+	case htons(ETH_P_IP):
+		iph = ip_hdr(skb);
+		if (iph->protocol != IPPROTO_TCP ||
+		    unlikely(ip_is_fragment(iph)))
+			return 0;
+
+		thoff = ip_hdrlen(skb);
+		maxmss = mssfix;
+		break;
+	case htons(ETH_P_IPV6):
+		ipv6h = ipv6_hdr(skb);
+		nexthdr = ipv6h->nexthdr;
+		thoff = ipv6_skip_exthdr(skb, sizeof(struct ipv6hdr), &nexthdr,
+					 &frag_off);
+		if (unlikely(thoff < 0))
+			return thoff;
+		if (nexthdr != IPPROTO_TCP || unlikely(frag_off))
+			return 0;
+
+		maxmss = mssfix - 20;
+		break;
+	default:
+		return 0;
+	}
+
+	if (unlikely(skb->len < thoff + sizeof(struct tcphdr)))
+		return -EINVAL;
+
+	if (unlikely(skb_ensure_writable(skb, thoff + sizeof(struct tcphdr))))
+		return -ENOMEM;
+
+	th = (struct tcphdr *)(skb->data + thoff);
+	thlen = th->doff * 4;
+
+	if (unlikely(thlen < sizeof(*th)))
+		return -EINVAL;
+
+	if (likely(!th->syn))
+		return 0;
+
+	if (unlikely(skb->len < thoff + thlen))
+		return -EINVAL;
+
+	if (unlikely(skb_ensure_writable(skb, thoff + thlen)))
+		return -ENOMEM;
+
+	th = (struct tcphdr *)(skb->data + thoff);
+	return tcp_clamp_mss_option(skb, th, maxmss);
+}
+
 /* Called after decrypt to write the IP packet to the device.
  * This method is expected to manage/free the skb.
  */
@@ -73,6 +135,13 @@ static void ovpn_netdev_write(struct ovpn_peer *peer, struct sk_buff *skb)
 	 * VPN, therefore we give other layers a chance to check that
 	 */
 	skb->ip_summed = CHECKSUM_NONE;
+
+	/* apply the MSS fix after resetting the checksum state in order to
+	 * avoid using stale metadata when updating the checksum
+	 */
+	if (peer->mssfix)
+		ovpn_apply_mssfix(skb, peer->mssfix);
+
 
 	/* skb hash for transport packet no longer valid after decapsulation */
 	skb_clear_hash(skb);
@@ -342,6 +411,9 @@ static void ovpn_send(struct ovpn_priv *ovpn, struct sk_buff *skb,
 	 * independently
 	 */
 	skb_list_walk_safe(skb, curr, next) {
+		if (peer->mssfix)
+			ovpn_apply_mssfix(curr, peer->mssfix);
+
 		if (unlikely(!ovpn_encrypt_one(peer, curr))) {
 			dev_dstats_tx_dropped(ovpn->dev);
 			kfree_skb(curr);

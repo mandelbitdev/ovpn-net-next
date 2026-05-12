@@ -171,6 +171,14 @@ attribute-sets:
           will advertise the tx-id to be used on the link.
         checks:
           max: 0xFFFFFF
+      -
+        name: mssfix
+        type: u16
+        doc: >-
+          OpenVPN mssfix value for this peer. TCP MSS options in SYN and
+          SYN-ACK packets traveling through the ovpn device are clamped to
+          this value for IPv4. For IPv6, 20 bytes are subtracted before
+          clamping to account for the larger IPv6 header.
   -
     name: peer-new-input
     subset-of: peer
@@ -201,6 +209,8 @@ attribute-sets:
         name: keepalive-timeout
       -
         name: tx-id
+      -
+        name: mssfix
   -
     name: peer-set-input
     subset-of: peer
@@ -229,6 +239,8 @@ attribute-sets:
         name: keepalive-timeout
       -
         name: tx-id
+      -
+        name: mssfix
   -
     name: peer-del-input
     subset-of: peer

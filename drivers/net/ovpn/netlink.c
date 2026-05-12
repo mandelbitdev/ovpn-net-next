@@ -283,6 +283,7 @@ static int ovpn_nl_peer_modify(struct ovpn_peer *peer, struct genl_info *info,
 	void *local_ip = NULL;
 	u32 interv, timeout;
 	bool rehash = false;
+	u16 mssfix;
 	int ret;
 
 	spin_lock_bh(&peer->lock);
@@ -310,6 +311,17 @@ static int ovpn_nl_peer_modify(struct ovpn_peer *peer, struct genl_info *info,
 	 */
 	if (attrs[OVPN_A_PEER_TX_ID])
 		peer->tx_id = nla_get_u32(attrs[OVPN_A_PEER_TX_ID]);
+
+	if (attrs[OVPN_A_PEER_MSSFIX]) {
+		mssfix = nla_get_u16(attrs[OVPN_A_PEER_MSSFIX]);
+		if (mssfix > 0 && mssfix <= 20) {
+			NL_SET_ERR_MSG_FMT_MOD(info->extack,
+					       "mssfix must be 0 (disable) or at least 21");
+			ret = -EINVAL;
+			goto err_unlock;
+		}
+		peer->mssfix = mssfix;
+	}
 
 	if (attrs[OVPN_A_PEER_VPN_IPV4]) {
 		rehash = true;
