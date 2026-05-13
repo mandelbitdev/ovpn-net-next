@@ -49,10 +49,10 @@ ovpn_prepare_network() {
 		peer_ns="ovpn_peer${p}"
 		ovpn_cmd_ok "set peer0 timeout for peer ${p}" \
 			ip netns exec ovpn_peer0 ${OVPN_CLI} set_peer tun0 \
-				${p} 60 120
+				${p} 60 120 -1
 		ovpn_cmd_ok "set peer${p} timeout for peer ${p}" \
 			ip netns exec "${peer_ns}" ${OVPN_CLI} set_peer \
-				tun${p} $((p + OVPN_ID_OFFSET)) 60 120
+				tun${p} $((p + OVPN_ID_OFFSET)) 60 120 -1
 	done
 }
 
@@ -140,6 +140,66 @@ ovpn_run_iperf() {
 	ovpn_cmd_ok "run iperf throughput flow" \
 		ip netns exec ovpn_peer1 iperf3 -Z -t 3 -c 5.5.5.1
 	wait "${iperf_pid}" || return 1
+}
+
+ovpn_run_mssfix_flow() {
+	local filter
+	local iperf_pid
+	local direction="$1"
+	local mssfix="$2"
+	local tcpdump_pid
+
+	filter="tcp and src host 5.5.5.1 and dst host 5.5.5.2"
+	filter="${filter} and tcp[tcpflags] & tcp-syn != 0"
+
+	ovpn_run_bg iperf_pid ip netns exec ovpn_peer1 iperf3 -1 -s
+	sleep 1
+
+	timeout 3s ip netns exec ovpn_peer1 tcpdump --immediate-mode -l -p \
+		-vv -nn -i tun1 -c 1 "${filter}" 2>&1 |
+		grep -iq "mss ${mssfix}" &
+	tcpdump_pid=$!
+	sleep 0.3
+
+	ovpn_cmd_ok "run ${direction} mssfix TCP flow" \
+		ip netns exec ovpn_peer0 iperf3 -t 1 -c 5.5.5.2
+
+	ovpn_cmd_ok "capture ${direction} mssfix TCP SYN" wait "${tcpdump_pid}"
+	ovpn_cmd_ok "finish ${direction} mssfix TCP server" wait "${iperf_pid}"
+}
+
+ovpn_run_mssfix() {
+	local peer0_id=$((1 + OVPN_ID_OFFSET))
+
+	# peer0 will clamp MSS for packets exchanged with peer1
+	ovpn_cmd_ok "set peer0 mssfix for peer 1" \
+		ip netns exec ovpn_peer0 ${OVPN_CLI} set_peer tun0 1 \
+			60 120 900
+
+	ovpn_cmd_fail "reject invalid peer0 mssfix for peer 1" \
+		ip netns exec ovpn_peer0 ${OVPN_CLI} set_peer tun0 1 \
+			60 120 20
+
+	ovpn_cmd_ok "clear peer1 mssfix for peer ${peer0_id}" \
+		ip netns exec ovpn_peer1 ${OVPN_CLI} set_peer tun1 \
+			"${peer0_id}" 60 120 0
+
+	ovpn_run_mssfix_flow "TX" 900
+
+	ovpn_cmd_ok "clear peer0 mssfix for peer 1" \
+		ip netns exec ovpn_peer0 ${OVPN_CLI} set_peer tun0 1 \
+			60 120 0
+
+	# peer1 will clamp MSS for packets exchanged with peer0
+	ovpn_cmd_ok "set peer1 mssfix for peer ${peer0_id}" \
+		ip netns exec ovpn_peer1 ${OVPN_CLI} set_peer tun1 \
+			"${peer0_id}" 60 120 901
+
+	ovpn_run_mssfix_flow "RX" 901
+
+	ovpn_cmd_ok "clear peer1 mssfix for peer ${peer0_id}" \
+		ip netns exec ovpn_peer1 ${OVPN_CLI} set_peer tun1 \
+			"${peer0_id}" 60 120 0
 }
 
 ovpn_run_key_rollover() {
@@ -259,11 +319,11 @@ ovpn_run_timeouts() {
 		# Non-fatal: this may fail in some protocol modes.
 		ovpn_cmd_mayfail "set peer0 timeout for peer ${p} (non-fatal)" \
 			ip netns exec ovpn_peer0 ${OVPN_CLI} set_peer tun0 \
-				${p} 3 3
+				${p} 3 3 -1
 		peer_ns="ovpn_peer${p}"
 		ovpn_cmd_ok "disable timeout on peer${p} while peer0 adjusts \
 			state" ip netns exec "${peer_ns}" ${OVPN_CLI} set_peer \
-			tun${p} $((p + OVPN_ID_OFFSET)) 0 0
+			tun${p} $((p + OVPN_ID_OFFSET)) 0 0 -1
 	done
 	# wait for peers to timeout
 	sleep 5
@@ -274,7 +334,7 @@ ovpn_run_timeouts() {
 		peer_ns="ovpn_peer${p}"
 		ovpn_cmd_ok "set peer${p} P2P timeout" \
 			ip netns exec "${peer_ns}" ${OVPN_CLI} set_peer \
-				tun${p} $((p + OVPN_ID_OFFSET)) 3 3
+				tun${p} $((p + OVPN_ID_OFFSET)) 3 3 -1
 	done
 	sleep 5
 }
@@ -293,9 +353,9 @@ trap ovpn_stage_err ERR
 
 ktap_print_header
 if [ "${OVPN_FLOAT}" == "1" ]; then
-	ktap_set_plan 13
+	ktap_set_plan 14
 else
-	ktap_set_plan 12
+	ktap_set_plan 13
 fi
 
 ovpn_cleanup
@@ -307,6 +367,7 @@ ovpn_run_stage "run LAN traffic behind peer1" ovpn_run_lan_traffic
 [ "${OVPN_FLOAT}" == "1" ] && ovpn_run_stage "run floating peer checks" \
 	ovpn_run_float_mode
 ovpn_run_stage "run iperf throughput" ovpn_run_iperf
+ovpn_run_stage "run mssfix TCP SYN clamp" ovpn_run_mssfix
 ovpn_run_stage "run key rollout" ovpn_run_key_rollover
 ovpn_run_stage "query peers" ovpn_run_queries
 ovpn_run_stage "query missing peer fails" ovpn_query_peer_missing

@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <inttypes.h>
 #include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
@@ -129,6 +130,7 @@ struct ovpn_ctx {
 
 	__u32 keepalive_interval;
 	__u32 keepalive_timeout;
+	int mssfix;
 
 	enum ovpn_key_direction key_dir;
 	enum ovpn_key_slot key_slot;
@@ -732,6 +734,8 @@ static int ovpn_set_peer(struct ovpn_ctx *ovpn)
 		    ovpn->keepalive_interval);
 	NLA_PUT_U32(ctx->nl_msg, OVPN_A_PEER_KEEPALIVE_TIMEOUT,
 		    ovpn->keepalive_timeout);
+	if (ovpn->mssfix >= 0)
+		NLA_PUT_U16(ctx->nl_msg, OVPN_A_PEER_MSSFIX, ovpn->mssfix);
 	nla_nest_end(ctx->nl_msg, attr);
 
 	ret = ovpn_nl_msg_send(ctx, NULL);
@@ -1730,13 +1734,15 @@ static void usage(const char *cmd)
 	fprintf(stderr, "\tmark: socket FW mark value\n");
 
 	fprintf(stderr,
-		"* set_peer <iface> <peer_id> <keepalive_interval> <keepalive_timeout>: set peer attributes\n");
+		"* set_peer <iface> <peer_id> <keepalive_interval> <keepalive_timeout> <mssfix>: set peer attributes\n");
 	fprintf(stderr, "\tiface: ovpn interface name\n");
 	fprintf(stderr, "\tpeer_id: peer ID of the peer to modify\n");
 	fprintf(stderr,
 		"\tkeepalive_interval: interval for sending ping messages\n");
 	fprintf(stderr,
 		"\tkeepalive_timeout: time after which a peer is timed out\n");
+	fprintf(stderr,
+		"\tmssfix: TCP MSS value to clamp SYN packets to (0 disables, -1 leaves unchanged)\n");
 
 	fprintf(stderr, "* del_peer <iface> <peer_id>: delete peer\n");
 	fprintf(stderr, "\tiface: ovpn interface name\n");
@@ -2166,6 +2172,7 @@ static int ovpn_run_cmd(struct ovpn_ctx *ovpn)
 
 static int ovpn_parse_cmd_args(struct ovpn_ctx *ovpn, int argc, char *argv[])
 {
+	long mssfix;
 	int ret;
 
 	/* no args required for LISTEN_MCAST */
@@ -2307,7 +2314,7 @@ static int ovpn_parse_cmd_args(struct ovpn_ctx *ovpn, int argc, char *argv[])
 		}
 		break;
 	case CMD_SET_PEER:
-		if (argc < 6)
+		if (argc < 7)
 			return -EINVAL;
 
 		ovpn->peer_id = strtoul(argv[3], NULL, 10);
@@ -2329,6 +2336,14 @@ static int ovpn_parse_cmd_args(struct ovpn_ctx *ovpn, int argc, char *argv[])
 				"keepalive interval value out of range\n");
 			return -1;
 		}
+
+		errno = 0;
+		mssfix = strtol(argv[6], NULL, 10);
+		if (errno == ERANGE || mssfix < -1 || mssfix > UINT16_MAX) {
+			fprintf(stderr, "mssfix value out of range\n");
+			return -1;
+		}
+		ovpn->mssfix = mssfix;
 		break;
 	case CMD_DEL_PEER:
 		if (argc < 4)
@@ -2442,6 +2457,7 @@ int main(int argc, char *argv[])
 	memset(&ovpn, 0, sizeof(ovpn));
 	ovpn.sa_family = AF_UNSPEC;
 	ovpn.cipher = OVPN_CIPHER_ALG_NONE;
+	ovpn.mssfix = -1;
 
 	ovpn.cmd = ovpn_parse_cmd(argv[1]);
 	if (ovpn.cmd == CMD_INVALID) {
