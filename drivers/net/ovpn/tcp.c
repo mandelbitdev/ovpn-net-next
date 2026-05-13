@@ -349,7 +349,7 @@ void ovpn_tcp_send_skb(struct ovpn_peer *peer, struct sock *sk,
 
 	*(__be16 *)__skb_push(skb, sizeof(u16)) = htons(len);
 
-	spin_lock_nested(&sk->sk_lock.slock, OVPN_TCP_DEPTH_NESTING);
+	spin_lock_bh_nested(&sk->sk_lock.slock, OVPN_TCP_DEPTH_NESTING);
 	if (sock_owned_by_user(sk)) {
 		if (skb_queue_len(&peer->tcp.out_queue) >=
 		    READ_ONCE(net_hotdata.max_backlog)) {
@@ -362,7 +362,7 @@ void ovpn_tcp_send_skb(struct ovpn_peer *peer, struct sock *sk,
 		ovpn_tcp_send_sock_skb(peer, sk, skb);
 	}
 unlock:
-	spin_unlock(&sk->sk_lock.slock);
+	spin_unlock_bh(&sk->sk_lock.slock);
 }
 
 static void ovpn_tcp_release(struct sock *sk)

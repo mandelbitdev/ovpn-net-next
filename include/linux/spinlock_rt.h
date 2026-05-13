@@ -90,6 +90,13 @@ static __always_inline void spin_lock_bh(spinlock_t *lock)
 	rt_spin_lock(lock);
 }
 
+static __always_inline void spin_lock_bh_nested(spinlock_t *lock, int subclass)
+	__acquires(lock)
+{
+	local_bh_disable();
+	__spin_lock_nested(lock, subclass);
+}
+
 static __always_inline void spin_lock_irq(spinlock_t *lock)
 	__acquires(lock)
 {
