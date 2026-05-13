@@ -41,10 +41,10 @@ ovpn_prepare_network() {
 		peer_ns="ovpn_peer${p}"
 		ovpn_cmd_ok "set peer0 timeout for peer ${p}" \
 			ip netns exec ovpn_peer0 ${OVPN_CLI} set_peer tun0 \
-				${p} 60 120
+				${p} 60 120 -1
 		ovpn_cmd_ok "set peer${p} timeout for peer ${p}" \
 			ip netns exec "${peer_ns}" ${OVPN_CLI} set_peer \
-				tun${p} $((p + OVPN_ID_OFFSET)) 60 120
+				tun${p} $((p + OVPN_ID_OFFSET)) 60 120 -1
 	done
 }
 
