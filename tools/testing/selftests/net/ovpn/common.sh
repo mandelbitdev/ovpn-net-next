@@ -174,6 +174,7 @@ ovpn_setup_ns() {
 		ip -n "${peer}" link set mtu ${3} dev tun${1}
 	fi
 	ip -n "${peer}" link set tun${1} up
+	ip -n "${peer}" addr add fe80::$(( ${1} + 1 ))/64 dev tun${1} scope link
 }
 
 ovpn_build_capture_filter() {

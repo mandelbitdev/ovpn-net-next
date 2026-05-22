@@ -56,6 +56,59 @@ ovpn_prepare_network() {
 	done
 }
 
+ovpn_run_mbcast_tests() {
+	local p
+	local peer_ns
+	local -a pids=()
+
+	ovpn_log "Testing broadcast:"
+	for p in $(seq 1 "${OVPN_NUM_PEERS}"); do
+		peer_ns="ovpn_peer${p}"
+		timeout 3 ip netns exec "${peer_ns}" \
+			tcpdump --immediate-mode -p -ni "tun${p}" -c 1 \
+			'icmp and dst host 5.5.5.255' >/dev/null 2>&1 &
+		pids+=($!)
+	done
+	sleep 0.5
+	ovpn_cmd_mayfail "send broadcast ping from peer0" \
+		ip netns exec ovpn_peer0 ping -qbc 1 -w 3 -I tun0 5.5.5.255
+	for pid in "${pids[@]}"; do
+		wait "${pid}" || return 1
+	done
+	pids=()
+
+	ovpn_log "Testing multicast IPv4:"
+	for p in $(seq 1 "${OVPN_NUM_PEERS}"); do
+		peer_ns="ovpn_peer${p}"
+		timeout 3 ip netns exec "${peer_ns}" \
+			tcpdump --immediate-mode -p -ni "tun${p}" -c 1 \
+			'icmp and dst host 224.0.0.1' >/dev/null 2>&1 &
+		pids+=($!)
+	done
+	sleep 0.5
+	ovpn_cmd_mayfail "send IPv4 multicast ping from peer0" \
+		ip netns exec ovpn_peer0 ping -qc 1 -w 3 -I tun0 224.0.0.1
+	for pid in "${pids[@]}"; do
+		wait "${pid}" || return 1
+	done
+	pids=()
+
+	ovpn_log "Testing multicast IPv6:"
+	for p in $(seq 1 "${OVPN_NUM_PEERS}"); do
+		peer_ns="ovpn_peer${p}"
+		timeout 3 ip netns exec "${peer_ns}" \
+			tcpdump --immediate-mode -p -ni "tun${p}" -c 1 \
+			'icmp6 and dst host ff02::1' >/dev/null 2>&1 &
+		pids+=($!)
+	done
+	sleep 0.5
+	ovpn_cmd_mayfail "send IPv6 multicast ping from peer0" \
+		ip netns exec ovpn_peer0 ping -6 -qc 1 -w 3 -I tun0 ff02::1
+	for pid in "${pids[@]}"; do
+		wait "${pid}" || return 1
+	done
+}
+
 ovpn_run_basic_traffic() {
 	local p
 	local header1
@@ -293,9 +346,9 @@ trap ovpn_stage_err ERR
 
 ktap_print_header
 if [ "${OVPN_FLOAT}" == "1" ]; then
-	ktap_set_plan 13
+	ktap_set_plan 14
 else
-	ktap_set_plan 12
+	ktap_set_plan 13
 fi
 
 ovpn_cleanup
@@ -303,6 +356,7 @@ modprobe -q ovpn || true
 
 ovpn_run_stage "setup network topology" ovpn_prepare_network
 ovpn_run_stage "run baseline data traffic" ovpn_run_basic_traffic
+ovpn_run_stage "run multi/broadcast traffic" ovpn_run_mbcast_tests
 ovpn_run_stage "run LAN traffic behind peer1" ovpn_run_lan_traffic
 [ "${OVPN_FLOAT}" == "1" ] && ovpn_run_stage "run floating peer checks" \
 	ovpn_run_float_mode
