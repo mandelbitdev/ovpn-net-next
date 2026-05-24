@@ -2066,6 +2066,7 @@ enum ovpn_mode {
 enum {
 	IFLA_OVPN_UNSPEC,
 	IFLA_OVPN_MODE,
+	IFLA_OVPN_SELFDESTROY,
 	__IFLA_OVPN_MAX,
 };
 

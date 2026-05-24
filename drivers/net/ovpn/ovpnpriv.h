@@ -10,6 +10,7 @@
 #ifndef _NET_OVPN_OVPNSTRUCT_H_
 #define _NET_OVPN_OVPNSTRUCT_H_
 
+#include <linux/list.h>
 #include <linux/workqueue.h>
 #include <net/gro_cells.h>
 #include <uapi/linux/if_link.h>
@@ -33,10 +34,23 @@ struct ovpn_peer_collection {
 };
 
 /**
+ * struct ovpn_lifeline_info - rtnetlink socket identity for self-destruction
+ * @node: entry on the module-wide lifeline list
+ * @net: net namespace of the rtnetlink socket
+ * @portid: port ID of the rtnetlink socket
+ */
+struct ovpn_lifeline_info {
+	struct list_head node;
+	struct net *net;
+	u32 portid;
+};
+
+/**
  * struct ovpn_priv - per ovpn interface state
  * @dev: the actual netdev representing the tunnel
  * @mode: device operation mode (i.e. p2p, mp, ..)
  * @lock: protect this object
+ * @lifeline: rtnetlink socket identity for self-destruction
  * @peers: data structures holding multi-peer references
  * @peer: in P2P mode, this is the only remote peer
  * @gro_cells: pointer to the Generic Receive Offload cell
@@ -46,6 +60,7 @@ struct ovpn_priv {
 	struct net_device *dev;
 	enum ovpn_mode mode;
 	spinlock_t lock; /* protect writing to the ovpn_priv object */
+	struct ovpn_lifeline_info lifeline;
 	struct ovpn_peer_collection *peers;
 	struct ovpn_peer __rcu *peer;
 	struct gro_cells gro_cells;

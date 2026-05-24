@@ -11,6 +11,7 @@
 #include <linux/genetlink.h>
 #include <linux/module.h>
 #include <linux/netdevice.h>
+#include <linux/list.h>
 #include <linux/inetdevice.h>
 #include <net/gro_cells.h>
 #include <net/ip.h>
@@ -25,6 +26,11 @@
 #include "proto.h"
 #include "tcp.h"
 #include "udp.h"
+
+/* Self-destroying devices indexed by their rtnetlink socket identity.
+ * Protected by RTNL.
+ */
+static LIST_HEAD(ovpn_lifeline_list);
 
 static void ovpn_priv_free(struct net_device *net)
 {
@@ -108,6 +114,7 @@ static const struct device_type ovpn_type = {
 static const struct nla_policy ovpn_policy[IFLA_OVPN_MAX + 1] = {
 	[IFLA_OVPN_MODE] = NLA_POLICY_RANGE(NLA_U8, OVPN_MODE_P2P,
 					    OVPN_MODE_MP),
+	[IFLA_OVPN_SELFDESTROY] = { .type = NLA_FLAG },
 };
 
 /**
@@ -174,6 +181,19 @@ static void ovpn_setup(struct net_device *dev)
 	SET_NETDEV_DEVTYPE(dev, &ovpn_type);
 }
 
+static void ovpn_lifeline_detach(struct ovpn_priv *ovpn)
+{
+	ASSERT_RTNL();
+
+	if (!ovpn->lifeline.net)
+		return;
+
+	list_del_init(&ovpn->lifeline.node);
+	put_net(ovpn->lifeline.net);
+	ovpn->lifeline.net = NULL;
+	ovpn->lifeline.portid = 0;
+}
+
 static int ovpn_newlink(struct net_device *dev,
 			struct rtnl_newlink_params *params,
 			struct netlink_ext_ack *extack)
@@ -181,14 +201,33 @@ static int ovpn_newlink(struct net_device *dev,
 	struct ovpn_priv *ovpn = netdev_priv(dev);
 	struct nlattr **data = params->data;
 	enum ovpn_mode mode = OVPN_MODE_P2P;
+	struct net *net = NULL;
+	u32 portid = 0;
+	int err;
 
 	if (data && data[IFLA_OVPN_MODE]) {
 		mode = nla_get_u8(data[IFLA_OVPN_MODE]);
 		netdev_dbg(dev, "setting device mode: %u\n", mode);
 	}
 
+	if (data && data[IFLA_OVPN_SELFDESTROY]) {
+		if (!params->portid) {
+			NL_SET_ERR_MSG(extack,
+				       "self-destroy requires a userspace netlink socket");
+			return -EINVAL;
+		}
+		/* save the identifiers for the NETLINK_URELEASE notification */
+		portid = params->portid;
+		net = get_net(params->src_net);
+		netdev_dbg(dev,
+			   "device will be destroyed when the netlink socket used to create it will be closed\n");
+	}
+
 	ovpn->dev = dev;
 	ovpn->mode = mode;
+	ovpn->lifeline.portid = portid;
+	ovpn->lifeline.net = net;
+	INIT_LIST_HEAD(&ovpn->lifeline.node);
 	spin_lock_init(&ovpn->lock);
 	INIT_DELAYED_WORK(&ovpn->keepalive_work, ovpn_peer_keepalive_work);
 
@@ -205,13 +244,27 @@ static int ovpn_newlink(struct net_device *dev,
 	else
 		netif_carrier_off(dev);
 
-	return register_netdevice(dev);
+	err = register_netdevice(dev);
+	if (err < 0) {
+		if (net)
+			put_net(net);
+		return err;
+	}
+
+	/* expose the device to the notifier only after registration succeeds */
+	if (portid) {
+		ASSERT_RTNL();
+		list_add_tail(&ovpn->lifeline.node, &ovpn_lifeline_list);
+	}
+
+	return 0;
 }
 
 static void ovpn_dellink(struct net_device *dev, struct list_head *head)
 {
 	struct ovpn_priv *ovpn = netdev_priv(dev);
 
+	ovpn_lifeline_detach(ovpn);
 	cancel_delayed_work_sync(&ovpn->keepalive_work);
 	ovpn_peers_free(ovpn, NULL, OVPN_DEL_PEER_REASON_TEARDOWN);
 	unregister_netdevice_queue(dev, head);
@@ -221,7 +274,11 @@ static int ovpn_fill_info(struct sk_buff *skb, const struct net_device *dev)
 {
 	struct ovpn_priv *ovpn = netdev_priv(dev);
 
+	ASSERT_RTNL();
+
 	if (nla_put_u8(skb, IFLA_OVPN_MODE, ovpn->mode))
+		return -EMSGSIZE;
+	if (ovpn->lifeline.net && nla_put_flag(skb, IFLA_OVPN_SELFDESTROY))
 		return -EMSGSIZE;
 
 	return 0;
@@ -239,6 +296,46 @@ static struct rtnl_link_ops ovpn_link_ops = {
 	.fill_info = ovpn_fill_info,
 };
 
+static int ovpn_netlink_notify(struct notifier_block *nb, unsigned long action,
+			       void *data)
+{
+	const struct netlink_notify *notify = data;
+	struct ovpn_lifeline_info *entry, *tmp;
+	struct ovpn_priv *ovpn;
+	LIST_HEAD(unreg_list);
+
+	/* A self-destroying ovpn device uses the rtnetlink socket that created
+	 * it as its lifeline. When that socket is released, delete all ovpn
+	 * devices whose saved socket netns and port ID match the notification.
+	 */
+	if (action != NETLINK_URELEASE || notify->protocol != NETLINK_ROUTE)
+		return NOTIFY_DONE;
+
+	rtnl_lock();
+
+	/* ovpn_dellink removes entry->node, so use the safe iterator */
+	list_for_each_entry_safe(entry, tmp, &ovpn_lifeline_list, node) {
+		if (!net_eq(notify->net, entry->net) ||
+		    entry->portid != notify->portid)
+			continue;
+
+		ovpn = container_of(entry, struct ovpn_priv, lifeline);
+		ovpn_dellink(ovpn->dev, &unreg_list);
+	}
+
+	/* One rtnetlink socket may be the lifeline for multiple ovpn devices
+	 * so unregister the whole list built by ovpn_dellink in a batch.
+	 */
+	unregister_netdevice_many(&unreg_list);
+	rtnl_unlock();
+
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block ovpn_netlink_notifier = {
+	.notifier_call = ovpn_netlink_notify,
+};
+
 static int __init ovpn_init(void)
 {
 	int err = rtnl_link_register(&ovpn_link_ops);
@@ -254,6 +351,13 @@ static int __init ovpn_init(void)
 		goto unreg_rtnl;
 	}
 
+	err = netlink_register_notifier(&ovpn_netlink_notifier);
+	if (err) {
+		pr_err("ovpn: can't register netlink notifier: %d\n", err);
+		ovpn_nl_unregister();
+		goto unreg_rtnl;
+	}
+
 	ovpn_tcp_init();
 
 	return 0;
@@ -265,6 +369,7 @@ unreg_rtnl:
 
 static __exit void ovpn_cleanup(void)
 {
+	netlink_unregister_notifier(&ovpn_netlink_notifier);
 	ovpn_nl_unregister();
 	rtnl_link_unregister(&ovpn_link_ops);
 
