@@ -75,6 +75,7 @@ static inline int rtnl_msg_family(const struct nlmsghdr *nlh)
  * @src_net: Source netns of rtnetlink socket
  * @link_net: Link netns by IFLA_LINK_NETNSID, NULL if not specified
  * @peer_net: Peer netns
+ * @portid: Netlink port ID of the message sender
  * @tb: IFLA_* attributes
  * @data: IFLA_INFO_DATA attributes
  */
@@ -82,6 +83,7 @@ struct rtnl_newlink_params {
 	struct net *src_net;
 	struct net *link_net;
 	struct net *peer_net;
+	u32 portid;
 	struct nlattr **tb;
 	struct nlattr **data;
 };

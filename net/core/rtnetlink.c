@@ -3846,6 +3846,7 @@ static int rtnl_newlink_create(struct sk_buff *skb, struct ifinfomsg *ifm,
 		.src_net = sock_net(skb->sk),
 		.link_net = link_net,
 		.peer_net = peer_net,
+		.portid = NETLINK_CB(skb).portid,
 		.tb = tb,
 		.data = data,
 	};
