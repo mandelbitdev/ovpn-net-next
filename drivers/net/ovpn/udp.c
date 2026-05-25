@@ -152,12 +152,19 @@ static int ovpn_udp4_output(struct ovpn_peer *peer, struct ovpn_bind *bind,
 		 */
 		.saddr = READ_ONCE(bind->local.ipv4.s_addr),
 		.daddr = bind->remote.in4.sin_addr.s_addr,
-		.fl4_sport = inet_sk(sk)->inet_sport,
+		.fl4_sport = READ_ONCE(inet_sk(sk)->inet_sport),
 		.fl4_dport = bind->remote.in4.sin_port,
 		.flowi4_proto = sk->sk_protocol,
 		.flowi4_mark = sk->sk_mark,
 	};
 	int ret;
+
+	/* an uninitialized socket or connect(AF_UNSPEC) can cause this */
+	if (unlikely(!fl.fl4_sport)) {
+		net_warn_ratelimited("%s: peer %u: UDP source port is 0\n",
+				     netdev_name(peer->ovpn->dev), peer->id);
+		return -EADDRNOTAVAIL;
+	}
 
 	local_bh_disable();
 	rt = dst_cache_get_ip4(cache, &fl.saddr);
@@ -228,7 +235,7 @@ static int ovpn_udp6_output(struct ovpn_peer *peer, struct ovpn_bind *bind,
 
 	struct flowi6 fl = {
 		.daddr = bind->remote.in6.sin6_addr,
-		.fl6_sport = inet_sk(sk)->inet_sport,
+		.fl6_sport = READ_ONCE(inet_sk(sk)->inet_sport),
 		.fl6_dport = bind->remote.in6.sin6_port,
 		.flowi6_proto = sk->sk_protocol,
 		.flowi6_mark = sk->sk_mark,
@@ -239,6 +246,13 @@ static int ovpn_udp6_output(struct ovpn_peer *peer, struct ovpn_bind *bind,
 	 * address under the peer seqcount to avoid a torn read
 	 */
 	ovpn_peer_local_ipv6(peer, bind, &fl.saddr);
+
+	/* an uninitialized socket or connect(AF_UNSPEC) can cause this */
+	if (unlikely(!fl.fl6_sport)) {
+		net_warn_ratelimited("%s: peer %u: UDP source port is 0\n",
+				     netdev_name(peer->ovpn->dev), peer->id);
+		return -EADDRNOTAVAIL;
+	}
 
 	local_bh_disable();
 	dst = dst_cache_get_ip6(cache, &fl.saddr);
@@ -298,7 +312,8 @@ err:
  * @skb: the packet to send
  *
  * rcu_read_lock should be held on entry.
- * On return, the skb is consumed.
+ * On success, the skb is passed to the transport stack and consumed. On
+ * error, ownership remains with the caller.
  *
  * Return: 0 on success or a negative error code otherwise
  */
@@ -345,21 +360,19 @@ out:
  * @peer: the destination peer
  * @sk: peer socket
  * @skb: the packet to send
+ *
+ * Return: 0 on success or a negative error code otherwise
  */
-void ovpn_udp_send_skb(struct ovpn_peer *peer, struct sock *sk,
-		       struct sk_buff *skb)
+int ovpn_udp_send_skb(struct ovpn_peer *peer, struct sock *sk,
+		      struct sk_buff *skb)
 {
-	int ret;
-
 	skb->dev = peer->ovpn->dev;
 	skb->mark = READ_ONCE(sk->sk_mark);
 	/* no checksum performed at this layer */
 	skb->ip_summed = CHECKSUM_NONE;
 
 	/* crypto layer -> transport (UDP) */
-	ret = ovpn_udp_output(peer, &peer->dst_cache, sk, skb);
-	if (unlikely(ret < 0))
-		kfree_skb(skb);
+	return ovpn_udp_output(peer, &peer->dst_cache, sk, skb);
 }
 
 static void ovpn_udp_encap_destroy(struct sock *sk)
