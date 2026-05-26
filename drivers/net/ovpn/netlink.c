@@ -254,15 +254,6 @@ static int ovpn_nl_peer_precheck(struct ovpn_priv *ovpn,
 		return -EINVAL;
 	}
 
-	if ((attrs[OVPN_A_PEER_KEEPALIVE_INTERVAL] &&
-	     !attrs[OVPN_A_PEER_KEEPALIVE_TIMEOUT]) ||
-	    (!attrs[OVPN_A_PEER_KEEPALIVE_INTERVAL] &&
-	     attrs[OVPN_A_PEER_KEEPALIVE_TIMEOUT])) {
-		NL_SET_ERR_MSG_FMT_MOD(info->extack,
-				       "keepalive interval and timeout are required together");
-		return -EINVAL;
-	}
-
 	return 0;
 }
 
@@ -281,7 +272,6 @@ static int ovpn_nl_peer_modify(struct ovpn_peer *peer, struct genl_info *info,
 {
 	struct sockaddr_storage ss = {};
 	void *local_ip = NULL;
-	u32 interv, timeout;
 	bool rehash = false;
 	int ret;
 
@@ -323,13 +313,9 @@ static int ovpn_nl_peer_modify(struct ovpn_peer *peer, struct genl_info *info,
 			nla_get_in6_addr(attrs[OVPN_A_PEER_VPN_IPV6]);
 	}
 
-	/* when setting the keepalive, both parameters have to be configured */
-	if (attrs[OVPN_A_PEER_KEEPALIVE_INTERVAL] &&
-	    attrs[OVPN_A_PEER_KEEPALIVE_TIMEOUT]) {
-		interv = nla_get_u32(attrs[OVPN_A_PEER_KEEPALIVE_INTERVAL]);
-		timeout = nla_get_u32(attrs[OVPN_A_PEER_KEEPALIVE_TIMEOUT]);
-		ovpn_peer_keepalive_set(peer, interv, timeout);
-	}
+	ovpn_peer_keepalive_set(peer,
+				attrs[OVPN_A_PEER_KEEPALIVE_INTERVAL],
+				attrs[OVPN_A_PEER_KEEPALIVE_TIMEOUT]);
 
 	netdev_dbg(peer->ovpn->dev,
 		   "modify peer id=%u tx_id=%u endpoint=%pIScp VPN-IPv4=%pI4 VPN-IPv6=%pI6c\n",

@@ -37,26 +37,60 @@ static void unlock_ovpn(struct ovpn_priv *ovpn,
 }
 
 /**
- * ovpn_peer_keepalive_set - configure keepalive values for peer
+ * ovpn_peer_keepalive_interval_set - configure keepalive interval for peer
  * @peer: the peer to configure
  * @interval: outgoing keepalive interval
- * @timeout: incoming keepalive timeout
+ * @now: current time
  */
-void ovpn_peer_keepalive_set(struct ovpn_peer *peer, u32 interval, u32 timeout)
+static void ovpn_peer_keepalive_interval_set(struct ovpn_peer *peer, u32 interval, time64_t now)
 {
-	time64_t now = ktime_get_real_seconds();
-
 	netdev_dbg(peer->ovpn->dev,
-		   "scheduling keepalive for peer %u: interval=%u timeout=%u\n",
-		   peer->id, interval, timeout);
+		   "scheduling keepalive interval for peer %u: %u\n",
+		   peer->id, interval);
 
 	peer->keepalive_interval = interval;
 	WRITE_ONCE(peer->last_sent, now);
 	peer->keepalive_xmit_exp = now + interval;
+}
+
+/**
+ * ovpn_peer_keepalive_timeout_set - configure keepalive timeout for peer
+ * @peer: the peer to configure
+ * @timeout: incoming keepalive timeout
+ * @now: current time
+ */
+static void ovpn_peer_keepalive_timeout_set(struct ovpn_peer *peer, u32 timeout, time64_t now)
+{
+	netdev_dbg(peer->ovpn->dev,
+		   "scheduling keepalive timeout for peer %u: %u\n",
+		   peer->id, timeout);
 
 	peer->keepalive_timeout = timeout;
 	WRITE_ONCE(peer->last_recv, now);
 	peer->keepalive_recv_exp = now + timeout;
+}
+
+/**
+ * ovpn_peer_keepalive_set - configure keepalive values for peer
+ * @peer: the peer to configure
+ * @nla_interval: pointer to the KEEPALIVE_INTERVAL netlink attribute
+ * @nla_timeout: pointer to the KEEPALIVE_TIMEOUT netlink attribute
+ */
+void ovpn_peer_keepalive_set(struct ovpn_peer *peer,
+			     const struct nlattr *nla_interval,
+			     const struct nlattr *nla_timeout)
+{
+	time64_t now;
+
+	if (!nla_interval && !nla_timeout)
+		return;
+
+	now = ktime_get_real_seconds();
+
+	if (nla_interval)
+		ovpn_peer_keepalive_interval_set(peer, nla_get_u32(nla_interval), now);
+	if (nla_timeout)
+		ovpn_peer_keepalive_timeout_set(peer, nla_get_u32(nla_timeout), now);
 
 	/* now that interval and timeout have been changed, kick
 	 * off the worker so that the next delay can be recomputed
@@ -1214,15 +1248,13 @@ static time64_t ovpn_peer_keepalive_work_single(struct ovpn_peer *peer,
 						time64_t now,
 						struct llist_head *release_list)
 {
-	time64_t last_recv, last_sent, next_run1, next_run2;
+	time64_t last_recv, last_sent, next_run1 = 0, next_run2;
 	unsigned long timeout, interval;
 	bool expired;
 
 	spin_lock_bh(&peer->lock);
-	/* we expect both timers to be configured at the same time,
-	 * therefore bail out if either is not set
-	 */
-	if (!peer->keepalive_timeout || !peer->keepalive_interval) {
+
+	if (!peer->keepalive_timeout && !peer->keepalive_interval) {
 		spin_unlock_bh(&peer->lock);
 		return 0;
 	}
@@ -1230,31 +1262,33 @@ static time64_t ovpn_peer_keepalive_work_single(struct ovpn_peer *peer,
 	/* check for peer timeout */
 	expired = false;
 	timeout = peer->keepalive_timeout;
-	last_recv = READ_ONCE(peer->last_recv);
-	if (now < last_recv + timeout) {
-		peer->keepalive_recv_exp = last_recv + timeout;
-		next_run1 = peer->keepalive_recv_exp;
-	} else if (peer->keepalive_recv_exp > now) {
-		next_run1 = peer->keepalive_recv_exp;
-	} else {
-		expired = true;
-	}
+	if (timeout) {
+		last_recv = READ_ONCE(peer->last_recv);
+		if (now < last_recv + timeout) {
+			peer->keepalive_recv_exp = last_recv + timeout;
+			next_run1 = peer->keepalive_recv_exp;
+		} else if (peer->keepalive_recv_exp > now) {
+			next_run1 = peer->keepalive_recv_exp;
+		} else {
+			expired = true;
+		}
 
-	if (expired) {
-		/* peer is dead -> kill it and move on */
-		spin_unlock_bh(&peer->lock);
-		netdev_dbg(peer->ovpn->dev, "peer %u expired\n",
-			   peer->id);
-		ovpn_peer_remove(peer, OVPN_DEL_PEER_REASON_EXPIRED,
-				 release_list);
-		return 0;
+		if (expired) {
+			/* peer is dead -> kill it and move on */
+			spin_unlock_bh(&peer->lock);
+			netdev_dbg(peer->ovpn->dev, "peer %u expired\n", peer->id);
+			ovpn_peer_remove(peer, OVPN_DEL_PEER_REASON_EXPIRED, release_list);
+			return 0;
+		}
 	}
 
 	/* check for peer keepalive */
-	expired = false;
 	interval = peer->keepalive_interval;
 	last_sent = READ_ONCE(peer->last_sent);
-	if (now < last_sent + interval) {
+	if (!interval) {
+		spin_unlock_bh(&peer->lock);
+		return next_run1;
+	} else if (now < last_sent + interval) {
 		peer->keepalive_xmit_exp = last_sent + interval;
 		next_run2 = peer->keepalive_xmit_exp;
 	} else if (peer->keepalive_xmit_exp > now) {
@@ -1274,7 +1308,7 @@ static time64_t ovpn_peer_keepalive_work_single(struct ovpn_peer *peer,
 			ovpn_peer_hold(peer);
 	}
 
-	if (next_run1 < next_run2)
+	if (next_run1 && next_run1 < next_run2)
 		return next_run1;
 
 	return next_run2;
