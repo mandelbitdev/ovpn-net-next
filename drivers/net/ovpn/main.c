@@ -217,6 +217,12 @@ static void ovpn_dellink(struct net_device *dev, struct list_head *head)
 	unregister_netdevice_queue(dev, head);
 }
 
+static size_t ovpn_get_size(const struct net_device *dev)
+{
+	/* IFLA_OVPN_MODE */
+	return nla_total_size(sizeof(u8));
+}
+
 static int ovpn_fill_info(struct sk_buff *skb, const struct net_device *dev)
 {
 	struct ovpn_priv *ovpn = netdev_priv(dev);
@@ -236,6 +242,7 @@ static struct rtnl_link_ops ovpn_link_ops = {
 	.maxtype = IFLA_OVPN_MAX,
 	.newlink = ovpn_newlink,
 	.dellink = ovpn_dellink,
+	.get_size = ovpn_get_size,
 	.fill_info = ovpn_fill_info,
 };
 
