@@ -22,10 +22,17 @@
  * struct ovpn_route_key - route key used for the peer dst cache
  * @mark: fwmark used for route lookup
  * @sport: UDP source port used for route lookup
+ * @family: address family of @saddr
+ * @saddr: local address used for route lookup
  */
 struct ovpn_route_key {
 	u32 mark;
 	__be16 sport;
+	sa_family_t family;
+	union {
+		__be32 ipv4;
+		struct in6_addr ipv6;
+	} saddr;
 };
 
 /**
