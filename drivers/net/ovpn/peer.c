@@ -200,12 +200,11 @@ static void __ovpn_peer_hash_transp_addr(struct ovpn_peer *peer,
  */
 void ovpn_peer_endpoints_update(struct ovpn_peer *peer, struct sk_buff *skb)
 {
+	const void *local_ip = NULL;
 	struct sockaddr_storage ss;
 	struct sockaddr_in6 *sa6;
-	bool reset_cache = false;
 	struct sockaddr_in *sa;
 	struct ovpn_bind *bind;
-	const void *local_ip;
 	size_t salen = 0;
 
 	spin_lock_bh(&peer->lock);
@@ -234,7 +233,6 @@ void ovpn_peer_endpoints_update(struct ovpn_peer *peer, struct sk_buff *skb)
 				.sin_port = udp_hdr(skb)->source,
 			};
 			salen = sizeof(*sa);
-			reset_cache = true;
 			break;
 		}
 
@@ -246,8 +244,7 @@ void ovpn_peer_endpoints_update(struct ovpn_peer *peer, struct sk_buff *skb)
 					    netdev_name(peer->ovpn->dev),
 					    peer->id, &bind->local.ipv4.s_addr,
 					    &ip_hdr(skb)->daddr);
-			bind->local.ipv4.s_addr = ip_hdr(skb)->daddr;
-			reset_cache = true;
+			local_ip = &ip_hdr(skb)->daddr;
 		}
 		break;
 	case htons(ETH_P_IPV6):
@@ -272,7 +269,6 @@ void ovpn_peer_endpoints_update(struct ovpn_peer *peer, struct sk_buff *skb)
 							    skb->skb_iif),
 			};
 			salen = sizeof(*sa6);
-			reset_cache = true;
 			break;
 		}
 
@@ -285,24 +281,38 @@ void ovpn_peer_endpoints_update(struct ovpn_peer *peer, struct sk_buff *skb)
 					    netdev_name(peer->ovpn->dev),
 					    peer->id, &bind->local.ipv6,
 					    &ipv6_hdr(skb)->daddr);
-			bind->local.ipv6 = ipv6_hdr(skb)->daddr;
-			reset_cache = true;
+			local_ip = &ipv6_hdr(skb)->daddr;
 		}
 		break;
 	default:
 		goto unlock;
 	}
 
-	if (unlikely(reset_cache))
-		dst_cache_reset(&peer->dst_cache);
-
-	/* if the peer did not float, we can bail out now */
-	if (likely(!salen))
+	/* if there was no float and the local address is unchanged, bail out */
+	if (likely(!salen && !local_ip))
 		goto unlock;
+
+	/* if only the local address changed, populate ss with the current
+	 * remote
+	 */
+	if (!salen)
+		memcpy(&ss, &bind->remote,
+		       bind->remote.in4.sin_family == AF_INET ?
+			       sizeof(struct sockaddr_in) :
+			       sizeof(struct sockaddr_in6));
 
 	if (unlikely(ovpn_peer_reset_sockaddr(peer,
 					      (struct sockaddr_storage *)&ss,
 					      local_ip) < 0))
+		goto unlock;
+
+	/* reset the cache only after a successful bind update to avoid useless
+	 * cache misses on concurrent TX
+	 */
+	dst_cache_reset(&peer->dst_cache);
+
+	/* if the peer did not float, we can bail out now */
+	if (!salen)
 		goto unlock;
 
 	net_dbg_ratelimited("%s: peer %d floated to %pIScp",
