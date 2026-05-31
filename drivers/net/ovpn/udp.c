@@ -316,9 +316,11 @@ static int ovpn_udp6_output(struct ovpn_peer *peer, struct ovpn_bind *bind,
 {
 	struct in6_addr local = in6addr_any;
 	struct sockaddr_storage remote;
+	struct net *net = sock_net(sk);
 	bool reset_local = false;
 	struct dst_entry *dst;
-	int ret;
+	int gen0, gen1, ret;
+	u32 cookie;
 
 	struct flowi6 fl = {
 		.saddr = bind->local.ipv6,
@@ -344,7 +346,11 @@ static int ovpn_udp6_output(struct ovpn_peer *peer, struct ovpn_bind *bind,
 		reset_local = true;
 	}
 
-	dst = ip6_dst_lookup_flow(sock_net(sk), sk, &fl, NULL);
+	gen0 = rt_genid_ipv6(net);
+	/* keep the unordered initial generation read before the FIB lookup */
+	smp_rmb();
+
+	dst = ip6_dst_lookup_flow(net, sk, &fl, NULL);
 	if (IS_ERR(dst)) {
 		ret = PTR_ERR(dst);
 		net_dbg_ratelimited("%s: no route to host %pISpc: %d\n",
@@ -353,27 +359,41 @@ static int ovpn_udp6_output(struct ovpn_peer *peer, struct ovpn_bind *bind,
 		goto err;
 	}
 
+	cookie = rt6_get_cookie(dst_rt6_info(dst));
+
+	/* keep the FIB and cookie reads before the final generation read */
+	smp_rmb();
+	gen1 = rt_genid_ipv6(net);
+
 	/* avoid storing a stale cache or local address */
 	spin_lock_bh(&peer->lock);
 	if (likely(ovpn_dst_cache_current(peer, bind, key))) {
-		if (!reset_local) {
-			dst_cache_set_ip6(cache, dst, &fl.saddr);
+		/* cache the dst with the original cookie only if the learned
+		 * local source was not reset and the FIB did not change
+		 */
+		if (!reset_local && likely(gen0 == gen1)) {
+			dst_cache_set_ip6_cookie(cache, dst, &fl.saddr, cookie);
 			spin_unlock_bh(&peer->lock);
 			goto transmit;
 		}
 
-		/* invalidate per-CPU dst entries that may still carry
-		 * the stale source
-		 */
-		dst_cache_reset(cache);
+		if (reset_local) {
+			/* invalidate per-CPU dst entries that may still carry
+			 * the stale source
+			 */
+			dst_cache_reset(cache);
 
-		/* preserve the current remote */
-		memcpy(&remote, &bind->remote, sizeof(struct sockaddr_in6));
-		/* The current packet already has a valid wildcard-source route.
-		 * If replacing the bind fails, leave the stale local in place;
-		 * a later cache miss will retry the repair.
-		 */
-		ovpn_peer_reset_sockaddr(peer, &remote, &local);
+			/* preserve the current remote */
+			memcpy(&remote, &bind->remote,
+			       sizeof(struct sockaddr_in6));
+			/* The current packet already has a valid
+			 * wildcard-source route. If replacing the bind fails,
+			 * leave the stale local in place; a later cache miss
+			 * will retry the repair.
+			 */
+			ovpn_peer_reset_sockaddr(peer, &remote, &local);
+		}
+
 	}
 	spin_unlock_bh(&peer->lock);
 
