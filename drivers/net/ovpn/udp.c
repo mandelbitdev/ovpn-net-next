@@ -342,8 +342,8 @@ void ovpn_udp_send_skb(struct ovpn_peer *peer, struct sock *sk,
 {
 	int ret;
 
-	/* the encrypted openvpn packet is the UDP tunnel payload */
-	skb_reset_inner_network_header(skb);
+	/* scrub stale metadata after encapsulation */
+	ovpn_skb_reset_metadata(skb, true);
 
 	skb->dev = peer->ovpn->dev;
 	skb->mark = READ_ONCE(sk->sk_mark);

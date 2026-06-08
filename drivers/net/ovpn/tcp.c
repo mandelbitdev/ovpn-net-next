@@ -349,6 +349,9 @@ void ovpn_tcp_send_skb(struct ovpn_peer *peer, struct sock *sk,
 
 	*(__be16 *)__skb_push(skb, sizeof(u16)) = htons(len);
 
+	/* scrub stale metadata after encapsulation */
+	ovpn_skb_reset_metadata(skb, true);
+
 	spin_lock_nested(&sk->sk_lock.slock, OVPN_TCP_DEPTH_NESTING);
 	if (sock_owned_by_user(sk)) {
 		if (skb_queue_len(&peer->tcp.out_queue) >=

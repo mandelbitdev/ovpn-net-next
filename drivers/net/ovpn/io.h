@@ -31,4 +31,6 @@ void ovpn_xmit_special(struct ovpn_peer *peer, const void *data,
 void ovpn_encrypt_post(void *data, int ret);
 void ovpn_decrypt_post(void *data, int ret);
 
+void ovpn_skb_reset_metadata(struct sk_buff *skb, bool preserve_hash);
+
 #endif /* _NET_OVPN_OVPN_H_ */

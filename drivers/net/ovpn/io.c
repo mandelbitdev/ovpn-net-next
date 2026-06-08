@@ -9,6 +9,7 @@
 
 #include <crypto/aead.h>
 #include <linux/netdevice.h>
+#include <linux/netfilter_netdev.h>
 #include <linux/skbuff.h>
 #include <net/gro_cells.h>
 #include <net/gso.h>
@@ -54,6 +55,41 @@ static bool ovpn_is_keepalive(struct sk_buff *skb)
 	return !memcmp(skb->data, ovpn_keepalive_message, OVPN_KEEPALIVE_SIZE);
 }
 
+void ovpn_skb_reset_metadata(struct sk_buff *skb, bool preserve_hash)
+{
+	const u8 l4_hash = skb->l4_hash;
+	const u8 sw_hash = skb->sw_hash;
+	const u32 hash = skb->hash;
+
+	skb_scrub_packet(skb, true);
+	nf_skip_egress(skb, false);
+
+	if (preserve_hash) {
+		skb->l4_hash = l4_hash;
+		skb->sw_hash = sw_hash;
+		skb->hash = hash;
+	} else {
+		skb_clear_hash(skb);
+	}
+
+	skb_set_queue_mapping(skb, 0);
+	skb_reset_redirect(skb);
+
+#ifdef CONFIG_NET_SCHED
+	skb->tc_index = 0;
+#endif
+
+	skb->nohdr = 0;
+	skb->peeked = 0;
+	skb->mac_len = 0;
+	skb->hdr_len = skb_headroom(skb);
+
+	skb_reset_mac_header(skb);
+	skb_reset_network_header(skb);
+	skb_reset_transport_header(skb);
+	skb_reset_inner_headers(skb);
+}
+
 /* Called after decrypt to write the IP packet to the device.
  * This method is expected to manage/free the skb.
  */
@@ -74,20 +110,7 @@ static void ovpn_netdev_write(struct ovpn_peer *peer, struct sk_buff *skb)
 	 */
 	skb->ip_summed = CHECKSUM_NONE;
 
-	/* skb hash for transport packet no longer valid after decapsulation */
-	skb_clear_hash(skb);
-
-	/* post-decrypt scrub -- prepare to inject encapsulated packet onto the
-	 * interface, based on __skb_tunnel_rx() in dst.h
-	 */
 	skb->dev = peer->ovpn->dev;
-	skb_set_queue_mapping(skb, 0);
-	skb_scrub_packet(skb, true);
-
-	/* network header reset in ovpn_decrypt_post() */
-	skb_reset_mac_header(skb);
-	skb_reset_transport_header(skb);
-	skb_reset_inner_headers(skb);
 
 	/* cause packet to be "received" by the interface */
 	pkt_len = skb->len;
@@ -154,10 +177,14 @@ void ovpn_decrypt_post(void *data, int ret)
 	/* point to encapsulated IP packet */
 	__skb_pull(skb, payload_offset);
 
+	/* decrypted payload starts at skb->data now so reset stale metadata
+	 * before parsing the inner packet
+	 */
+	ovpn_skb_reset_metadata(skb, false);
+
 	/* check if this is a valid datapacket that has to be delivered to the
 	 * ovpn interface
 	 */
-	skb_reset_network_header(skb);
 	proto = ovpn_ip_check_protocol(skb);
 	if (unlikely(!proto)) {
 		/* check if null packet */
