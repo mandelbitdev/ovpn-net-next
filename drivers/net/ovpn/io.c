@@ -390,6 +390,10 @@ netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
 	skb_dst_drop(skb);
 
 	if (skb_is_gso(skb)) {
+		/* no offload features: segments come out linear and with a
+		 * complete checksum, computed while copying the payload, so
+		 * that the in-place encryption doesn't need another copy
+		 */
 		segments = skb_gso_segment(skb, 0);
 		if (IS_ERR(segments)) {
 			ret = PTR_ERR(segments);
@@ -398,8 +402,13 @@ netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
 			goto drop;
 		}
 
-		consume_skb(skb);
-		skb = segments;
+		if (segments) {
+			consume_skb(skb);
+			skb = segments;
+		} else {
+			/* nothing to segment: send the packet as it is */
+			skb_gso_reset(skb);
+		}
 	}
 
 	/* from this moment on, "skb" might be a list */
@@ -413,6 +422,16 @@ netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
 			net_err_ratelimited("%s: skb_share_check failed for payload packet\n",
 					    netdev_name(dev));
 			ovpn_dev_dstats_tx_dropped(ovpn->dev);
+			continue;
+		}
+
+		/* NETIF_F_HW_CSUM requires completing partial checksums */
+		if (unlikely(curr->ip_summed == CHECKSUM_PARTIAL &&
+			     skb_csum_hwoffload_help(curr, 0) < 0)) {
+			net_err_ratelimited("%s: skb_checksum_help failed for payload packet\n",
+					    netdev_name(dev));
+			ovpn_dev_dstats_tx_dropped(ovpn->dev);
+			kfree_skb(curr);
 			continue;
 		}
 
