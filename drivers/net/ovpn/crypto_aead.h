@@ -16,9 +16,9 @@
 #include <linux/skbuff.h>
 
 int ovpn_aead_encrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
-		      struct sk_buff *skb);
+		      struct sk_buff *in);
 int ovpn_aead_decrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
-		      struct sk_buff *skb);
+		      struct sk_buff *in);
 
 struct ovpn_crypto_key_slot *
 ovpn_aead_crypto_key_slot_new(const struct ovpn_key_config *kc);

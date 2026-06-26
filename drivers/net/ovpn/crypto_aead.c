@@ -24,24 +24,16 @@
 #include "skb.h"
 
 #define OVPN_AUTH_TAG_SIZE	16
-#define OVPN_AAD_SIZE		(OVPN_OPCODE_SIZE + OVPN_NONCE_WIRE_SIZE)
 
 #define ALG_NAME_AES		"gcm(aes)"
 #define ALG_NAME_CHACHAPOLY	"rfc7539(chacha20,poly1305)"
-
-static int ovpn_aead_encap_overhead(const struct ovpn_crypto_key_slot *ks)
-{
-	return  OVPN_OPCODE_SIZE +			/* OP header size */
-		sizeof(u32) +				/* Packet ID */
-		crypto_aead_authsize(ks->encrypt);	/* Auth Tag */
-}
 
 /**
  * ovpn_aead_crypto_tmp_size - compute the size of a temporary object containing
  *			       an AEAD request structure with extra space for SG
  *			       and IV.
  * @tfm: the AEAD cipher handle
- * @nfrags: the number of fragments in the skb
+ * @nsg: the number of scatterlist entries to reserve
  *
  * This function calculates the size of a contiguous memory block that includes
  * the initialization vector (IV), the AEAD request, and an array of scatterlist
@@ -53,7 +45,7 @@ static int ovpn_aead_encap_overhead(const struct ovpn_crypto_key_slot *ks)
  * Return: the size of the temporary memory that needs to be allocated
  */
 static unsigned int ovpn_aead_crypto_tmp_size(struct crypto_aead *tfm,
-					      const unsigned int nfrags)
+					      const unsigned int nsg)
 {
 	unsigned int len = OVPN_NONCE_SIZE;
 
@@ -69,8 +61,8 @@ static unsigned int ovpn_aead_crypto_tmp_size(struct crypto_aead *tfm,
 	/* round up to the next multiple of the scatterlist alignment */
 	len = ALIGN(len, __alignof__(struct scatterlist));
 
-	/* add enough space for nfrags + 2 scatterlist entries */
-	len += array_size(sizeof(struct scatterlist), nfrags + 2);
+	/* add enough space for the scatterlist entries */
+	len += array_size(sizeof(struct scatterlist), nsg);
 	return len;
 }
 
@@ -135,19 +127,23 @@ static struct scatterlist *ovpn_aead_crypto_req_sg(struct crypto_aead *aead,
 }
 
 int ovpn_aead_encrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
-		      struct sk_buff *skb)
+		      struct sk_buff *in)
 {
 	const unsigned int tag_size = crypto_aead_authsize(ks->encrypt);
+	const unsigned int src_nents = skb_shinfo(in)->nr_frags + 2;
+	const unsigned int out_len = OVPN_AAD_SIZE + tag_size + in->len;
+	const unsigned int payload_len = in->len;
+	const unsigned int dst_nents = 3;
+	struct scatterlist *src, *dst;
 	struct aead_request *req;
-	struct sk_buff *trailer;
-	struct scatterlist *sg;
-	int nfrags, ret;
+	struct sk_buff *out;
 	u32 pktid, op;
 	void *tmp;
+	int ret;
 	u8 *iv;
 
-	ovpn_skb_cb(skb)->peer = peer;
-	ovpn_skb_cb(skb)->ks = ks;
+	ovpn_skb_cb(in)->peer = peer;
+	ovpn_skb_cb(in)->ks = ks;
 
 	/* Sample AEAD header format:
 	 * 48000001 00000005 7e7046bd 444a7e28 cc6387b1 64a4d6c1 380275a...
@@ -156,50 +152,33 @@ int ovpn_aead_encrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 	 *          IV head]
 	 */
 
-	/* check that there's enough headroom in the skb for packet
-	 * encapsulation
-	 */
-	if (unlikely(skb_cow_head(skb, OVPN_HEAD_ROOM)))
-		return -ENOBUFS;
+	/* allocate the output skb for out-of-place crypto */
+	out = netdev_alloc_skb(peer->ovpn->dev, OVPN_HEAD_ROOM + out_len);
+	if (unlikely(!out))
+		return -ENOMEM;
 
-	/* get number of skb frags and ensure that packet data is writable */
-	nfrags = skb_cow_data(skb, 0, &trailer);
-	if (unlikely(nfrags < 0))
-		return nfrags;
+	/* setup the skb layout */
+	skb_reserve(out, OVPN_HEAD_ROOM);
+	skb_put(out, out_len);
+	skb_reset_inner_network_header(out);
 
-	if (unlikely(nfrags + 2 > (MAX_SKB_FRAGS + 2)))
-		return -ENOSPC;
+	memset(ovpn_skb_cb(out), 0, sizeof(struct ovpn_cb));
+	ovpn_skb_cb(out)->nosignal = ovpn_skb_cb(in)->nosignal;
+	ovpn_skb_cb(in)->out_skb = out;
 
-	/* allocate temporary memory for iv, sg and req */
-	tmp = kmalloc(ovpn_aead_crypto_tmp_size(ks->encrypt, nfrags),
+	/* allocate temporary memory for iv, req and sgs */
+	tmp = kmalloc(ovpn_aead_crypto_tmp_size(ks->encrypt,
+						src_nents + dst_nents),
 		      GFP_ATOMIC);
 	if (unlikely(!tmp))
 		return -ENOMEM;
 
-	ovpn_skb_cb(skb)->crypto_tmp = tmp;
+	ovpn_skb_cb(in)->crypto_tmp = tmp;
 
 	iv = ovpn_aead_crypto_tmp_iv(ks->encrypt, tmp);
 	req = ovpn_aead_crypto_tmp_req(ks->encrypt, iv);
-	sg = ovpn_aead_crypto_req_sg(ks->encrypt, req);
-
-	/* sg table:
-	 * 0: op, wire nonce (AD, len=OVPN_OP_SIZE_V2+OVPN_NONCE_WIRE_SIZE),
-	 * 1, 2, 3, ..., n: payload,
-	 * n+1: auth_tag (len=tag_size)
-	 */
-	sg_init_table(sg, nfrags + 2);
-
-	/* build scatterlist to encrypt packet payload */
-	ret = skb_to_sgvec_nomark(skb, sg + 1, 0, skb->len);
-	if (unlikely(ret < 0)) {
-		netdev_err(peer->ovpn->dev,
-			   "encrypt: cannot map skb to sg: %d\n", ret);
-		return ret;
-	}
-
-	/* append auth_tag onto scatterlist */
-	__skb_push(skb, tag_size);
-	sg_set_buf(sg + ret + 1, skb->data, tag_size);
+	src = ovpn_aead_crypto_req_sg(ks->encrypt, req);
+	dst = src + src_nents;
 
 	/* obtain packet ID, which is used both as a first
 	 * 4 bytes of nonce and last 4 bytes of associated data.
@@ -213,24 +192,49 @@ int ovpn_aead_encrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 	 */
 	ovpn_pktid_aead_write(pktid, ks->nonce_tail_xmit, iv);
 
-	/* make space for packet id and push it to the front */
-	__skb_push(skb, OVPN_NONCE_WIRE_SIZE);
-	memcpy(skb->data, iv, OVPN_NONCE_WIRE_SIZE);
-
-	/* add packet op as head of additional data */
 	op = ovpn_opcode_compose(OVPN_DATA_V2, ks->key_id, peer->tx_id);
-	__skb_push(skb, OVPN_OPCODE_SIZE);
 	BUILD_BUG_ON(sizeof(op) != OVPN_OPCODE_SIZE);
-	*((__force __be32 *)skb->data) = htonl(op);
+	*((__force __be32 *)out->data) = htonl(op);
+	memcpy(out->data + OVPN_OPCODE_SIZE, iv, OVPN_NONCE_WIRE_SIZE);
 
-	/* AEAD Additional data */
-	sg_set_buf(sg, skb->data, OVPN_AAD_SIZE);
+	/* source sg table:
+	 * 0: op, wire nonce (AD, len=OVPN_OP_SIZE_V2+OVPN_NONCE_WIRE_SIZE),
+	 * 1, ..., src_nents: plaintext
+	 */
+	sg_init_table(src, src_nents);
 
-	/* setup async crypto operation */
+	/* destination sg table:
+	 * 0: AAD,
+	 * 1: ciphertext,
+	 * 2: auth_tag (len=tag_size)
+	 */
+	sg_init_table(dst, dst_nents);
+
+	/* use the already written OpenVPN AEAD Additional data in the output
+	 * skb as the source AAD for AEAD authentication
+	 */
+	sg_set_buf(src, out->data, OVPN_AAD_SIZE);
+	ret = skb_to_sgvec_nomark(in, src + 1, 0, payload_len);
+	if (unlikely(ret < 0)) {
+		netdev_err(peer->ovpn->dev,
+			   "encrypt: cannot map skb to src sg: %d\n", ret);
+		return ret;
+	}
+	sg_mark_end(src + ret);
+
+	/* output skb layout:
+	 * AAD:        out->data             = dst[0]
+	 * tag:        out->data + AAD       = dst[2]
+	 * ciphertext: out->data + AAD + tag = dst[1]
+	 */
+	sg_set_buf(dst, out->data, OVPN_AAD_SIZE);
+	sg_set_buf(dst + 1, out->data + OVPN_AAD_SIZE + tag_size,
+		   payload_len);
+	sg_set_buf(dst + 2, out->data + OVPN_AAD_SIZE, tag_size);
+
 	aead_request_set_tfm(req, ks->encrypt);
-	aead_request_set_callback(req, 0, ovpn_encrypt_post, skb);
-	aead_request_set_crypt(req, sg, sg,
-			       skb->len - ovpn_aead_encap_overhead(ks), iv);
+	aead_request_set_callback(req, 0, ovpn_encrypt_post, in);
+	aead_request_set_crypt(req, src, dst, payload_len, iv);
 	aead_request_set_ad(req, OVPN_AAD_SIZE);
 
 	/* encrypt it */
@@ -238,23 +242,22 @@ int ovpn_aead_encrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 }
 
 int ovpn_aead_decrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
-		      struct sk_buff *skb)
+		      struct sk_buff *in)
 {
 	const unsigned int tag_size = crypto_aead_authsize(ks->decrypt);
-	int ret, payload_len, nfrags;
-	unsigned int payload_offset;
+	const unsigned int payload_offset = OVPN_AAD_SIZE + tag_size;
+	const int payload_len = in->len - payload_offset;
+	const unsigned int dst_nents = 2;
+	struct scatterlist *src, *dst;
 	struct aead_request *req;
-	struct sk_buff *trailer;
-	struct scatterlist *sg;
+	unsigned int src_nents;
+	struct sk_buff *out;
 	void *tmp;
+	int ret;
 	u8 *iv;
 
-	payload_offset = OVPN_AAD_SIZE + tag_size;
-	payload_len = skb->len - payload_offset;
-
-	ovpn_skb_cb(skb)->payload_offset = payload_offset;
-	ovpn_skb_cb(skb)->peer = peer;
-	ovpn_skb_cb(skb)->ks = ks;
+	ovpn_skb_cb(in)->peer = peer;
+	ovpn_skb_cb(in)->ks = ks;
 
 	/* sanity check on packet size, payload size must be >= 0 */
 	if (unlikely(payload_len < 0))
@@ -264,59 +267,80 @@ int ovpn_aead_decrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 	 * This is required because this area is directly mapped into the sg
 	 * list.
 	 */
-	if (unlikely(!pskb_may_pull(skb, payload_offset)))
+	if (unlikely(!pskb_may_pull(in, payload_offset)))
 		return -ENODATA;
 
-	/* get number of skb frags and ensure that packet data is writable */
-	nfrags = skb_cow_data(skb, 0, &trailer);
-	if (unlikely(nfrags < 0))
-		return nfrags;
+	/* allocate the output skb for out-of-place crypto */
+	out = netdev_alloc_skb(peer->ovpn->dev, payload_len);
+	if (unlikely(!out))
+		return -ENOMEM;
 
-	if (unlikely(nfrags + 2 > (MAX_SKB_FRAGS + 2)))
-		return -ENOSPC;
+	skb_put(out, payload_len);
+	memset(ovpn_skb_cb(out), 0, sizeof(struct ovpn_cb));
+	ovpn_skb_cb(in)->out_skb = out;
 
-	/* allocate temporary memory for iv, sg and req */
-	tmp = kmalloc(ovpn_aead_crypto_tmp_size(ks->decrypt, nfrags),
+	/* source sg needs one entry for AAD, up to nr_frags + 1 entries for
+	 * ciphertext and one entry for auth_tag
+	 */
+	src_nents = skb_shinfo(in)->nr_frags + 3;
+
+	/* allocate temporary memory for iv, req and sgs */
+	tmp = kmalloc(ovpn_aead_crypto_tmp_size(ks->decrypt,
+						src_nents + dst_nents),
 		      GFP_ATOMIC);
 	if (unlikely(!tmp))
 		return -ENOMEM;
 
-	ovpn_skb_cb(skb)->crypto_tmp = tmp;
+	ovpn_skb_cb(in)->crypto_tmp = tmp;
 
 	iv = ovpn_aead_crypto_tmp_iv(ks->decrypt, tmp);
 	req = ovpn_aead_crypto_tmp_req(ks->decrypt, iv);
-	sg = ovpn_aead_crypto_req_sg(ks->decrypt, req);
+	src = ovpn_aead_crypto_req_sg(ks->decrypt, req);
+	dst = src + src_nents;
 
-	/* sg table:
+	/* source sg table:
 	 * 0: op, wire nonce (AD, len=OVPN_OPCODE_SIZE+OVPN_NONCE_WIRE_SIZE),
 	 * 1, 2, 3, ..., n: payload,
 	 * n+1: auth_tag (len=tag_size)
 	 */
-	sg_init_table(sg, nfrags + 2);
+	sg_init_table(src, src_nents);
+
+	/* destination sg table:
+	 * 0: AAD,
+	 * 1: plaintext
+	 */
+	sg_init_table(dst, dst_nents);
 
 	/* packet op is head of additional data */
-	sg_set_buf(sg, skb->data, OVPN_AAD_SIZE);
+	sg_set_buf(src, in->data, OVPN_AAD_SIZE);
 
 	/* build scatterlist to decrypt packet payload */
-	ret = skb_to_sgvec_nomark(skb, sg + 1, payload_offset, payload_len);
+	ret = skb_to_sgvec_nomark(in, src + 1, payload_offset, payload_len);
 	if (unlikely(ret < 0)) {
 		netdev_err(peer->ovpn->dev,
-			   "decrypt: cannot map skb to sg: %d\n", ret);
+			   "decrypt: cannot map skb to src sg: %d\n", ret);
 		return ret;
 	}
 
 	/* append auth_tag onto scatterlist */
-	sg_set_buf(sg + ret + 1, skb->data + OVPN_AAD_SIZE, tag_size);
+	sg_set_buf(src + ret + 1, in->data + OVPN_AAD_SIZE, tag_size);
+	sg_mark_end(src + ret + 1);
+
+	/* use the already written OpenVPN AEAD Additional data in the input
+	 * skb as the destination AAD for AEAD authentication
+	 */
+	sg_set_buf(dst, in->data, OVPN_AAD_SIZE);
+	sg_set_buf(dst + 1, out->data, payload_len);
 
 	/* copy nonce into IV buffer */
-	memcpy(iv, skb->data + OVPN_OPCODE_SIZE, OVPN_NONCE_WIRE_SIZE);
+	memcpy(iv, in->data + OVPN_OPCODE_SIZE, OVPN_NONCE_WIRE_SIZE);
 	memcpy(iv + OVPN_NONCE_WIRE_SIZE, ks->nonce_tail_recv,
 	       OVPN_NONCE_TAIL_SIZE);
 
 	/* setup async crypto operation */
 	aead_request_set_tfm(req, ks->decrypt);
-	aead_request_set_callback(req, 0, ovpn_decrypt_post, skb);
-	aead_request_set_crypt(req, sg, sg, payload_len + tag_size, iv);
+	aead_request_set_callback(req, 0, ovpn_decrypt_post, in);
+	aead_request_set_crypt(req, src, dst, payload_len + tag_size, iv);
 
 	aead_request_set_ad(req, OVPN_AAD_SIZE);
 

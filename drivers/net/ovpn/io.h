@@ -10,8 +10,10 @@
 #ifndef _NET_OVPN_OVPN_H_
 #define _NET_OVPN_OVPN_H_
 
+#define OVPN_AAD_SIZE	(OVPN_OPCODE_SIZE + OVPN_NONCE_WIRE_SIZE)
+
 /* DATA_V2 header size with AEAD encryption */
-#define OVPN_HEAD_ROOM (OVPN_OPCODE_SIZE + OVPN_NONCE_WIRE_SIZE +	   \
+#define OVPN_HEAD_ROOM	(OVPN_AAD_SIZE +				   \
 			16 /* AEAD TAG length */ +			   \
 			max(sizeof(struct udphdr), sizeof(struct tcphdr)) +\
 			max(sizeof(struct ipv6hdr), sizeof(struct iphdr)))

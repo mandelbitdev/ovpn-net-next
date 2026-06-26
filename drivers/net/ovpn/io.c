@@ -107,9 +107,8 @@ static void ovpn_netdev_write(struct ovpn_peer *peer, struct sk_buff *skb)
 
 void ovpn_decrypt_post(void *data, int ret)
 {
+	struct sk_buff *in = data, *out, *skb;
 	struct ovpn_crypto_key_slot *ks;
-	unsigned int payload_offset = 0;
-	struct sk_buff *skb = data;
 	struct ovpn_socket *sock;
 	struct ovpn_peer *peer;
 	__be16 proto;
@@ -121,18 +120,19 @@ void ovpn_decrypt_post(void *data, int ret)
 	if (unlikely(ret == -EINPROGRESS))
 		return;
 
-	payload_offset = ovpn_skb_cb(skb)->payload_offset;
-	ks = ovpn_skb_cb(skb)->ks;
-	peer = ovpn_skb_cb(skb)->peer;
+	skb = in;
+	out = ovpn_skb_cb(in)->out_skb;
+	ks = ovpn_skb_cb(in)->ks;
+	peer = ovpn_skb_cb(in)->peer;
 
 	/* crypto is done, cleanup skb CB and its members */
-	kfree(ovpn_skb_cb(skb)->crypto_tmp);
+	kfree(ovpn_skb_cb(in)->crypto_tmp);
 
 	if (unlikely(ret < 0))
 		goto drop;
 
 	/* PID sits after the op */
-	pid = (__force __be32 *)(skb->data + OVPN_OPCODE_SIZE);
+	pid = (__force __be32 *)(in->data + OVPN_OPCODE_SIZE);
 	ret = ovpn_pktid_recv(&ks->pid_recv, ntohl(*pid), 0);
 	if (unlikely(ret < 0)) {
 		net_err_ratelimited("%s: PKT ID RX error for peer %u: %d\n",
@@ -148,11 +148,18 @@ void ovpn_decrypt_post(void *data, int ret)
 	sock = rcu_dereference(peer->sock);
 	if (sock && sock->sk->sk_protocol == IPPROTO_UDP)
 		/* check if this peer changed local or remote endpoint */
-		ovpn_peer_endpoints_update(peer, skb);
+		ovpn_peer_endpoints_update(peer, in);
 	rcu_read_unlock();
 
+	if (WARN_ON_ONCE(!out))
+		goto drop;
+
+	consume_skb(in);
+	in = NULL;
+
 	/* point to encapsulated IP packet */
-	__skb_pull(skb, payload_offset);
+	skb = out;
+	out = NULL;
 
 	/* check if this is a valid datapacket that has to be delivered to the
 	 * ovpn interface
@@ -202,6 +209,7 @@ void ovpn_decrypt_post(void *data, int ret)
 drop:
 	if (unlikely(skb))
 		ovpn_dev_dstats_rx_dropped(peer->ovpn->dev);
+	kfree_skb(out);
 	kfree_skb(skb);
 drop_nocount:
 	if (likely(peer))
@@ -237,8 +245,8 @@ void ovpn_recv(struct ovpn_peer *peer, struct sk_buff *skb)
 
 void ovpn_encrypt_post(void *data, int ret)
 {
+	struct sk_buff *in = data, *out, *skb;
 	struct ovpn_crypto_key_slot *ks;
-	struct sk_buff *skb = data;
 	struct ovpn_socket *sock;
 	struct ovpn_peer *peer;
 	unsigned int orig_len;
@@ -249,11 +257,13 @@ void ovpn_encrypt_post(void *data, int ret)
 	if (unlikely(ret == -EINPROGRESS))
 		return;
 
-	ks = ovpn_skb_cb(skb)->ks;
-	peer = ovpn_skb_cb(skb)->peer;
+	skb = in;
+	out = ovpn_skb_cb(in)->out_skb;
+	ks = ovpn_skb_cb(in)->ks;
+	peer = ovpn_skb_cb(in)->peer;
 
 	/* crypto is done, cleanup skb CB and its members */
-	kfree(ovpn_skb_cb(skb)->crypto_tmp);
+	kfree(ovpn_skb_cb(in)->crypto_tmp);
 
 	if (unlikely(ret == -ERANGE)) {
 		/* we ran out of IVs and we must kill the key as it can't be
@@ -271,6 +281,14 @@ void ovpn_encrypt_post(void *data, int ret)
 
 	if (unlikely(ret < 0))
 		goto err;
+
+	if (WARN_ON_ONCE(!out))
+		goto err;
+
+	consume_skb(in);
+	in = NULL;
+	skb = out;
+	out = NULL;
 
 	skb_mark_not_on_list(skb);
 	orig_len = skb->len;
@@ -306,6 +324,7 @@ err:
 		ovpn_peer_put(peer);
 	if (likely(ks))
 		ovpn_crypto_key_slot_put(ks);
+	kfree_skb(out);
 	kfree_skb(skb);
 }
 
