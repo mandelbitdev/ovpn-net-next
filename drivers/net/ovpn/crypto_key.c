@@ -149,7 +149,8 @@ ovpn_key_ctx_replay_state(struct ovpn_key_ctx *key)
 static struct ovpn_key_ctx *
 ovpn_key_ctx_new(const char *title, const char *alg_name,
 		 const u8 *cipher_key, unsigned int cipher_key_len,
-		 const u8 *implicit_iv, u16 epoch, bool encrypt)
+		 const u8 *implicit_iv, u16 epoch, bool epoch_format,
+		 bool encrypt)
 {
 	struct ovpn_limit pktid_limit;
 	struct ovpn_key_ctx *key;
@@ -180,7 +181,7 @@ ovpn_key_ctx_new(const char *title, const char *alg_name,
 	kref_init(&key->refcount);
 
 	if (encrypt) {
-		ovpn_pktid_xmit_limit_init(&pktid_limit, false);
+		ovpn_pktid_xmit_limit_init(&pktid_limit, epoch_format);
 		ovpn_pktid_xmit_init(&key->pktid_xmit, &pktid_limit);
 	}
 
@@ -202,7 +203,7 @@ ovpn_key_ctx_create_direct(bool encrypt, const char *alg_name,
 
 	key = ovpn_key_ctx_new(encrypt ? "encrypt" : "decrypt", alg_name,
 			       dir->cipher_key, dir->cipher_key_size,
-			       implicit_iv, 0, encrypt);
+			       implicit_iv, 0, false, encrypt);
 	memzero_explicit(implicit_iv, sizeof(implicit_iv));
 
 	return key;
@@ -224,7 +225,7 @@ ovpn_key_ctx_create_epoch(bool encrypt, const char *alg_name,
 
 	key = ovpn_key_ctx_new(encrypt ? "encrypt" : "decrypt", alg_name,
 			       cipher_key, epoch_key->cipher_key_len,
-			       implicit_iv, epoch_key->epoch, encrypt);
+			       implicit_iv, epoch_key->epoch, true, encrypt);
 
 out:
 	memzero_explicit(cipher_key, sizeof(cipher_key));
