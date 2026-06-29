@@ -10,6 +10,8 @@
 #ifndef _NET_OVPN_OVPNCRYPTO_H_
 #define _NET_OVPN_OVPNCRYPTO_H_
 
+#include <linux/kref.h>
+#include <linux/rcupdate.h>
 #include <linux/workqueue.h>
 
 #include "crypto_limits.h"
@@ -50,14 +52,17 @@ struct ovpn_key_ctx {
 	atomic64_t decrypt_failures;
 	/* whether userspace was notified of excessive decrypt failures */
 	atomic_t decrypt_failure_notified;
+	struct rcu_work free_work;
+	struct kref refcount;
 };
 
 struct ovpn_crypto_key_slot {
 	u8 key_id;
 	enum ovpn_cipher_alg cipher_alg;
 	struct ovpn_limit usage_limit;
-	struct ovpn_key_ctx *encrypt;
-	struct ovpn_key_ctx *decrypt;
+
+	struct ovpn_key_ctx __rcu *encrypt;
+	struct ovpn_key_ctx __rcu *decrypt;
 	struct rcu_work free_work;
 	struct kref refcount;
 };
@@ -137,6 +142,31 @@ void ovpn_crypto_key_slot_release(struct kref *kref);
 static inline void ovpn_crypto_key_slot_put(struct ovpn_crypto_key_slot *ks)
 {
 	kref_put(&ks->refcount, ovpn_crypto_key_slot_release);
+}
+
+void ovpn_key_ctx_release(struct kref *kref);
+
+static inline void ovpn_key_ctx_put(struct ovpn_key_ctx *key)
+{
+	if (key)
+		kref_put(&key->refcount, ovpn_key_ctx_release);
+}
+
+static inline int ovpn_key_ctx_get(struct ovpn_key_ctx **out,
+				   struct ovpn_key_ctx __rcu **rcu_ptr)
+{
+	struct ovpn_key_ctx *key;
+
+	rcu_read_lock();
+	key = rcu_dereference(*rcu_ptr);
+	if (unlikely(!key || !kref_get_unless_zero(&key->refcount))) {
+		rcu_read_unlock();
+		return -ENOKEY;
+	}
+	rcu_read_unlock();
+
+	*out = key;
+	return 0;
 }
 
 int ovpn_crypto_state_reset(struct ovpn_crypto_state *cs,
