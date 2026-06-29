@@ -154,11 +154,12 @@ int ovpn_aead_encrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 	struct ovpn_key_ctx *key = NULL;
 	struct aead_request *req;
 	struct sk_buff *trailer;
+	u64 aead_blocks, pktid;
 	struct scatterlist *sg;
+	bool pktid_notify;
 	int nfrags, ret;
-	u64 aead_blocks;
-	u32 pktid, op;
 	void *tmp;
+	u32 op;
 	u8 *iv;
 
 	ovpn_skb_cb(skb)->peer = peer;
@@ -227,11 +228,15 @@ int ovpn_aead_encrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 	/* obtain packet ID, which is used both as a first
 	 * 4 bytes of nonce and last 4 bytes of associated data.
 	 */
-	aead_blocks = ovpn_aead_limit_blocks(ks->cipher_alg,
-					     OVPN_AEAD_DIRECT_AAD_SIZE,
+	ret = ovpn_pktid_xmit_next(&key->pid.xmit, &pktid);
+	if (unlikely(ret < 0))
+		return ret;
+	pktid_notify = ret > 0;
+
+	aead_blocks = ovpn_aead_limit_blocks(ks->cipher_alg, ks->aad_size,
 					     plaintext_len);
-	ret = ovpn_pktid_xmit_next(&key->pid.xmit, &key->usage,
-				   &ks->usage_limit, aead_blocks, &pktid);
+	ret = ovpn_key_usage_xmit(&key->usage, &ks->usage_limit, pktid,
+				  aead_blocks, pktid_notify);
 	if (unlikely(ret < 0))
 		return ret;
 	if (unlikely(ret > 0))
@@ -240,11 +245,11 @@ int ovpn_aead_encrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 	/* concat 4 bytes packet id and 8 bytes nonce tail into 12 bytes
 	 * nonce
 	 */
-	ovpn_pktid_aead_write(pktid, key->implicit_iv, iv);
+	pktid = ovpn_pktid_aead_write(0, pktid, key->implicit_iv, iv);
 
 	/* make space for packet id and push it to the front */
-	__skb_push(skb, OVPN_NONCE_WIRE_SIZE);
-	memcpy(skb->data, iv, OVPN_NONCE_WIRE_SIZE);
+	__skb_push(skb, ks->pktid_size);
+	ovpn_pktid_wire_write(skb->data, false, pktid);
 
 	/* add packet op as head of additional data */
 	op = ovpn_opcode_compose(OVPN_DATA_V2, ks->key_id, peer->tx_id);
@@ -253,14 +258,14 @@ int ovpn_aead_encrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 	*((__force __be32 *)skb->data) = htonl(op);
 
 	/* AEAD Additional data */
-	sg_set_buf(sg, skb->data, OVPN_AEAD_DIRECT_AAD_SIZE);
+	sg_set_buf(sg, skb->data, ks->aad_size);
 
 	/* setup async crypto operation */
 	aead_request_set_tfm(req, key->tfm);
 	aead_request_set_callback(req, 0, ovpn_encrypt_post, skb);
 	aead_request_set_crypt(req, sg, sg,
 			       skb->len - ovpn_aead_encap_overhead(key), iv);
-	aead_request_set_ad(req, OVPN_AEAD_DIRECT_AAD_SIZE);
+	aead_request_set_ad(req, ks->aad_size);
 
 	/* encrypt it */
 	return crypto_aead_encrypt(req);
@@ -334,7 +339,7 @@ int ovpn_aead_decrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 	sg_init_table(sg, nfrags + 2);
 
 	/* packet op is head of additional data */
-	sg_set_buf(sg, skb->data, OVPN_AEAD_DIRECT_AAD_SIZE);
+	sg_set_buf(sg, skb->data, ks->aad_size);
 
 	/* build scatterlist to decrypt packet payload */
 	ret = skb_to_sgvec_nomark(skb, sg + 1, payload_offset, payload_len);
@@ -358,7 +363,7 @@ int ovpn_aead_decrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 	aead_request_set_callback(req, 0, ovpn_decrypt_post, skb);
 	aead_request_set_crypt(req, sg, sg, payload_len + tag_size, iv);
 
-	aead_request_set_ad(req, OVPN_AEAD_DIRECT_AAD_SIZE);
+	aead_request_set_ad(req, ks->aad_size);
 
 	/* decrypt it */
 	return crypto_aead_decrypt(req);
