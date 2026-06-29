@@ -139,6 +139,7 @@ int ovpn_aead_encrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 		      struct sk_buff *skb)
 {
 	const unsigned int tag_size = crypto_aead_authsize(ks->encrypt);
+	unsigned int plaintext_len;
 	struct aead_request *req;
 	struct sk_buff *trailer;
 	struct scatterlist *sg;
@@ -149,6 +150,7 @@ int ovpn_aead_encrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 
 	ovpn_skb_cb(skb)->peer = peer;
 	ovpn_skb_cb(skb)->ks = ks;
+	plaintext_len = skb->len;
 
 	/* Sample AEAD header format:
 	 * 48000001 00000005 7e7046bd 444a7e28 cc6387b1 64a4d6c1 380275a...
@@ -205,7 +207,12 @@ int ovpn_aead_encrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 	/* obtain packet ID, which is used both as a first
 	 * 4 bytes of nonce and last 4 bytes of associated data.
 	 */
-	ret = ovpn_pktid_xmit_next(&ks->pid_xmit, &pktid);
+	ret = ovpn_pktid_xmit_next(&ks->pid_xmit, &ks->usage_xmit,
+				   &ks->usage_limit,
+				   ovpn_aead_limit_blocks(ks->cipher_alg,
+							  OVPN_AAD_SIZE,
+							  plaintext_len),
+				   &pktid);
 	if (unlikely(ret < 0))
 		return ret;
 	if (unlikely(ret > 0))
@@ -425,6 +432,10 @@ ovpn_aead_crypto_key_slot_new(const struct ovpn_key_config *kc)
 	ks->decrypt = NULL;
 	kref_init(&ks->refcount);
 	ks->key_id = kc->key_id;
+	ks->cipher_alg = kc->cipher_alg;
+	ovpn_key_usage_limit_init(&ks->usage_limit, kc->cipher_alg);
+	ovpn_key_usage_init(&ks->usage_xmit);
+	ovpn_key_usage_init(&ks->usage_recv);
 
 	ks->encrypt = ovpn_aead_init("encrypt", alg_name,
 				     kc->encrypt.cipher_key,

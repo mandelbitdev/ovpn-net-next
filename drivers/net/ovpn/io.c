@@ -112,6 +112,7 @@ void ovpn_decrypt_post(void *data, int ret)
 	struct sk_buff *skb = data;
 	struct ovpn_socket *sock;
 	struct ovpn_peer *peer;
+	u64 aead_blocks;
 	__be16 proto;
 	__be32 *pid;
 
@@ -140,6 +141,16 @@ void ovpn_decrypt_post(void *data, int ret)
 				    ret);
 		goto drop;
 	}
+
+	aead_blocks = ovpn_aead_limit_blocks(ks->cipher_alg,
+					     OVPN_OPCODE_SIZE +
+					     OVPN_NONCE_WIRE_SIZE,
+					     skb->len - payload_offset);
+	if (unlikely(ovpn_pktid_recv_update_aead(&ks->pid_recv,
+						 &ks->usage_recv,
+						 &ks->usage_limit,
+						 aead_blocks)))
+		ovpn_nl_key_swap_notify(peer, ks->key_id);
 
 	/* keep track of last received authenticated packet for keepalive */
 	WRITE_ONCE(peer->last_recv, ktime_get_real_seconds());

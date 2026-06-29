@@ -10,6 +10,7 @@
 #ifndef _NET_OVPN_OVPNPKTID_H_
 #define _NET_OVPN_OVPNPKTID_H_
 
+#include "crypto_limits.h"
 #include "proto.h"
 
 /* If no packets received for this length of time, set a backtrack floor
@@ -58,31 +59,71 @@ struct ovpn_pktid_recv {
 /**
  * ovpn_pktid_xmit_next - allocate a transmit packet ID
  * @pid: transmit packet ID state
+ * @usage: key usage state
+ * @limit: key usage limits
+ * @aead_blocks: AEAD usage blocks consumed by this packet
  * @pktid: location where the generated packet ID is stored
  *
  * The returned packet ID becomes part of the AEAD nonce, so the helper rejects
- * the packet before the 32-bit packet-ID space wraps.
+ * the packet before the 32-bit packet-ID space wraps. It also reserves this
+ * packet's AEAD usage against the key and rejects the packet before the hard
+ * AES-GCM usage limit would be exceeded.
  *
- * The packet-ID soft threshold does not reject the packet. It returns 1 once
- * so the caller can notify userspace to rekey while packet-ID space remains.
+ * Soft thresholds do not reject the packet. They return 1 once so the caller
+ * can notify userspace to rekey while packet-ID space remains and before the
+ * hard AES-GCM usage limit is reached.
  *
  * Return: 1 if userspace should be notified, 0 if no notification is needed,
  * or a negative error code otherwise.
  */
-static inline int ovpn_pktid_xmit_next(struct ovpn_pktid_xmit *pid, u32 *pktid)
+static inline int ovpn_pktid_xmit_next(struct ovpn_pktid_xmit *pid,
+				       struct ovpn_key_usage *usage,
+				       const struct ovpn_limit *limit,
+				       u64 aead_blocks, u32 *pktid)
 {
 	const u32 seq_num = atomic_fetch_add_unless(&pid->seq_num, 1, 0);
-	int ret = 0;
+	bool pktid_notify;
+	int ret;
 
 	/* packet IDs are used to create cipher IVs and must not wrap */
 	if (unlikely(!seq_num))
 		return -ERANGE;
 
-	/* notify userspace before the packet ID space is close to wrapping */
-	if (unlikely(seq_num == PKTID_XMIT_REKEY_NOTIFY))
-		ret = 1;
+	pktid_notify = seq_num >= PKTID_XMIT_REKEY_NOTIFY;
+	ret = ovpn_key_usage_xmit(usage, limit, seq_num, aead_blocks,
+				  pktid_notify);
+	if (unlikely(ret < 0))
+		return ret;
 
 	*pktid = seq_num;
+
+	return ret;
+}
+
+/**
+ * ovpn_pktid_recv_update_aead - account receive-side AEAD usage
+ * @pr: receive packet ID state
+ * @usage: key usage state
+ * @limit: key usage limits
+ * @aead_blocks: AEAD usage blocks consumed by this packet
+ *
+ * RX AEAD accounting is only informational for the local userspace process.
+ * The peer's packets that already passed authentication and replay checks are
+ * not dropped because the peer crossed a local usage threshold.
+ *
+ * Return: true if userspace should be notified, false otherwise.
+ */
+static inline bool
+ovpn_pktid_recv_update_aead(struct ovpn_pktid_recv *pr,
+			    struct ovpn_key_usage *usage,
+			    const struct ovpn_limit *limit,
+			    u64 aead_blocks)
+{
+	bool ret;
+
+	spin_lock_bh(&pr->lock);
+	ret = ovpn_key_usage_recv(usage, limit, pr->id, aead_blocks);
+	spin_unlock_bh(&pr->lock);
 
 	return ret;
 }

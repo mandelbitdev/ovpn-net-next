@@ -10,6 +10,7 @@
 #ifndef _NET_OVPN_OVPNCRYPTO_H_
 #define _NET_OVPN_OVPNCRYPTO_H_
 
+#include "crypto_limits.h"
 #include "pktid.h"
 #include "proto.h"
 
@@ -37,6 +38,8 @@ struct ovpn_peer_key_reset {
 
 struct ovpn_crypto_key_slot {
 	u8 key_id;
+	enum ovpn_cipher_alg cipher_alg;
+	struct ovpn_limit usage_limit;
 
 	struct crypto_aead *encrypt;
 	struct crypto_aead *decrypt;
@@ -44,7 +47,9 @@ struct ovpn_crypto_key_slot {
 	u8 nonce_tail_recv[OVPN_NONCE_TAIL_SIZE];
 
 	struct ovpn_pktid_recv pid_recv ____cacheline_aligned_in_smp;
+	struct ovpn_key_usage usage_recv;
 	struct ovpn_pktid_xmit pid_xmit ____cacheline_aligned_in_smp;
+	struct ovpn_key_usage usage_xmit;
 	struct kref refcount;
 	struct rcu_head rcu;
 };
