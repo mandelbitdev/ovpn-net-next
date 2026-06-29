@@ -18,6 +18,7 @@
 #include <uapi/linux/if_arp.h>
 
 #include "ovpnpriv.h"
+#include "crypto.h"
 #include "main.h"
 #include "netlink.h"
 #include "io.h"
@@ -233,11 +234,18 @@ static struct rtnl_link_ops ovpn_link_ops = {
 
 static int __init ovpn_init(void)
 {
-	int err = rtnl_link_register(&ovpn_link_ops);
+	int err;
 
+	err = ovpn_crypto_workqueue_init();
+	if (err) {
+		pr_err("ovpn: can't allocate workqueue: %d\n", err);
+		return err;
+	}
+
+	err = rtnl_link_register(&ovpn_link_ops);
 	if (err) {
 		pr_err("ovpn: can't register rtnl link ops: %d\n", err);
-		return err;
+		goto destroy_wq;
 	}
 
 	err = ovpn_nl_register();
@@ -252,6 +260,8 @@ static int __init ovpn_init(void)
 
 unreg_rtnl:
 	rtnl_link_unregister(&ovpn_link_ops);
+destroy_wq:
+	ovpn_crypto_workqueue_destroy();
 	return err;
 }
 
@@ -259,6 +269,7 @@ static __exit void ovpn_cleanup(void)
 {
 	ovpn_nl_unregister();
 	rtnl_link_unregister(&ovpn_link_ops);
+	ovpn_crypto_workqueue_destroy();
 
 	rcu_barrier();
 }
