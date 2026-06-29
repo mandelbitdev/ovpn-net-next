@@ -128,14 +128,16 @@ ovpn_pktid_recv_update_aead(struct ovpn_pktid_recv *pr,
 	return ret;
 }
 
-/* Write 12-byte AEAD IV to dest */
+/* write the direct-key AEAD IV to dest */
 static inline void ovpn_pktid_aead_write(const u32 pktid,
-					 const u8 nt[],
+					 const u8 implicit_iv[],
 					 unsigned char *dest)
 {
 	*(__force __be32 *)(dest) = htonl(pktid);
-	BUILD_BUG_ON(4 + OVPN_NONCE_TAIL_SIZE != OVPN_NONCE_SIZE);
-	memcpy(dest + 4, nt, OVPN_NONCE_TAIL_SIZE);
+	BUILD_BUG_ON(OVPN_NONCE_WIRE_SIZE + OVPN_NONCE_TAIL_SIZE !=
+		     OVPN_NONCE_SIZE);
+	memcpy(dest + OVPN_NONCE_WIRE_SIZE,
+	       implicit_iv + OVPN_NONCE_WIRE_SIZE, OVPN_NONCE_TAIL_SIZE);
 }
 
 void ovpn_pktid_xmit_init(struct ovpn_pktid_xmit *pid);
