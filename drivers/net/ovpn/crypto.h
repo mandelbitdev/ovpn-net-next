@@ -10,6 +10,7 @@
 #ifndef _NET_OVPN_OVPNCRYPTO_H_
 #define _NET_OVPN_OVPNCRYPTO_H_
 
+#include <linux/bitops.h>
 #include <linux/kref.h>
 #include <linux/rcupdate.h>
 #include <linux/workqueue_types.h>
@@ -57,6 +58,8 @@ struct ovpn_peer_key_reset {
 	struct ovpn_key_config key;
 };
 
+#define OVPN_CRYPTO_TX_ROTATE_PENDING 0
+
 /* state for one concrete AEAD key direction */
 struct ovpn_key_ctx {
 	u16 epoch;
@@ -83,6 +86,7 @@ struct ovpn_crypto_key_slot {
 	unsigned int pktid_size;
 	unsigned int payload_offset;
 	unsigned int tail_tag_size;
+	unsigned long flags;
 
 	struct ovpn_epoch_key epoch_key_send;
 	struct ovpn_epoch_key epoch_key_recv;

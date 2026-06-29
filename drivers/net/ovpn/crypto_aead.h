@@ -15,6 +15,9 @@
 #include <asm/types.h>
 #include <linux/skbuff.h>
 
+int ovpn_advance_encrypt_key(struct ovpn_crypto_key_slot *ks, u16 target_epoch,
+			     bool required);
+
 int ovpn_aead_encrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 		      struct sk_buff *skb);
 int ovpn_aead_decrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,

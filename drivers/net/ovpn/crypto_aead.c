@@ -142,17 +142,170 @@ static struct scatterlist *ovpn_aead_crypto_req_sg(struct crypto_aead *aead,
 			     __alignof__(struct scatterlist));
 }
 
+/**
+ * ovpn_advance_encrypt_key - promote TX to a target epoch
+ * @ks: key slot containing TX epoch state
+ * @target_epoch: epoch to promote TX to
+ * @required: whether the caller must stop if promotion cannot complete
+ *
+ * TX promotion consumes prederived future keys up to @target_epoch. If another
+ * context is already updating TX state or refill has not caught up, optional
+ * promotions keep using the current key while required promotions fail in the
+ * caller.
+ *
+ * Return: 0 on success, -EINPROGRESS if the TX lock is busy, -EALREADY if TX
+ * is already at or beyond @target_epoch, -ENOKEY if the future ring cannot
+ * provide @target_epoch, or another negative error code otherwise.
+ */
+int ovpn_advance_encrypt_key(struct ovpn_crypto_key_slot *ks, u16 target_epoch,
+			     bool required)
+{
+	u16 stale_count = 0, advance, count, index, stale_index, i;
+	struct ovpn_key_ctx *stale[OVPN_EPOCH_FUTURE_KEYS_COUNT];
+	struct ovpn_key_ctx *old_encrypt, *new_encrypt, *future;
+	struct ovpn_key_ctx __rcu **slot;
+	bool lock_held;
+
+	/* concurrent promotion or refill means another context is moving tx */
+	if (unlikely(!spin_trylock_bh(&ks->tx_lock)))
+		return -EINPROGRESS;
+
+	lock_held = lockdep_is_held(&ks->tx_lock);
+	old_encrypt = rcu_dereference_protected(ks->encrypt,
+						lock_held);
+	if (unlikely(old_encrypt->epoch >= target_epoch)) {
+		spin_unlock_bh(&ks->tx_lock);
+		return -EALREADY;
+	}
+
+	count = ovpn_epoch_future_keys_count(&ks->future_tx_keys);
+	advance = target_epoch - old_encrypt->epoch;
+	/* refill can lag behind packet processing under pressure */
+	if (unlikely(count < advance)) {
+		spin_unlock_bh(&ks->tx_lock);
+		ovpn_schedule_refill(ks, true);
+		return -ENOKEY;
+	}
+
+	index = (ks->future_tx_keys.tail + advance - 1) %
+		OVPN_EPOCH_FUTURE_KEYS_COUNT;
+	new_encrypt = rcu_dereference_protected(ks->future_tx_keys.keys[index],
+						lock_held);
+	if (WARN_ON_ONCE(!new_encrypt ||
+			 new_encrypt->epoch != target_epoch)) {
+		spin_unlock_bh(&ks->tx_lock);
+		return -ENOKEY;
+	}
+
+	for (i = 0; i < advance; i++) {
+		/* drop skipped future keys when advancing past them */
+		stale_index = (ks->future_tx_keys.tail + i) %
+			      OVPN_EPOCH_FUTURE_KEYS_COUNT;
+		slot = &ks->future_tx_keys.keys[stale_index];
+		future = rcu_dereference_protected(*slot, lock_held);
+		if (future != new_encrypt)
+			stale[stale_count++] = future;
+		RCU_INIT_POINTER(*slot, NULL);
+	}
+
+	/* each concrete key carries fresh packet-ID state */
+	rcu_assign_pointer(ks->encrypt, new_encrypt);
+	ks->future_tx_keys.tail = (ks->future_tx_keys.tail + advance) %
+				  OVPN_EPOCH_FUTURE_KEYS_COUNT;
+	ks->future_tx_keys.full = false;
+	spin_unlock_bh(&ks->tx_lock);
+
+	ovpn_key_ctx_put(old_encrypt);
+	for (i = 0; i < stale_count; i++)
+		ovpn_key_ctx_put(stale[i]);
+
+	ovpn_schedule_refill(ks, true);
+
+	return 0;
+}
+
+static int ovpn_aead_encrypt_next_seq(struct ovpn_peer *peer,
+				      struct ovpn_crypto_key_slot *ks,
+				      struct ovpn_key_ctx *encrypt,
+				      unsigned int pkt_len, u64 *seq)
+{
+	bool required = false, pktid_notify;
+	u64 aead_blocks;
+	int ret;
+
+	/* hard packet-ID exhaustion requires fresh key material */
+	ret = ovpn_pktid_xmit_next(&encrypt->pid.xmit, seq);
+	if (unlikely(ret < 0)) {
+		if (!ks->epoch_format)
+			return ret;
+		required = true;
+		goto new_key;
+	}
+	pktid_notify = ret > 0;
+
+	aead_blocks = ovpn_aead_limit_blocks(ks->cipher_alg, ks->aad_size,
+					     pkt_len);
+	ret = ovpn_key_usage_xmit(&encrypt->usage, &ks->usage_limit, *seq,
+				  aead_blocks, pktid_notify);
+	if (unlikely(ret < 0)) {
+		/* epoch keys rotate internally instead of asking userspace */
+		if (!ks->epoch_format)
+			return ret;
+		required = true;
+		goto new_key;
+	}
+	if (unlikely(ret > 0)) {
+		if (!ks->epoch_format) {
+			ovpn_nl_key_swap_notify(peer, ks->key_id);
+			return 0;
+		}
+		/* epoch tx rotates locally when the soft limit is crossed */
+		set_bit(OVPN_CRYPTO_TX_ROTATE_PENDING, &ks->flags);
+	}
+
+	if (!ks->epoch_format)
+		return 0;
+
+	/* rx can request a tx epoch bump without adding rx work to every
+	 * tx packet
+	 */
+	if (unlikely(test_bit(OVPN_CRYPTO_TX_ROTATE_PENDING, &ks->flags)))
+		goto new_key;
+
+	return 0;
+
+new_key:
+	/* keep enough epoch space for the future-key ring after promotion */
+	if (unlikely(encrypt->epoch + 1 + OVPN_EPOCH_FUTURE_KEYS_COUNT >=
+		     OVPN_MAX_EPOCH))
+		return -ERANGE;
+
+	ret = ovpn_advance_encrypt_key(ks, encrypt->epoch + 1, required);
+	if (unlikely(ret == -EINPROGRESS || ret == -ENOKEY))
+		return required ? -EBUSY : 0;
+	if (unlikely(ret < 0 && ret != -EALREADY))
+		return ret;
+
+	/* A concurrent soft-limit request can theoretically be lost here,
+	 * but it would require the new tx epoch to consume its soft limit
+	 * before this CPU clears the bit. Hard limits still force rotation.
+	 */
+	clear_bit(OVPN_CRYPTO_TX_ROTATE_PENDING, &ks->flags);
+
+	return -EAGAIN;
+}
+
 int ovpn_aead_encrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 		      struct sk_buff *skb)
 {
 	unsigned int plaintext_len, payload_sg_len, sg_nents, tag_size;
 	struct ovpn_key_ctx *key = NULL;
-	u64 aead_blocks, pktid, seq;
 	struct aead_request *req;
 	struct sk_buff *trailer;
 	struct scatterlist *sg;
-	bool pktid_notify;
+	bool retried = false;
 	int nfrags, ret;
+	u64 pktid, seq;
 	void *tmp;
 	u32 op;
 	u8 *iv;
@@ -173,6 +326,7 @@ int ovpn_aead_encrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 	 *          [        8-byte packet ID          ]
 	 */
 
+retry:
 	ret = ovpn_key_ctx_get(&key, &ks->encrypt);
 	if (unlikely(ret))
 		return ret;
@@ -180,19 +334,20 @@ int ovpn_aead_encrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 
 	tag_size = crypto_aead_authsize(key->tfm);
 
-	ret = ovpn_pktid_xmit_next(&key->pid.xmit, &seq);
-	if (unlikely(ret < 0))
-		return ret;
-	pktid_notify = ret > 0;
+	ret = ovpn_aead_encrypt_next_seq(peer, ks, key, plaintext_len, &seq);
+	if (unlikely(ret == -EAGAIN)) {
+		if (retried)
+			return -EBUSY;
 
-	aead_blocks = ovpn_aead_limit_blocks(ks->cipher_alg, ks->aad_size,
-					     plaintext_len);
-	ret = ovpn_key_usage_xmit(&key->usage, &ks->usage_limit, seq,
-				  aead_blocks, pktid_notify);
+		/* retry once after epoch promotion */
+		ovpn_skb_cb(skb)->key = NULL;
+		ovpn_key_ctx_put(key);
+		key = NULL;
+		retried = true;
+		goto retry;
+	}
 	if (unlikely(ret < 0))
 		return ret;
-	if (unlikely(ret > 0 && !ks->epoch_format))
-		ovpn_nl_key_swap_notify(peer, ks->key_id);
 
 	/* check that there's enough headroom in the skb for packet
 	 * encapsulation

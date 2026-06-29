@@ -121,6 +121,7 @@ static inline int ovpn_pktid_xmit_next(struct ovpn_pktid_xmit *pid, u64 *pktid)
  * @usage: key usage state
  * @limit: key usage limits
  * @aead_blocks: AEAD usage blocks consumed by this packet
+ * @hard_exceeded: set to true if RX has crossed the hard usage limit
  *
  * RX AEAD accounting is only informational for the local userspace process.
  * The peer's packets that already passed authentication and replay checks are
@@ -132,12 +133,15 @@ static inline bool
 ovpn_pktid_recv_update_aead(struct ovpn_pktid_recv *pr,
 			    struct ovpn_key_usage *usage,
 			    const struct ovpn_limit *limit,
-			    u64 aead_blocks)
+			    u64 aead_blocks, bool *hard_exceeded)
 {
 	bool ret;
 
 	spin_lock_bh(&pr->lock);
 	ret = ovpn_key_usage_recv(usage, limit, pr->id, aead_blocks);
+	*hard_exceeded =
+		ovpn_key_usage_over_limit(limit->hard, pr->id,
+					  atomic64_read(&usage->blocks));
 	spin_unlock_bh(&pr->lock);
 
 	return ret;
