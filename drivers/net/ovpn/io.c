@@ -337,9 +337,10 @@ void ovpn_decrypt_post(void *data, int ret)
 	struct ovpn_cb *cb;
 
 	/* crypto is happening asynchronously. this function will be called
-	 * again later by the crypto callback with a proper return code
+	 * again later by the crypto callback with a proper return code.
+	 * With MAY_BACKLOG, -EBUSY is also a queued/pending outcome.
 	 */
-	if (unlikely(ret == -EINPROGRESS))
+	if (unlikely(ret == -EINPROGRESS || ret == -EBUSY))
 		return;
 
 	/* crypto is done, cleanup skb CB and its members */
@@ -515,9 +516,10 @@ void ovpn_encrypt_post(void *data, int ret)
 	cb = ovpn_skb_cb(skb);
 
 	/* encryption is happening asynchronously. This function will be
-	 * called later by the crypto callback with a proper return value
+	 * called later by the crypto callback with a proper return value.
+	 * With MAY_BACKLOG, -EBUSY is also a queued/pending outcome.
 	 */
-	if (unlikely(ret == -EINPROGRESS))
+	if (unlikely(ret == -EINPROGRESS || ret == -EBUSY))
 		return;
 
 	ks = cb->ks;

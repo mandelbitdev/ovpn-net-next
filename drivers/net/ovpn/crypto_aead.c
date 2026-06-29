@@ -226,7 +226,8 @@ int ovpn_aead_encrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 
 	/* setup async crypto operation */
 	aead_request_set_tfm(req, ks->encrypt);
-	aead_request_set_callback(req, 0, ovpn_encrypt_post, skb);
+	aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
+				  ovpn_encrypt_post, skb);
 	aead_request_set_crypt(req, sg, sg,
 			       skb->len - ovpn_aead_encap_overhead(ks), iv);
 	aead_request_set_ad(req, OVPN_AAD_SIZE);
@@ -313,7 +314,8 @@ int ovpn_aead_decrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 
 	/* setup async crypto operation */
 	aead_request_set_tfm(req, ks->decrypt);
-	aead_request_set_callback(req, 0, ovpn_decrypt_post, skb);
+	aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
+				  ovpn_decrypt_post, skb);
 	aead_request_set_crypt(req, sg, sg, payload_len + tag_size, iv);
 
 	aead_request_set_ad(req, OVPN_AAD_SIZE);
