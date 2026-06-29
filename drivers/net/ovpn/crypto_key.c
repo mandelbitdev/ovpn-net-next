@@ -447,6 +447,7 @@ struct ovpn_crypto_key_slot *
 ovpn_crypto_key_slot_new(const struct ovpn_key_config *kc)
 {
 	struct ovpn_crypto_key_slot *ks = NULL;
+	unsigned int direct_payload_offset;
 	struct ovpn_key_ctx *key;
 	const char *alg_name;
 	int ret;
@@ -480,6 +481,9 @@ ovpn_crypto_key_slot_new(const struct ovpn_key_config *kc)
 	if (!ks)
 		return ERR_PTR(-ENOMEM);
 
+	direct_payload_offset =
+		ovpn_aead_direct_payload_offset(OVPN_AEAD_TAG_SIZE);
+
 	ks->encrypt = NULL;
 	ks->decrypt = NULL;
 	kref_init(&ks->refcount);
@@ -491,6 +495,10 @@ ovpn_crypto_key_slot_new(const struct ovpn_key_config *kc)
 					     OVPN_AEAD_DIRECT_AAD_SIZE;
 	ks->pktid_size = kc->use_epoch_keys ? OVPN_EPOCH_NONCE_WIRE_SIZE :
 					       OVPN_NONCE_WIRE_SIZE;
+	ks->payload_offset = kc->use_epoch_keys ?
+			     OVPN_AEAD_EPOCH_AAD_SIZE :
+			     direct_payload_offset;
+	ks->tail_tag_size = kc->use_epoch_keys ? OVPN_AEAD_TAG_SIZE : 0;
 	ovpn_key_usage_limit_init(&ks->usage_limit, kc->cipher_alg);
 
 	if (kc->use_epoch_keys) {

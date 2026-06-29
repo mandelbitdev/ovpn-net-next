@@ -114,6 +114,7 @@ void ovpn_decrypt_post(void *data, int ret)
 	struct ovpn_key_ctx *key;
 	u64 aead_blocks, pktid;
 	struct ovpn_peer *peer;
+	int payload_len;
 	u16 pkt_epoch;
 	__be16 proto;
 
@@ -132,7 +133,8 @@ void ovpn_decrypt_post(void *data, int ret)
 	kfree(ovpn_skb_cb(skb)->crypto_tmp);
 
 	if (unlikely(ret == -EBADMSG)) {
-		if (key && unlikely(ovpn_aead_decrypt_failure_record(key)))
+		if (key && unlikely(ovpn_aead_decrypt_failure_record(key)) &&
+		    likely(!ks->epoch_format))
 			ovpn_nl_key_swap_notify(peer, ks->key_id);
 		goto drop;
 	}
@@ -140,8 +142,8 @@ void ovpn_decrypt_post(void *data, int ret)
 	if (unlikely(ret < 0))
 		goto drop;
 
-	pktid = ovpn_pktid_read(skb->data + OVPN_OPCODE_SIZE, false,
-				&pkt_epoch);
+	pktid = ovpn_pktid_read(skb->data + OVPN_OPCODE_SIZE,
+				ks->epoch_format, &pkt_epoch);
 	ret = ovpn_pktid_recv(&key->pid.recv, pktid, 0);
 	if (unlikely(ret < 0)) {
 		net_err_ratelimited("%s: PKT ID RX error for peer %u: %d\n",
@@ -150,12 +152,28 @@ void ovpn_decrypt_post(void *data, int ret)
 		goto drop;
 	}
 
+	if (unlikely(skb->len < payload_offset))
+		goto drop;
+	payload_len = skb->len - payload_offset;
+	if (unlikely(ks->tail_tag_size)) {
+		if (unlikely(payload_len < ks->tail_tag_size))
+			goto drop;
+		payload_len -= ks->tail_tag_size;
+	}
+	if (unlikely(payload_len < 0))
+		goto drop;
+
 	aead_blocks = ovpn_aead_limit_blocks(ks->cipher_alg, ks->aad_size,
-					     skb->len - payload_offset);
+					     payload_len);
 	if (unlikely(ovpn_pktid_recv_update_aead(&key->pid.recv, &key->usage,
 						 &ks->usage_limit,
-						 aead_blocks)))
+						 aead_blocks) &&
+		     !ks->epoch_format))
 		ovpn_nl_key_swap_notify(peer, ks->key_id);
+
+	if (unlikely(ks->tail_tag_size &&
+		     pskb_trim(skb, skb->len - ks->tail_tag_size)))
+		goto drop;
 
 	/* keep track of last received authenticated packet for keepalive */
 	WRITE_ONCE(peer->last_recv, ktime_get_real_seconds());
