@@ -19,6 +19,7 @@
 #include "pktid.h"
 #include "crypto_aead.h"
 #include "crypto.h"
+#include "netlink.h"
 #include "peer.h"
 #include "proto.h"
 #include "skb.h"
@@ -207,6 +208,8 @@ int ovpn_aead_encrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 	ret = ovpn_pktid_xmit_next(&ks->pid_xmit, &pktid);
 	if (unlikely(ret < 0))
 		return ret;
+	if (unlikely(ret > 0))
+		ovpn_nl_key_swap_notify(peer, ks->key_id);
 
 	/* concat 4 bytes packet id and 8 bytes nonce tail into 12 bytes
 	 * nonce
