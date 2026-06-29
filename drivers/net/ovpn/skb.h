@@ -22,6 +22,7 @@
  * struct ovpn_cb - ovpn skb control block
  * @peer: the peer this skb was received from/sent to
  * @ks: the crypto key slot used to encrypt/decrypt this skb
+ * @key: the key context used to encrypt/decrypt this skb
  * @crypto_tmp: pointer to temporary memory used for crypto operations
  *		containing the IV, the scatter gather list and the aead request
  * @payload_offset: offset in the skb where the payload starts
@@ -30,6 +31,7 @@
 struct ovpn_cb {
 	struct ovpn_peer *peer;
 	struct ovpn_crypto_key_slot *ks;
+	struct ovpn_key_ctx *key;
 	void *crypto_tmp;
 	unsigned int payload_offset;
 	bool nosignal;
