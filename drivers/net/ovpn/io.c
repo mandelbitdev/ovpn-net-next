@@ -111,6 +111,7 @@ void ovpn_decrypt_post(void *data, int ret)
 	unsigned int payload_offset = 0;
 	struct sk_buff *skb = data;
 	struct ovpn_socket *sock;
+	struct ovpn_key_ctx *key;
 	struct ovpn_peer *peer;
 	u64 aead_blocks;
 	__be16 proto;
@@ -124,13 +125,14 @@ void ovpn_decrypt_post(void *data, int ret)
 
 	payload_offset = ovpn_skb_cb(skb)->payload_offset;
 	ks = ovpn_skb_cb(skb)->ks;
+	key = ks->decrypt;
 	peer = ovpn_skb_cb(skb)->peer;
 
 	/* crypto is done, cleanup skb CB and its members */
 	kfree(ovpn_skb_cb(skb)->crypto_tmp);
 
 	if (unlikely(ret == -EBADMSG)) {
-		if (unlikely(ovpn_aead_decrypt_failure_record(ks)))
+		if (unlikely(ovpn_aead_decrypt_failure_record(key)))
 			ovpn_nl_key_swap_notify(peer, ks->key_id);
 		goto drop;
 	}
@@ -139,7 +141,7 @@ void ovpn_decrypt_post(void *data, int ret)
 		goto drop;
 
 	pktid = ovpn_aead_direct_pktid(skb);
-	ret = ovpn_pktid_recv(&ks->pid_recv, pktid, 0);
+	ret = ovpn_pktid_recv(&key->pid.recv, pktid, 0);
 	if (unlikely(ret < 0)) {
 		net_err_ratelimited("%s: PKT ID RX error for peer %u: %d\n",
 				    netdev_name(peer->ovpn->dev), peer->id,
@@ -150,8 +152,7 @@ void ovpn_decrypt_post(void *data, int ret)
 	aead_blocks = ovpn_aead_limit_blocks(ks->cipher_alg,
 					     OVPN_AEAD_DIRECT_AAD_SIZE,
 					     skb->len - payload_offset);
-	if (unlikely(ovpn_pktid_recv_update_aead(&ks->pid_recv,
-						 &ks->usage_recv,
+	if (unlikely(ovpn_pktid_recv_update_aead(&key->pid.recv, &key->usage,
 						 &ks->usage_limit,
 						 aead_blocks)))
 		ovpn_nl_key_swap_notify(peer, ks->key_id);

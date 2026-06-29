@@ -71,13 +71,65 @@ error:
 	return ERR_PTR(ret);
 }
 
+static void ovpn_key_ctx_free(struct ovpn_key_ctx *key)
+{
+	if (!key)
+		return;
+
+	if (key->tfm)
+		crypto_free_aead(key->tfm);
+	memzero_explicit(key->implicit_iv, sizeof(key->implicit_iv));
+	kfree(key);
+}
+
+static struct ovpn_key_ctx *
+ovpn_key_ctx_new(const char *title, const char *alg_name,
+		 const struct ovpn_key_direction *dir, bool encrypt)
+{
+	struct ovpn_key_ctx *key;
+	size_t tail_offset;
+	int ret;
+
+	key = kmalloc_obj(*key);
+	if (!key)
+		return ERR_PTR(-ENOMEM);
+
+	/* create the concrete AEAD transform first */
+	key->tfm = ovpn_aead_init(title, alg_name, dir->cipher_key,
+				  dir->cipher_key_size);
+	if (IS_ERR(key->tfm)) {
+		ret = PTR_ERR(key->tfm);
+		key->tfm = NULL;
+		ovpn_key_ctx_free(key);
+		return ERR_PTR(ret);
+	}
+
+	/* store the implicit IV in a full nonce-sized buffer */
+	tail_offset = OVPN_NONCE_SIZE - dir->nonce_tail_size;
+	memset(key->implicit_iv, 0, sizeof(key->implicit_iv));
+	memcpy(key->implicit_iv + tail_offset, dir->nonce_tail,
+	       dir->nonce_tail_size);
+
+	ovpn_key_usage_init(&key->usage);
+	atomic64_set(&key->decrypt_failures, 0);
+	key->decrypt_failure_flags = 0;
+
+	/* initialize only the packet ID direction this context owns */
+	if (encrypt)
+		ovpn_pktid_xmit_init(&key->pid.xmit);
+	else
+		ovpn_pktid_recv_init(&key->pid.recv);
+
+	return key;
+}
+
 void ovpn_crypto_key_slot_destroy(struct ovpn_crypto_key_slot *ks)
 {
 	if (!ks)
 		return;
 
-	crypto_free_aead(ks->encrypt);
-	crypto_free_aead(ks->decrypt);
+	ovpn_key_ctx_free(ks->encrypt);
+	ovpn_key_ctx_free(ks->decrypt);
 	kfree(ks);
 }
 
@@ -115,37 +167,22 @@ ovpn_crypto_key_slot_new(const struct ovpn_key_config *kc)
 	ks->key_id = kc->key_id;
 	ks->cipher_alg = kc->cipher_alg;
 	ovpn_key_usage_limit_init(&ks->usage_limit, kc->cipher_alg);
-	ovpn_key_usage_init(&ks->usage_xmit);
-	ovpn_key_usage_init(&ks->usage_recv);
-	atomic64_set(&ks->decrypt_failures, 0);
-	ks->decrypt_failure_flags = 0;
 
-	ks->encrypt = ovpn_aead_init("encrypt", alg_name,
-				     kc->encrypt.cipher_key,
-				     kc->encrypt.cipher_key_size);
+	ks->encrypt = ovpn_key_ctx_new("encrypt", alg_name, &kc->encrypt,
+				       true);
 	if (IS_ERR(ks->encrypt)) {
 		ret = PTR_ERR(ks->encrypt);
 		ks->encrypt = NULL;
 		goto destroy_ks;
 	}
 
-	ks->decrypt = ovpn_aead_init("decrypt", alg_name,
-				     kc->decrypt.cipher_key,
-				     kc->decrypt.cipher_key_size);
+	ks->decrypt = ovpn_key_ctx_new("decrypt", alg_name, &kc->decrypt,
+				       false);
 	if (IS_ERR(ks->decrypt)) {
 		ret = PTR_ERR(ks->decrypt);
 		ks->decrypt = NULL;
 		goto destroy_ks;
 	}
-
-	memcpy(ks->nonce_tail_xmit, kc->encrypt.nonce_tail,
-	       OVPN_NONCE_TAIL_SIZE);
-	memcpy(ks->nonce_tail_recv, kc->decrypt.nonce_tail,
-	       OVPN_NONCE_TAIL_SIZE);
-
-	/* init packet ID generation/validation */
-	ovpn_pktid_xmit_init(&ks->pid_xmit);
-	ovpn_pktid_recv_init(&ks->pid_recv);
 
 	return ks;
 
@@ -158,10 +195,10 @@ enum ovpn_cipher_alg ovpn_crypto_key_slot_alg(struct ovpn_crypto_key_slot *ks)
 {
 	const char *alg_name;
 
-	if (!ks->encrypt)
+	if (!ks->encrypt || !ks->encrypt->tfm)
 		return OVPN_CIPHER_ALG_NONE;
 
-	alg_name = crypto_tfm_alg_name(crypto_aead_tfm(ks->encrypt));
+	alg_name = crypto_tfm_alg_name(crypto_aead_tfm(ks->encrypt->tfm));
 
 	if (!strcmp(alg_name, ALG_NAME_AES))
 		return OVPN_CIPHER_ALG_AES_GCM;

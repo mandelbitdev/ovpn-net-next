@@ -22,7 +22,7 @@ struct ovpn_key_direction {
 	size_t nonce_tail_size; /* only needed for GCM modes */
 };
 
-/* all info for a particular symmetric key (primary or secondary) */
+/* direct-key material for a primary or secondary slot */
 struct ovpn_key_config {
 	enum ovpn_cipher_alg cipher_alg;
 	u8 key_id;
@@ -36,22 +36,26 @@ struct ovpn_peer_key_reset {
 	struct ovpn_key_config key;
 };
 
+/* state for one concrete AEAD key direction */
+struct ovpn_key_ctx {
+	struct crypto_aead *tfm;
+	u8 implicit_iv[OVPN_NONCE_SIZE];
+	union {
+		struct ovpn_pktid_recv recv;
+		struct ovpn_pktid_xmit xmit;
+	} pid ____cacheline_aligned_in_smp;
+	struct ovpn_key_usage usage;
+	atomic64_t decrypt_failures;
+	unsigned long decrypt_failure_flags;
+};
+
 struct ovpn_crypto_key_slot {
 	u8 key_id;
 	enum ovpn_cipher_alg cipher_alg;
 	struct ovpn_limit usage_limit;
 
-	struct crypto_aead *encrypt;
-	struct crypto_aead *decrypt;
-	atomic64_t decrypt_failures;
-	unsigned long decrypt_failure_flags;
-	u8 nonce_tail_xmit[OVPN_NONCE_TAIL_SIZE];
-	u8 nonce_tail_recv[OVPN_NONCE_TAIL_SIZE];
-
-	struct ovpn_pktid_recv pid_recv ____cacheline_aligned_in_smp;
-	struct ovpn_key_usage usage_recv;
-	struct ovpn_pktid_xmit pid_xmit ____cacheline_aligned_in_smp;
-	struct ovpn_key_usage usage_xmit;
+	struct ovpn_key_ctx *encrypt;
+	struct ovpn_key_ctx *decrypt;
 	struct kref refcount;
 	struct rcu_head rcu;
 };
