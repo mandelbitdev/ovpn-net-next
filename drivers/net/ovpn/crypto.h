@@ -43,6 +43,8 @@ struct ovpn_crypto_key_slot {
 
 	struct crypto_aead *encrypt;
 	struct crypto_aead *decrypt;
+	atomic64_t decrypt_failures;
+	unsigned long decrypt_failure_flags;
 	u8 nonce_tail_xmit[OVPN_NONCE_TAIL_SIZE];
 	u8 nonce_tail_recv[OVPN_NONCE_TAIL_SIZE];
 

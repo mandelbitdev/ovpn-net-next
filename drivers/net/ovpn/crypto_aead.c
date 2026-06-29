@@ -29,6 +29,25 @@
 
 #define ALG_NAME_AES		"gcm(aes)"
 #define ALG_NAME_CHACHAPOLY	"rfc7539(chacha20,poly1305)"
+#define OVPN_AEAD_DECRYPT_FAILURE_NOTIFY	BIT_ULL(35)
+#define OVPN_AEAD_DECRYPT_FAILURE_LIMIT		BIT_ULL(36)
+#define OVPN_AEAD_DECRYPT_FAILURE_NOTIFY_BIT	0
+
+static bool
+ovpn_aead_decrypt_failure_exceeded(const struct ovpn_crypto_key_slot *ks)
+{
+	return atomic64_read(&ks->decrypt_failures) >
+	       OVPN_AEAD_DECRYPT_FAILURE_LIMIT;
+}
+
+bool ovpn_aead_decrypt_failure_record(struct ovpn_crypto_key_slot *ks)
+{
+	u64 failures = atomic64_inc_return(&ks->decrypt_failures);
+
+	return failures > OVPN_AEAD_DECRYPT_FAILURE_NOTIFY &&
+	       !test_and_set_bit(OVPN_AEAD_DECRYPT_FAILURE_NOTIFY_BIT,
+				 &ks->decrypt_failure_flags);
+}
 
 static int ovpn_aead_encap_overhead(const struct ovpn_crypto_key_slot *ks)
 {
@@ -270,6 +289,9 @@ int ovpn_aead_decrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 	if (unlikely(payload_len < 0))
 		return -EINVAL;
 
+	if (unlikely(ovpn_aead_decrypt_failure_exceeded(ks)))
+		return -EKEYREJECTED;
+
 	/* Prepare the skb data buffer to be accessed up until the auth tag.
 	 * This is required because this area is directly mapped into the sg
 	 * list.
@@ -436,6 +458,8 @@ ovpn_aead_crypto_key_slot_new(const struct ovpn_key_config *kc)
 	ovpn_key_usage_limit_init(&ks->usage_limit, kc->cipher_alg);
 	ovpn_key_usage_init(&ks->usage_xmit);
 	ovpn_key_usage_init(&ks->usage_recv);
+	atomic64_set(&ks->decrypt_failures, 0);
+	ks->decrypt_failure_flags = 0;
 
 	ks->encrypt = ovpn_aead_init("encrypt", alg_name,
 				     kc->encrypt.cipher_key,
