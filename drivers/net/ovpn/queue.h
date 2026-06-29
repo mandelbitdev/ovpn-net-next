@@ -33,6 +33,11 @@ struct ovpn_ordered_queue {
 void ovpn_ordered_queue_init(struct ovpn_ordered_queue *queue);
 bool ovpn_ordered_queue_enqueue(struct ovpn_ordered_queue *queue,
 				struct sk_buff *skb, unsigned int max_len);
+static inline bool
+ovpn_ordered_queue_empty(const struct ovpn_ordered_queue *queue)
+{
+	return !READ_ONCE(queue->peeked) && !atomic_read(&queue->count);
+}
 struct sk_buff *ovpn_ordered_queue_dequeue(struct ovpn_ordered_queue *queue);
 struct sk_buff *ovpn_ordered_queue_peek(struct ovpn_ordered_queue *queue);
 void ovpn_ordered_queue_drop_peeked(struct ovpn_ordered_queue *queue);

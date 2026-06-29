@@ -137,7 +137,7 @@ static void ovpn_tcp_rcv(struct strparser *strp, struct sk_buff *skb)
 		return;
 	}
 
-	/* hold reference to peer as required by ovpn_recv().
+	/* hold reference to peer as required by ovpn_recv_defer().
 	 *
 	 * NOTE: in this context we should already be holding a reference to
 	 * this peer, therefore ovpn_peer_hold() is not expected to fail
@@ -145,7 +145,7 @@ static void ovpn_tcp_rcv(struct strparser *strp, struct sk_buff *skb)
 	if (WARN_ON(!ovpn_peer_hold(peer)))
 		goto err_nopeer;
 
-	ovpn_recv(peer, skb);
+	ovpn_recv_defer(peer, skb);
 	return;
 err:
 	/* take reference for deferred peer deletion. should never fail */

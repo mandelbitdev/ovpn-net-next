@@ -10,10 +10,13 @@
 #ifndef _NET_OVPN_OVPNPEER_H_
 #define _NET_OVPN_OVPNPEER_H_
 
+#include <linux/netdevice.h>
+#include <linux/wait.h>
 #include <net/dst_cache.h>
 #include <net/strparser.h>
 
 #include "crypto.h"
+#include "queue.h"
 #include "socket.h"
 #include "stats.h"
 
@@ -56,9 +59,12 @@
  * @link_stats: per-peer link/transport TX/RX stats
  * @delete_reason: why peer was deleted (i.e. timeout, transport error, ..)
  * @lock: protects binding to peer (bind) and keepalive* fields
+ * @rx_wait: waitqueue used to wait for RX queue drain during peer removal
  * @refcount: reference counter
  * @rcu: used to free peer in an RCU safe way
  * @release_entry: entry for the socket release list
+ * @rx_queue: ordered packets waiting for RX completion
+ * @rx_napi: NAPI poll instance draining rx_queue once packets are decrypted
  * @keepalive_work: used to schedule keepalive sending
  */
 struct ovpn_peer {
@@ -110,9 +116,12 @@ struct ovpn_peer {
 	struct ovpn_peer_stats link_stats;
 	enum ovpn_del_peer_reason delete_reason;
 	spinlock_t lock; /* protects bind  and keepalive* */
+	wait_queue_head_t rx_wait;
 	struct kref refcount;
 	struct rcu_head rcu;
 	struct llist_node release_entry;
+	struct ovpn_ordered_queue rx_queue;
+	struct napi_struct rx_napi;
 	struct work_struct keepalive_work;
 };
 

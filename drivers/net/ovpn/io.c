@@ -8,9 +8,12 @@
  */
 
 #include <crypto/aead.h>
+#include <linux/cpu.h>
 #include <linux/netdevice.h>
+#include <linux/ratelimit.h>
+#include <linux/sched.h>
+#include <linux/slab.h>
 #include <linux/skbuff.h>
-#include <net/gro_cells.h>
 #include <net/gso.h>
 #include <net/ip.h>
 
@@ -22,15 +25,65 @@
 #include "crypto_aead.h"
 #include "netlink.h"
 #include "proto.h"
+#include "queue.h"
 #include "tcp.h"
 #include "udp.h"
 #include "skb.h"
 #include "socket.h"
 
+#define OVPN_RING_LEN 4096
+#define OVPN_QUEUE_LEN 4096
+
 const unsigned char ovpn_keepalive_message[OVPN_KEEPALIVE_SIZE] = {
 	0x2a, 0x18, 0x7b, 0xf3, 0x64, 0x1e, 0xb4, 0xcb,
 	0x07, 0xed, 0x2d, 0x0a, 0x98, 0x1f, 0xc7, 0x48
 };
+
+static void ovpn_pkt_state_set(struct sk_buff *skb,
+			       enum ovpn_pkt_state new_state)
+{
+	/* pairs with pkt_state acquire loads in ovpn_peer_rx_poll() */
+	smp_store_release(&ovpn_skb_cb(skb)->pkt_state, new_state);
+}
+
+static void ovpn_pkt_complete_and_schedule(struct sk_buff *skb,
+					   struct napi_struct *napi,
+					   enum ovpn_pkt_state new_state)
+{
+	bool schedule;
+
+	/* keep the split NAPI claim, state publish and NAPI queueing in
+	 * BH-disabled context because once the terminal state is visible, poll
+	 * may consume skb, so napi must already have been claimed
+	 */
+	local_bh_disable();
+	schedule = napi_schedule_prep(napi);
+	ovpn_pkt_state_set(skb, new_state);
+	if (schedule)
+		__napi_schedule(napi);
+	local_bh_enable();
+}
+
+static int ovpn_cpumask_next_online(int *last_cpu)
+{
+	int cpu = cpumask_next(READ_ONCE(*last_cpu), cpu_online_mask);
+
+	if (cpu >= nr_cpu_ids)
+		cpu = cpumask_first(cpu_online_mask);
+	WRITE_ONCE(*last_cpu, cpu);
+
+	return cpu;
+}
+
+static void ovpn_rx_worker_kick(struct ovpn_priv *ovpn)
+{
+	struct ovpn_rx_worker *worker;
+	int cpu;
+
+	cpu = ovpn_cpumask_next_online(&ovpn->rx_queue.last_cpu);
+	worker = per_cpu_ptr(ovpn->rx_queue.worker, cpu);
+	queue_work_on(cpu, ovpn->rx_wq, &worker->work);
+}
 
 /**
  * ovpn_is_keepalive - check if skb contains a keepalive message
@@ -57,10 +110,11 @@ static bool ovpn_is_keepalive(struct sk_buff *skb)
 /* Called after decrypt to write the IP packet to the device.
  * This method is expected to manage/free the skb.
  */
-static void ovpn_netdev_write(struct ovpn_peer *peer, struct sk_buff *skb)
+static void ovpn_netdev_write_napi(struct ovpn_peer *peer,
+				   struct napi_struct *napi,
+				   struct sk_buff *skb)
 {
 	unsigned int pkt_len;
-	int ret;
 
 	/*
 	 * GSO state from the transport layer is not valid for the tunnel/data
@@ -84,52 +138,32 @@ static void ovpn_netdev_write(struct ovpn_peer *peer, struct sk_buff *skb)
 	skb_set_queue_mapping(skb, 0);
 	skb_scrub_packet(skb, true);
 
-	/* network header reset in ovpn_decrypt_post() */
+	/* network header reset in ovpn_decrypt_finalize_napi() */
 	skb_reset_mac_header(skb);
 	skb_reset_transport_header(skb);
 	skb_reset_inner_headers(skb);
 
 	/* cause packet to be "received" by the interface */
 	pkt_len = skb->len;
-	/* we may get here in process context in case of TCP connections,
-	 * therefore we have to disable BHs to ensure gro_cells_receive()
-	 * and dev_dstats_rx_add() do not get corrupted or enter deadlock
+	/* caller runs from NAPI poll context, so GRO and device stats already
+	 * run with BH disabled
 	 */
-	local_bh_disable();
-	ret = gro_cells_receive(&peer->ovpn->gro_cells, skb);
-	if (likely(ret == NET_RX_SUCCESS)) {
-		/* update RX stats with the size of decrypted packet */
-		ovpn_peer_stats_increment_rx(&peer->vpn_stats, pkt_len);
-		dev_dstats_rx_add(peer->ovpn->dev, pkt_len);
-	}
-	local_bh_enable();
+	napi_gro_receive(napi, skb);
+	/* update RX stats with the size of decrypted packet */
+	ovpn_peer_stats_increment_rx(&peer->vpn_stats, pkt_len);
+	dev_dstats_rx_add(peer->ovpn->dev, pkt_len);
 }
 
-void ovpn_decrypt_post(void *data, int ret)
+static void ovpn_decrypt_finalize_napi(struct ovpn_peer *peer,
+				       struct napi_struct *napi,
+				       struct sk_buff *skb)
 {
-	struct ovpn_crypto_key_slot *ks;
-	unsigned int payload_offset = 0;
-	struct sk_buff *skb = data;
+	unsigned int payload_offset = ovpn_skb_cb(skb)->payload_offset;
+	struct ovpn_crypto_key_slot *ks = ovpn_skb_cb(skb)->ks;
 	struct ovpn_socket *sock;
-	struct ovpn_peer *peer;
 	__be16 proto;
 	__be32 *pid;
-
-	/* crypto is happening asynchronously. this function will be called
-	 * again later by the crypto callback with a proper return code
-	 */
-	if (unlikely(ret == -EINPROGRESS))
-		return;
-
-	payload_offset = ovpn_skb_cb(skb)->payload_offset;
-	ks = ovpn_skb_cb(skb)->ks;
-	peer = ovpn_skb_cb(skb)->peer;
-
-	/* crypto is done, cleanup skb CB and its members */
-	kfree(ovpn_skb_cb(skb)->crypto_tmp);
-
-	if (unlikely(ret < 0))
-		goto drop;
+	int ret;
 
 	/* PID sits after the op */
 	pid = (__force __be32 *)(skb->data + OVPN_OPCODE_SIZE);
@@ -196,7 +230,7 @@ void ovpn_decrypt_post(void *data, int ret)
 		goto drop;
 	}
 
-	ovpn_netdev_write(peer, skb);
+	ovpn_netdev_write_napi(peer, napi, skb);
 	/* skb is passed to upper layer - don't free it */
 	skb = NULL;
 drop:
@@ -204,35 +238,244 @@ drop:
 		ovpn_dev_dstats_rx_dropped(peer->ovpn->dev);
 	kfree_skb(skb);
 drop_nocount:
-	if (likely(peer))
-		ovpn_peer_put(peer);
-	if (likely(ks))
-		ovpn_crypto_key_slot_put(ks);
+	ovpn_peer_put(peer);
+	ovpn_crypto_key_slot_put(ks);
 }
 
-/* RX path entry point: decrypt packet and forward it to the device */
-void ovpn_recv(struct ovpn_peer *peer, struct sk_buff *skb)
+void ovpn_decrypt_post(void *data, int ret)
 {
-	struct ovpn_crypto_key_slot *ks;
-	u8 key_id;
+	struct sk_buff *skb = data;
+	struct ovpn_peer *peer;
+	struct ovpn_cb *cb;
 
-	ovpn_peer_stats_increment_rx(&peer->link_stats, skb->len);
-
-	/* get the key slot matching the key ID in the received packet */
-	key_id = ovpn_key_id_from_skb(skb);
-	ks = ovpn_crypto_key_id_to_slot(&peer->crypto, key_id);
-	if (unlikely(!ks)) {
-		net_info_ratelimited("%s: no available key for peer %u, key-id: %u\n",
-				     netdev_name(peer->ovpn->dev), peer->id,
-				     key_id);
-		ovpn_dev_dstats_rx_dropped(peer->ovpn->dev);
-		kfree_skb(skb);
-		ovpn_peer_put(peer);
+	/* crypto is happening asynchronously. this function will be called
+	 * again later by the crypto callback with a proper return code
+	 */
+	if (unlikely(ret == -EINPROGRESS))
 		return;
+
+	/* crypto is done, cleanup skb CB and its members */
+	cb = ovpn_skb_cb(skb);
+	peer = cb->peer;
+	kfree(cb->crypto_tmp);
+
+	ovpn_pkt_complete_and_schedule(skb, &peer->rx_napi,
+				       ret < 0 ? OVPN_PKT_DEAD :
+						 OVPN_PKT_READY);
+}
+
+static int ovpn_peer_rx_poll(struct napi_struct *napi, int budget)
+{
+	struct ovpn_peer *peer = container_of(napi, struct ovpn_peer, rx_napi);
+	struct ovpn_crypto_key_slot *ks;
+	enum ovpn_pkt_state pkt_state;
+	struct ovpn_peer *skb_peer;
+	int work_done = 0;
+	struct sk_buff *skb;
+	struct ovpn_cb *cb;
+
+	for (;;) {
+		if (work_done >= budget)
+			break;
+
+		skb = ovpn_ordered_queue_peek(&peer->rx_queue);
+		if (!skb)
+			break;
+
+		cb = ovpn_skb_cb(skb);
+		/* pairs with pkt_state release stores from RX completions */
+		pkt_state = smp_load_acquire(&cb->pkt_state);
+		if (pkt_state == OVPN_PKT_PENDING ||
+		    pkt_state == OVPN_PKT_PROCESSING)
+			break;
+
+		ovpn_ordered_queue_drop_peeked(&peer->rx_queue);
+		/* peer removal waits for this consumer to empty the queue */
+		if (unlikely(ovpn_ordered_queue_empty(&peer->rx_queue)) &&
+		    wq_has_sleeper(&peer->rx_wait))
+			wake_up(&peer->rx_wait);
+
+		if (likely(pkt_state == OVPN_PKT_READY)) {
+			ovpn_decrypt_finalize_napi(peer, napi, skb);
+		} else {
+			skb_peer = cb->peer;
+			ks = cb->ks;
+			ovpn_dev_dstats_rx_dropped(peer->ovpn->dev);
+			kfree_skb(skb);
+			ovpn_peer_put(skb_peer);
+			if (ks)
+				ovpn_crypto_key_slot_put(ks);
+		}
+		work_done++;
 	}
 
-	memset(ovpn_skb_cb(skb), 0, sizeof(struct ovpn_cb));
-	ovpn_decrypt_post(skb, ovpn_aead_decrypt(peer, ks, skb));
+	if (work_done < budget)
+		napi_complete_done(napi, work_done);
+
+	return work_done;
+}
+
+static int ovpn_peer_rx_enqueue(struct ovpn_peer *peer, struct sk_buff *skb)
+{
+	struct ovpn_priv *ovpn = peer->ovpn;
+	struct ovpn_cb *cb = ovpn_skb_cb(skb);
+
+	memset(cb, 0, sizeof(*cb));
+	cb->peer = peer;
+	/* publish RX queue ownership before workers can observe this skb */
+	smp_store_release(&cb->pkt_state, OVPN_PKT_PENDING);
+
+	/* enqueue in per-peer order first; consumer waits for state changes */
+	if (unlikely(!ovpn_ordered_queue_enqueue(&peer->rx_queue, skb,
+						 OVPN_QUEUE_LEN)))
+		return -ENOSPC;
+
+	if (unlikely(ptr_ring_produce_bh(&ovpn->rx_queue.ring, skb))) {
+		ovpn_pkt_complete_and_schedule(skb, &peer->rx_napi,
+					       OVPN_PKT_DEAD);
+		return 0;
+	}
+
+	ovpn_rx_worker_kick(ovpn);
+	return 0;
+}
+
+/* RX path entry point: queue packet for decryption and device delivery */
+void ovpn_recv_defer(struct ovpn_peer *peer, struct sk_buff *skb)
+{
+	struct ovpn_priv *ovpn = peer->ovpn;
+	int ret;
+
+	ovpn_peer_stats_increment_rx(&peer->link_stats, skb->len);
+	ret = ovpn_peer_rx_enqueue(peer, skb);
+	if (unlikely(ret))
+		goto drop;
+
+	return;
+drop:
+	ovpn_dev_dstats_rx_dropped(ovpn->dev);
+	kfree_skb(skb);
+	ovpn_peer_put(peer);
+}
+
+static void ovpn_rx_worker(struct work_struct *work)
+{
+	const struct ovpn_rx_worker *worker;
+	struct ovpn_crypto_key_slot *ks;
+	struct ovpn_priv *ovpn;
+	struct ovpn_peer *peer;
+	struct sk_buff *skb;
+	u8 key_id;
+
+	worker = container_of(work, struct ovpn_rx_worker, work);
+	ovpn = worker->ovpn;
+
+	while ((skb = ptr_ring_consume_bh(&ovpn->rx_queue.ring)) != NULL) {
+		peer = ovpn_skb_cb(skb)->peer;
+
+		/* get the key slot matching the key ID in the received
+		 * packet
+		 */
+		key_id = ovpn_key_id_from_skb(skb);
+
+		ks = ovpn_crypto_key_id_to_slot(&peer->crypto, key_id);
+		if (unlikely(!ks)) {
+			net_info_ratelimited("%s: no available key for peer %u, key-id: %u\n",
+					     netdev_name(peer->ovpn->dev),
+					     peer->id, key_id);
+			ovpn_pkt_complete_and_schedule(skb, &peer->rx_napi,
+						       OVPN_PKT_DEAD);
+			continue;
+		}
+
+		ovpn_pkt_state_set(skb, OVPN_PKT_PROCESSING);
+		ovpn_decrypt_post(skb, ovpn_aead_decrypt(peer, ks, skb));
+		if (need_resched())
+			cond_resched();
+	}
+}
+
+static void ovpn_rx_ring_cleanup_cb(void *ptr)
+{
+	/* the ring is non-owning: every pending skb is also linked in the
+	 * owning peer queue, which must be empty before device RX teardown
+	 */
+	DEBUG_NET_WARN_ON_ONCE(1);
+}
+
+int ovpn_rx_init(struct ovpn_priv *ovpn)
+{
+	struct ovpn_rx_worker *worker;
+	int ret, cpu;
+
+	ovpn->rx_wq = alloc_workqueue("ovpn-rx-%s",
+				      WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM, 0,
+				      netdev_name(ovpn->dev));
+	if (!ovpn->rx_wq)
+		return -ENOMEM;
+
+	ret = ptr_ring_init(&ovpn->rx_queue.ring, OVPN_RING_LEN, GFP_KERNEL);
+	if (ret < 0)
+		goto err_destroy_wq;
+
+	ovpn->rx_queue.worker = alloc_percpu(struct ovpn_rx_worker);
+	if (!ovpn->rx_queue.worker) {
+		ret = -ENOMEM;
+		goto err_cleanup_ring;
+	}
+
+	for_each_possible_cpu(cpu) {
+		worker = per_cpu_ptr(ovpn->rx_queue.worker, cpu);
+		INIT_WORK(&worker->work, ovpn_rx_worker);
+		worker->ovpn = ovpn;
+	}
+	ovpn->rx_queue.last_cpu = -1;
+
+	return 0;
+
+err_cleanup_ring:
+	ptr_ring_cleanup(&ovpn->rx_queue.ring, NULL);
+err_destroy_wq:
+	destroy_workqueue(ovpn->rx_wq);
+	ovpn->rx_wq = NULL;
+
+	return ret;
+}
+
+void ovpn_rx_uninit(struct ovpn_priv *ovpn)
+{
+	if (ovpn->rx_wq) {
+		destroy_workqueue(ovpn->rx_wq);
+		ovpn->rx_wq = NULL;
+	}
+
+	if (ovpn->rx_queue.worker) {
+		free_percpu(ovpn->rx_queue.worker);
+		ovpn->rx_queue.worker = NULL;
+	}
+
+	ptr_ring_cleanup(&ovpn->rx_queue.ring, ovpn_rx_ring_cleanup_cb);
+}
+
+void ovpn_peer_rx_init(struct ovpn_peer *peer)
+{
+	ovpn_ordered_queue_init(&peer->rx_queue);
+	netif_napi_add(peer->ovpn->dev, &peer->rx_napi, ovpn_peer_rx_poll);
+	napi_enable(&peer->rx_napi);
+}
+
+void ovpn_peer_rx_stop(struct ovpn_peer *peer, bool netdev_locked)
+{
+	/* producers are quiesced before this point; NAPI owns queue draining */
+	wait_event(peer->rx_wait, ovpn_ordered_queue_empty(&peer->rx_queue));
+
+	if (netdev_locked) {
+		napi_disable_locked(&peer->rx_napi);
+		__netif_napi_del_locked(&peer->rx_napi);
+	} else {
+		napi_disable(&peer->rx_napi);
+		__netif_napi_del(&peer->rx_napi);
+	}
 }
 
 void ovpn_encrypt_post(void *data, int ret)

@@ -12,7 +12,6 @@
 #include <linux/module.h>
 #include <linux/netdevice.h>
 #include <linux/inetdevice.h>
-#include <net/gro_cells.h>
 #include <net/ip.h>
 #include <net/rtnetlink.h>
 #include <uapi/linux/if_arp.h>
@@ -74,14 +73,16 @@ static int ovpn_mp_alloc(struct ovpn_priv *ovpn)
 static int ovpn_net_init(struct net_device *dev)
 {
 	struct ovpn_priv *ovpn = netdev_priv(dev);
-	int err = gro_cells_init(&ovpn->gro_cells, dev);
+	int err;
 
+	err = ovpn_mp_alloc(ovpn);
 	if (err < 0)
 		return err;
 
-	err = ovpn_mp_alloc(ovpn);
+	err = ovpn_rx_init(ovpn);
 	if (err < 0) {
-		gro_cells_destroy(&ovpn->gro_cells);
+		kfree(ovpn->peers);
+		ovpn->peers = NULL;
 		return err;
 	}
 
@@ -94,7 +95,7 @@ static void ovpn_net_uninit(struct net_device *dev)
 
 	disable_delayed_work_sync(&ovpn->keepalive_work);
 	ovpn_peers_free(ovpn, NULL, OVPN_DEL_PEER_REASON_TEARDOWN);
-	gro_cells_destroy(&ovpn->gro_cells);
+	ovpn_rx_uninit(ovpn);
 }
 
 static const struct net_device_ops ovpn_netdev_ops = {

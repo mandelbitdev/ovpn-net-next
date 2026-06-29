@@ -14,6 +14,7 @@
 
 #include "ovpnpriv.h"
 #include "main.h"
+#include "io.h"
 #include "netlink.h"
 #include "netlink-gen.h"
 #include "bind.h"
@@ -462,11 +463,11 @@ int ovpn_nl_peer_new_doit(struct sk_buff *skb, struct genl_info *info)
 sock_release:
 	ovpn_socket_release(peer);
 peer_release:
-	/* For UDP, the peer is unreachable until added to the hashtables, so
-	 * dropping the initial reference is enough. For TCP, the peer may be
-	 * concurrently reachable via sk_user_data->peer until
-	 * ovpn_socket_release() detaches; rely on the refcount.
+	/* NAPI is initialized by ovpn_peer_new(), but this peer will not go
+	 * through the normal removal path. Stop RX explicitly before dropping
+	 * the initial reference.
 	 */
+	ovpn_peer_rx_stop(peer, false);
 	ovpn_peer_put(peer);
 
 	return ret;

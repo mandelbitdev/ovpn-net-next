@@ -121,7 +121,7 @@ static int ovpn_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
 
 	/* pop off outer UDP header */
 	__skb_pull(skb, sizeof(struct udphdr));
-	ovpn_recv(peer, skb);
+	ovpn_recv_defer(peer, skb);
 	return 0;
 
 drop:
