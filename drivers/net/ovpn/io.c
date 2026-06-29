@@ -114,7 +114,7 @@ void ovpn_decrypt_post(void *data, int ret)
 	struct ovpn_peer *peer;
 	u64 aead_blocks;
 	__be16 proto;
-	__be32 *pid;
+	u32 pktid;
 
 	/* crypto is happening asynchronously. this function will be called
 	 * again later by the crypto callback with a proper return code
@@ -138,9 +138,8 @@ void ovpn_decrypt_post(void *data, int ret)
 	if (unlikely(ret < 0))
 		goto drop;
 
-	/* PID sits after the op */
-	pid = (__force __be32 *)(skb->data + OVPN_OPCODE_SIZE);
-	ret = ovpn_pktid_recv(&ks->pid_recv, ntohl(*pid), 0);
+	pktid = ovpn_aead_direct_pktid(skb);
+	ret = ovpn_pktid_recv(&ks->pid_recv, pktid, 0);
 	if (unlikely(ret < 0)) {
 		net_err_ratelimited("%s: PKT ID RX error for peer %u: %d\n",
 				    netdev_name(peer->ovpn->dev), peer->id,
@@ -149,8 +148,7 @@ void ovpn_decrypt_post(void *data, int ret)
 	}
 
 	aead_blocks = ovpn_aead_limit_blocks(ks->cipher_alg,
-					     OVPN_OPCODE_SIZE +
-					     OVPN_NONCE_WIRE_SIZE,
+					     OVPN_AEAD_DIRECT_AAD_SIZE,
 					     skb->len - payload_offset);
 	if (unlikely(ovpn_pktid_recv_update_aead(&ks->pid_recv,
 						 &ks->usage_recv,
