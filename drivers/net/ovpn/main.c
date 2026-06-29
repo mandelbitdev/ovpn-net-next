@@ -79,8 +79,16 @@ static int ovpn_net_init(struct net_device *dev)
 	if (err < 0)
 		return err;
 
+	err = ovpn_tx_init(ovpn);
+	if (err < 0) {
+		kfree(ovpn->peers);
+		ovpn->peers = NULL;
+		return err;
+	}
+
 	err = ovpn_rx_init(ovpn);
 	if (err < 0) {
+		ovpn_tx_uninit(ovpn);
 		kfree(ovpn->peers);
 		ovpn->peers = NULL;
 		return err;
@@ -96,6 +104,7 @@ static void ovpn_net_uninit(struct net_device *dev)
 	disable_delayed_work_sync(&ovpn->keepalive_work);
 	ovpn_peers_free(ovpn, NULL, OVPN_DEL_PEER_REASON_TEARDOWN);
 	ovpn_rx_uninit(ovpn);
+	ovpn_tx_uninit(ovpn);
 }
 
 static const struct net_device_ops ovpn_netdev_ops = {

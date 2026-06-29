@@ -32,6 +32,7 @@ enum ovpn_pkt_state {
  * @crypto_tmp: pointer to temporary memory used for crypto operations
  *		containing the IV, the scatter gather list and the aead request
  * @payload_offset: offset in the skb where the payload starts (RX)
+ * @tx_pktid: pre-reserved TX packet-id for queued stage-1 ordering (TX)
  * @nosignal: whether this skb should be sent with the MSG_NOSIGNAL flag (TCP)
  * @pkt_state: packet state for ordered per-peer processing
  */
@@ -39,7 +40,10 @@ struct ovpn_cb {
 	struct ovpn_peer *peer;
 	struct ovpn_crypto_key_slot *ks;
 	void *crypto_tmp;
-	unsigned int payload_offset;
+	union {
+		unsigned int payload_offset;
+		u32 tx_pktid;
+	};
 	bool nosignal;
 	u8 pkt_state;
 };

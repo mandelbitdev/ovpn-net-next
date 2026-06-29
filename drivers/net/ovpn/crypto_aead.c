@@ -201,12 +201,10 @@ int ovpn_aead_encrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 	__skb_push(skb, tag_size);
 	sg_set_buf(sg + ret + 1, skb->data, tag_size);
 
-	/* obtain packet ID, which is used both as a first
-	 * 4 bytes of nonce and last 4 bytes of associated data.
-	 */
-	ret = ovpn_pktid_xmit_next(&ks->pid_xmit, &pktid);
-	if (unlikely(ret < 0))
-		return ret;
+	/* tx is queued-only: pktid is reserved in stage-1 enqueue order */
+	pktid = ovpn_skb_cb(skb)->tx_pktid;
+	if (unlikely(!pktid))
+		return -EINVAL;
 
 	/* concat 4 bytes packet id and 8 bytes nonce tail into 12 bytes
 	 * nonce

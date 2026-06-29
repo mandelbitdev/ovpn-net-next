@@ -464,9 +464,10 @@ sock_release:
 	ovpn_socket_release(peer);
 peer_release:
 	/* NAPI is initialized by ovpn_peer_new(), but this peer will not go
-	 * through the normal removal path. Stop RX explicitly before dropping
-	 * the initial reference.
+	 * through the normal removal path. Stop TX/RX explicitly before
+	 * dropping the initial reference.
 	 */
+	ovpn_peer_tx_stop(peer, false);
 	ovpn_peer_rx_stop(peer, false);
 	ovpn_peer_put(peer);
 

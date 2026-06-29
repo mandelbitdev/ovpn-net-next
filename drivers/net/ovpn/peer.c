@@ -30,18 +30,24 @@ static void unlock_ovpn(struct ovpn_priv *ovpn,
 
 	spin_unlock_bh(&ovpn->lock);
 
-	llist_for_each_entry(peer, release_list->first, release_entry)
+	llist_for_each_entry(peer, release_list->first, release_entry) {
+		cancel_work_sync(&peer->keepalive_work);
 		ovpn_socket_release(peer);
+	}
 
-	/* removal from peer tables prevents new lookups. Queued RX packets
-	 * may still complete while removal waits, but source validation
-	 * rejects them: MP peers are no longer in the VPN-address tables,
-	 * and P2P peers no longer match ovpn->peer.
+	/* peer lookup and queue admission run under networking RCU: netdev TX
+	 * is called under rcu_read_lock_bh() and UDP encap RX under
+	 * rcu_read_lock(). Once the peer is removed from the lookup tables,
+	 * this grace period guarantees those producers have either queued their
+	 * packets or dropped them before per-peer NAPI is stopped below.
+	 * TCP RX is quiesced by ovpn_socket_release(), and keepalive work is
+	 * canceled explicitly above.
 	 */
 	if (release_list->first)
 		synchronize_rcu();
 
 	llist_for_each_entry(peer, release_list->first, release_entry) {
+		ovpn_peer_tx_stop(peer, netdev_locked);
 		ovpn_peer_rx_stop(peer, netdev_locked);
 		ovpn_peer_put(peer);
 	}
@@ -123,7 +129,7 @@ struct ovpn_peer *ovpn_peer_new(struct ovpn_priv *ovpn, u32 id)
 	RCU_INIT_POINTER(peer->bind, NULL);
 	ovpn_crypto_state_init(&peer->crypto);
 	spin_lock_init(&peer->lock);
-	init_waitqueue_head(&peer->rx_wait);
+	init_waitqueue_head(&peer->drain_wait);
 	kref_init(&peer->refcount);
 	ovpn_peer_stats_init(&peer->vpn_stats);
 	ovpn_peer_stats_init(&peer->link_stats);
@@ -139,6 +145,7 @@ struct ovpn_peer *ovpn_peer_new(struct ovpn_priv *ovpn, u32 id)
 	}
 
 	netdev_hold(ovpn->dev, &peer->dev_tracker, GFP_KERNEL);
+	ovpn_peer_tx_init(peer);
 	ovpn_peer_rx_init(peer);
 
 	return peer;
@@ -370,10 +377,10 @@ static void ovpn_peer_release_rcu(struct rcu_head *head)
 static void ovpn_peer_release(struct ovpn_peer *peer)
 {
 	/* queued skbs hold peer refs, so final peer release must see an empty
-	 * RX queue
+	 * TX/RX queues
 	 */
+	DEBUG_NET_WARN_ON_ONCE(!ovpn_ordered_queue_empty(&peer->tx_queue));
 	DEBUG_NET_WARN_ON_ONCE(!ovpn_ordered_queue_empty(&peer->rx_queue));
-
 	ovpn_crypto_state_release(&peer->crypto);
 	spin_lock_bh(&peer->lock);
 	ovpn_bind_reset(peer, NULL);

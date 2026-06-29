@@ -35,6 +35,16 @@ struct ovpn_peer_collection {
 struct ovpn_priv;
 
 /**
+ * struct ovpn_tx_worker - per-CPU TX worker
+ * @work: work item draining the device tx ring
+ * @ovpn: parent ovpn device
+ */
+struct ovpn_tx_worker {
+	struct work_struct work;
+	struct ovpn_priv *ovpn;
+};
+
+/**
  * struct ovpn_rx_worker - per-CPU RX worker
  * @work: work item draining the device rx ring
  * @ovpn: parent ovpn device
@@ -42,6 +52,18 @@ struct ovpn_priv;
 struct ovpn_rx_worker {
 	struct work_struct work;
 	struct ovpn_priv *ovpn;
+};
+
+/**
+ * struct ovpn_tx_queue - stage-1 device TX queue
+ * @ring: ring containing packets waiting for encryption
+ * @worker: per-CPU workers draining ring
+ * @last_cpu: last CPU selected for worker wakeup
+ */
+struct ovpn_tx_queue {
+	struct ptr_ring ring;
+	struct ovpn_tx_worker __percpu *worker;
+	int last_cpu;
 };
 
 /**
@@ -63,7 +85,9 @@ struct ovpn_rx_queue {
  * @lock: protect this object
  * @peers: data structures holding multi-peer references
  * @peer: in P2P mode, this is the only remote peer
+ * @tx_queue: stage-1 TX queue used to defer encryption out of ndo_start_xmit
  * @rx_queue: stage-1 RX queue used to defer decryption out of softirq path
+ * @tx_wq: workqueue used by tx_queue workers
  * @rx_wq: workqueue used by rx_queue workers
  * @keepalive_work: struct used to schedule keepalive periodic job
  */
@@ -73,7 +97,9 @@ struct ovpn_priv {
 	spinlock_t lock; /* protect writing to the ovpn_priv object */
 	struct ovpn_peer_collection *peers;
 	struct ovpn_peer __rcu *peer;
+	struct ovpn_tx_queue tx_queue;
 	struct ovpn_rx_queue rx_queue;
+	struct workqueue_struct *tx_wq;
 	struct workqueue_struct *rx_wq;
 	struct delayed_work keepalive_work;
 };

@@ -25,12 +25,16 @@
 extern const unsigned char ovpn_keepalive_message[OVPN_KEEPALIVE_SIZE];
 
 netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev);
+int ovpn_tx_init(struct ovpn_priv *ovpn);
+void ovpn_tx_uninit(struct ovpn_priv *ovpn);
 int ovpn_rx_init(struct ovpn_priv *ovpn);
 void ovpn_rx_uninit(struct ovpn_priv *ovpn);
 
 void ovpn_recv_defer(struct ovpn_peer *peer, struct sk_buff *skb);
 void ovpn_xmit_special(struct ovpn_peer *peer, const void *data,
 		       const unsigned int len);
+void ovpn_peer_tx_init(struct ovpn_peer *peer);
+void ovpn_peer_tx_stop(struct ovpn_peer *peer, bool netdev_locked);
 void ovpn_peer_rx_init(struct ovpn_peer *peer);
 void ovpn_peer_rx_stop(struct ovpn_peer *peer, bool netdev_locked);
 
