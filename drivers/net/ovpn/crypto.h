@@ -136,6 +136,13 @@ static inline void ovpn_crypto_key_slot_put(struct ovpn_crypto_key_slot *ks)
 int ovpn_crypto_state_reset(struct ovpn_crypto_state *cs,
 			    const struct ovpn_peer_key_reset *pkr);
 
+struct ovpn_crypto_key_slot *
+ovpn_crypto_key_slot_new(const struct ovpn_key_config *kc);
+
+void ovpn_crypto_key_slot_destroy(struct ovpn_crypto_key_slot *ks);
+
+enum ovpn_cipher_alg ovpn_crypto_key_slot_alg(struct ovpn_crypto_key_slot *ks);
+
 void ovpn_crypto_key_slot_delete(struct ovpn_crypto_state *cs,
 				 enum ovpn_key_slot slot);
 
