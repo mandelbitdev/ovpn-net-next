@@ -81,6 +81,8 @@ struct ovpn_crypto_key_slot {
 	bool epoch_format;
 	unsigned int aad_size;
 	unsigned int pktid_size;
+	unsigned int payload_offset;
+	unsigned int tail_tag_size;
 
 	struct ovpn_epoch_key epoch_key_send;
 	struct ovpn_epoch_key epoch_key_recv;
