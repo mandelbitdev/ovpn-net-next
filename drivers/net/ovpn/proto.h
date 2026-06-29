@@ -47,7 +47,37 @@
 #define OVPN_DATA_V1			6 /* data channel v1 packet */
 #define OVPN_DATA_V2			9 /* data channel v2 packet */
 
+/* direct-key AEAD packet layout */
+#define OVPN_AEAD_TAG_SIZE		16
+#define OVPN_AEAD_DIRECT_OP_OFFSET	0
+#define OVPN_AEAD_DIRECT_PKTID_OFFSET	(OVPN_AEAD_DIRECT_OP_OFFSET + \
+					 OVPN_OPCODE_SIZE)
+#define OVPN_AEAD_DIRECT_TAG_OFFSET	(OVPN_AEAD_DIRECT_PKTID_OFFSET + \
+					 OVPN_NONCE_WIRE_SIZE)
+#define OVPN_AEAD_DIRECT_AAD_SIZE	OVPN_AEAD_DIRECT_TAG_OFFSET
+
 #define OVPN_PEER_ID_UNDEF		0x00FFFFFF
+
+static inline unsigned int
+ovpn_aead_direct_payload_offset(unsigned int tag_size)
+{
+	return OVPN_AEAD_DIRECT_TAG_OFFSET + tag_size;
+}
+
+static inline u32 ovpn_aead_direct_pktid(const struct sk_buff *skb)
+{
+	const __be32 *pktid;
+
+	pktid = (__force const __be32 *)(skb->data +
+					 OVPN_AEAD_DIRECT_PKTID_OFFSET);
+
+	return be32_to_cpu(*pktid);
+}
+
+static inline u8 *ovpn_aead_direct_wire_nonce(struct sk_buff *skb)
+{
+	return skb->data + OVPN_AEAD_DIRECT_PKTID_OFFSET;
+}
 
 /**
  * ovpn_opcode_from_skb - extract OP code from skb at specified offset
