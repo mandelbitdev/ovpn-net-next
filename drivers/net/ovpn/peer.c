@@ -26,15 +26,27 @@ static void unlock_ovpn(struct ovpn_priv *ovpn,
 			 struct llist_head *release_list)
 	__releases(&ovpn->lock)
 {
-	struct ovpn_peer *peer, *next;
+	struct ovpn_peer *peer, *next_peer;
+	struct ovpn_socket *sock, *next_sock;
+	LIST_HEAD(sock_release_list);
 
 	spin_unlock_bh(&ovpn->lock);
 
-	llist_for_each_entry_safe(peer, next, release_list->first,
-				  release_entry) {
-		ovpn_socket_release(peer);
-		ovpn_peer_put(peer);
+	llist_for_each_entry(peer, release_list->first, release_entry) {
+		sock = ovpn_socket_release_prepare(peer);
+		if (!sock)
+			continue;
+		list_add_tail(&sock->release_entry, &sock_release_list);
 	}
+
+	if (!list_empty(&sock_release_list))
+		synchronize_net();
+
+	list_for_each_entry_safe(sock, next_sock, &sock_release_list, release_entry)
+		ovpn_socket_release_finish(sock);
+
+	llist_for_each_entry_safe(peer, next_peer, release_list->first, release_entry)
+		ovpn_peer_put(peer);
 }
 
 /**

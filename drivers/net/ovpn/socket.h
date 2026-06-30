@@ -24,6 +24,7 @@ struct ovpn_peer;
  * @peer: unique peer transmitting over this socket (TCP only)
  * @sk: the low level sock object
  * @refcount: amount of contexts currently referencing this object
+ * @release_entry: entry for the deferred release list
  * @work: member used to schedule release routine (it may block)
  * @tcp_tx_work: work for deferring outgoing packet processing (TCP only)
  */
@@ -38,6 +39,7 @@ struct ovpn_socket {
 
 	struct sock *sk;
 	struct kref refcount;
+	struct list_head release_entry;
 	struct work_struct work;
 	struct work_struct tcp_tx_work;
 };
@@ -45,5 +47,7 @@ struct ovpn_socket {
 struct ovpn_socket *ovpn_socket_new(struct socket *sock,
 				    struct ovpn_peer *peer);
 void ovpn_socket_release(struct ovpn_peer *peer);
+struct ovpn_socket *ovpn_socket_release_prepare(struct ovpn_peer *peer);
+void ovpn_socket_release_finish(struct ovpn_socket *sock);
 
 #endif /* _NET_OVPN_SOCK_H_ */

@@ -46,6 +46,69 @@ static bool ovpn_socket_put(struct ovpn_peer *peer, struct ovpn_socket *sock)
 }
 
 /**
+ * ovpn_socket_release_prepare - detach peer from its socket
+ * @peer: peer whose socket should be detached
+ *
+ * Return: the detached socket if its refcount reached zero, NULL otherwise.
+ * If a socket is returned, the caller must call synchronize_net() before
+ * invoking ovpn_socket_release_finish().
+ */
+struct ovpn_socket *ovpn_socket_release_prepare(struct ovpn_peer *peer)
+{
+	struct ovpn_socket *sock;
+	bool released;
+
+	might_sleep();
+
+	sock = rcu_replace_pointer(peer->sock, NULL, true);
+	/* release may be invoked after socket was detached */
+	if (!sock)
+		return NULL;
+
+	/* Drop the reference while holding the sock lock to avoid
+	 * concurrent ovpn_socket_new call to mess up with a partially
+	 * detached socket.
+	 *
+	 * Holding the lock ensures that a socket with refcnt 0 is fully
+	 * detached before it can be picked by a concurrent reader.
+	 */
+	lock_sock(sock->sk);
+	released = ovpn_socket_put(peer, sock);
+	release_sock(sock->sk);
+
+	if (released)
+		return sock;
+
+	return NULL;
+}
+
+/**
+ * ovpn_socket_release_finish - complete release of a detached socket
+ * @sock: socket whose refcount reached zero
+ *
+ * The caller must have called synchronize_net() after
+ * ovpn_socket_release_prepare() returned this socket.
+ */
+void ovpn_socket_release_finish(struct ovpn_socket *sock)
+{
+	might_sleep();
+
+	if (sock->sk->sk_protocol == IPPROTO_UDP) {
+		netdev_put(sock->ovpn->dev, &sock->dev_tracker);
+	} else if (sock->sk->sk_protocol == IPPROTO_TCP) {
+		/* wait for TCP jobs to terminate */
+		ovpn_tcp_socket_wait_finish(sock);
+		ovpn_peer_put(sock->peer);
+	}
+	/* drop reference acquired in ovpn_socket_new() */
+	sock_put(sock->sk);
+	/* we can call plain kfree() because we already waited one RCU
+	 * period due to synchronize_net()
+	 */
+	kfree(sock);
+}
+
+/**
  * ovpn_socket_release - release resources owned by socket user
  * @peer: peer whose socket should be released
  *
@@ -66,45 +129,18 @@ static bool ovpn_socket_put(struct ovpn_peer *peer, struct ovpn_socket *sock)
 void ovpn_socket_release(struct ovpn_peer *peer)
 {
 	struct ovpn_socket *sock;
-	bool released;
 
 	might_sleep();
 
-	sock = rcu_replace_pointer(peer->sock, NULL, true);
-	/* release may be invoked after socket was detached */
+	sock = ovpn_socket_release_prepare(peer);
 	if (!sock)
 		return;
 
-	/* Drop the reference while holding the sock lock to avoid
-	 * concurrent ovpn_socket_new call to mess up with a partially
-	 * detached socket.
-	 *
-	 * Holding the lock ensures that a socket with refcnt 0 is fully
-	 * detached before it can be picked by a concurrent reader.
-	 */
-	lock_sock(sock->sk);
-	released = ovpn_socket_put(peer, sock);
-	release_sock(sock->sk);
-
 	/* align all readers with sk_user_data being NULL */
-	synchronize_rcu();
+	synchronize_net();
 
 	/* following cleanup should happen with lock released */
-	if (released) {
-		if (sock->sk->sk_protocol == IPPROTO_UDP) {
-			netdev_put(sock->ovpn->dev, &sock->dev_tracker);
-		} else if (sock->sk->sk_protocol == IPPROTO_TCP) {
-			/* wait for TCP jobs to terminate */
-			ovpn_tcp_socket_wait_finish(sock);
-			ovpn_peer_put(sock->peer);
-		}
-		/* drop reference acquired in ovpn_socket_new() */
-		sock_put(sock->sk);
-		/* we can call plain kfree() because we already waited one RCU
-		 * period due to synchronize_rcu()
-		 */
-		kfree(sock);
-	}
+	ovpn_socket_release_finish(sock);
 }
 
 static bool ovpn_socket_hold(struct ovpn_socket *sock)
