@@ -1335,7 +1335,7 @@ int ovpn_nl_key_swap_notify(struct ovpn_peer *peer, u8 key_id)
 	if (nla_put_u32(msg, OVPN_A_KEYCONF_PEER_ID, peer->id))
 		goto err_cancel_msg;
 
-	if (nla_put_u16(msg, OVPN_A_KEYCONF_KEY_ID, key_id))
+	if (nla_put_u32(msg, OVPN_A_KEYCONF_KEY_ID, key_id))
 		goto err_cancel_msg;
 
 	nla_nest_end(msg, k_attr);
