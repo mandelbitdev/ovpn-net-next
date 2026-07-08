@@ -500,9 +500,15 @@ static void ovpn_tcp_peer_del_work(struct work_struct *work)
 {
 	struct ovpn_peer *peer = container_of(work, struct ovpn_peer,
 					      tcp.defer_del_work);
+	u32 peer_id = peer->id;
 
 	ovpn_peer_del(peer, OVPN_DEL_PEER_REASON_TRANSPORT_ERROR);
 	ovpn_peer_put(peer);
+
+	pr_info("ovpn debug: tcp del worker alive after peer put %u\n",
+		peer_id);
+	msleep(30000);
+	pr_info("ovpn debug: tcp del worker returning\n");
 }
 
 /* Set TCP encapsulation callbacks */
@@ -567,6 +573,16 @@ int ovpn_tcp_socket_attach(struct ovpn_socket *ovpn_sock,
 
 	/* enqueue the RX worker */
 	strp_check_rcv(&peer->tcp.strp);
+
+	if (WARN_ON(!ovpn_peer_hold(peer)))
+		return 0;
+	if (schedule_work(&peer->tcp.defer_del_work)) {
+		pr_info("ovpn debug: queued tcp del worker for peer %u fn=%ps/%px\n",
+			peer->id, ovpn_tcp_peer_del_work,
+			ovpn_tcp_peer_del_work);
+	} else {
+		ovpn_peer_put(peer);
+	}
 
 	return 0;
 err:
