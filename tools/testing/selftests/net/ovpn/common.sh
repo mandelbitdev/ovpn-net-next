@@ -9,6 +9,8 @@ source "$OVPN_COMMON_DIR/../../kselftest/ktap_helpers.sh"
 
 OVPN_UDP_PEERS_FILE=${OVPN_UDP_PEERS_FILE:-udp_peers.txt}
 OVPN_TCP_PEERS_FILE=${OVPN_TCP_PEERS_FILE:-tcp_peers.txt}
+OVPN_SERVER_VPN4_ADDR=${OVPN_SERVER_VPN4_ADDR:-5.5.5.1}
+OVPN_SERVER_VPN6_ADDR=${OVPN_SERVER_VPN6_ADDR:-2001:db8:abcd:ef01:5:5:5:1}
 OVPN_CLI=${OVPN_CLI:-${OVPN_COMMON_DIR}/ovpn-cli}
 OVPN_YNL=${OVPN_YNL:-${OVPN_COMMON_DIR}/../../../../net/ynl/pyynl/cli.py}
 OVPN_ALG=${OVPN_ALG:-aes}
@@ -136,14 +138,38 @@ ovpn_create_ns() {
 	ip netns add "ovpn_peer${1}"
 }
 
+ovpn_peer_vpn_addr() {
+	local peer="$1"
+	local file
+
+	if [ "${OVPN_PROTO}" == "UDP" ]; then
+		file="${OVPN_UDP_PEERS_FILE}"
+	else
+		file="${OVPN_TCP_PEERS_FILE}"
+	fi
+
+	# the last word of the matching line is the VPN address
+	grep -E "^${peer}[[:space:]]" "${file}" | awk '{print $NF}'
+}
+
+ovpn_peer_vpn_server_addr() {
+	local peer="$1"
+
+	if ovpn_peer_vpn_addr "${peer}" | grep -q ':'; then
+		printf "%s\n" "${OVPN_SERVER_VPN6_ADDR}"
+	else
+		printf "%s\n" "${OVPN_SERVER_VPN4_ADDR}"
+	fi
+}
+
 ovpn_setup_ns() {
 	local peer="ovpn_peer${1}"
 	local server_ns="ovpn_peer0"
 	local peer_ns
-	MODE="P2P"
+	local vpn_addr
+	local prefix_len
 
 	if [ ${1} -eq 0 ]; then
-		MODE="MP"
 		for p in $(seq 1 ${OVPN_NUM_PEERS}); do
 			peer_ns="ovpn_peer${p}"
 			ip link add veth${p} netns "${server_ns}" type veth \
@@ -160,18 +186,32 @@ ovpn_setup_ns() {
 				veth${p}
 			ip -n "${peer_ns}" link set veth${p} up
 		done
+
+		ip netns exec "${peer}" ${OVPN_CLI} new_iface tun0 "MP"
+		# the server needs to speak both IPv4 and IPv6
+		ip -n "${peer}" addr add "${OVPN_SERVER_VPN4_ADDR}/24" dev tun0
+		ip -n "${peer}" addr add "${OVPN_SERVER_VPN6_ADDR}/64" dev tun0
+	else
+		vpn_addr=$(ovpn_peer_vpn_addr "${1}")
+		if echo "${vpn_addr}" | grep -q ':'; then
+			prefix_len="64"
+		else
+			prefix_len="24"
+		fi
+
+		ip netns exec "${peer}" ${OVPN_CLI} new_iface tun${1} "P2P"
+		ip -n "${peer}" addr add \
+			"${vpn_addr}/${prefix_len}" dev tun${1}
 	fi
 
-	ip netns exec "${peer}" ${OVPN_CLI} new_iface tun${1} $MODE
-	ip -n "${peer}" addr add ${2} dev tun${1}
 	# add a secondary IP to peer 1, to test a LAN behind a client
-	if [ ${1} -eq 1 -a -n "${OVPN_LAN_IP}" ]; then
+	if [ "${1}" -eq 1 ] && [ -n "${OVPN_LAN_IP}" ]; then
 		ip -n "${peer}" addr add ${OVPN_LAN_IP} dev tun${1}
 		ip -n "${server_ns}" route add ${OVPN_LAN_IP} via \
-			$(echo ${2} |sed -e s'!/.*!!') dev tun0
+			"${vpn_addr}" dev tun0
 	fi
-	if [ -n "${3}" ]; then
-		ip -n "${peer}" link set mtu ${3} dev tun${1}
+	if [ -n "${2}" ]; then
+		ip -n "${peer}" link set mtu ${2} dev tun${1}
 	fi
 	ip -n "${peer}" link set tun${1} up
 }

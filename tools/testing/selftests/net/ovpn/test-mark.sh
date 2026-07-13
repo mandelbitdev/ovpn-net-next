@@ -33,8 +33,7 @@ ovpn_mark_prepare_network() {
 	done
 
 	for p in $(seq 0 3); do
-		ovpn_cmd_ok "configure peer${p} namespace" ovpn_setup_ns \
-			"${p}" 5.5.5.$((p + 1))/24
+		ovpn_cmd_ok "configure peer${p} namespace" ovpn_setup_ns "${p}"
 	done
 
 	ovpn_cmd_ok "create server-side multi-peer with fwmark" \
@@ -67,7 +66,7 @@ ovpn_mark_run_baseline_traffic() {
 	for p in $(seq 1 3); do
 		ovpn_cmd_ok "send baseline traffic to peer ${p}" \
 			ip netns exec ovpn_peer0 ping -qfc 100 -w 3 \
-				5.5.5.$((p + 1))
+				"$(ovpn_peer_vpn_addr "${p}")"
 	done
 }
 
@@ -102,7 +101,7 @@ ovpn_mark_verify_drop_traffic() {
 
 	for p in $(seq 1 3); do
 		if ping_output=$(ip netns exec ovpn_peer0 ping -qfc 100 -w 1 \
-			5.5.5.$((p + 1)) 2>&1); then
+			"$(ovpn_peer_vpn_addr "${p}")" 2>&1); then
 			printf '%s\n' "expected ping to peer ${p} to fail \
 				after nft drop rule"
 			return 1
@@ -145,7 +144,7 @@ ovpn_mark_verify_traffic_recovery() {
 	for p in $(seq 1 3); do
 		ovpn_cmd_ok "send recovery traffic to peer ${p}" \
 			ip netns exec ovpn_peer0 ping -qfc 100 -w 3 \
-				5.5.5.$((p + 1))
+				"$(ovpn_peer_vpn_addr "${p}")"
 	done
 }
 

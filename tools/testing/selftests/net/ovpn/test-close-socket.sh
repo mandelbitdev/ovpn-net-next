@@ -29,8 +29,7 @@ ovpn_prepare_network() {
 	done
 
 	for p in $(seq 0 ${OVPN_NUM_PEERS}); do
-		ovpn_cmd_ok "configure peer${p} namespace" ovpn_setup_ns \
-			"${p}" 5.5.5.$((p + 1))/24
+		ovpn_cmd_ok "configure peer${p} namespace" ovpn_setup_ns "${p}"
 	done
 
 	for p in $(seq 0 ${OVPN_NUM_PEERS}); do
@@ -54,7 +53,7 @@ ovpn_run_ping_traffic() {
 	for p in $(seq 1 ${OVPN_NUM_PEERS}); do
 		ovpn_cmd_ok "send ping traffic to peer ${p}" \
 			ip netns exec ovpn_peer0 ping -qfc 100 -w 3 \
-				5.5.5.$((p + 1))
+				"$(ovpn_peer_vpn_addr "${p}")"
 	done
 }
 
@@ -64,7 +63,8 @@ ovpn_run_iperf() {
 	ovpn_run_bg iperf_pid ip netns exec ovpn_peer0 iperf3 -1 -s
 	sleep 1
 	ovpn_cmd_ok "run iperf throughput flow" \
-		ip netns exec ovpn_peer1 iperf3 -Z -t 3 -c 5.5.5.1
+		ip netns exec ovpn_peer1 iperf3 -Z -t 3 \
+			-c "$(ovpn_peer_vpn_server_addr 1)"
 	wait "${iperf_pid}" || return 1
 }
 

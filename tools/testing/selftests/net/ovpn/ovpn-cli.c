@@ -2021,7 +2021,7 @@ static int ovpn_run_cmd(struct ovpn_ctx *ovpn)
 			}
 
 			peer_ctx.ifindex = ovpn->ifindex;
-			peer_ctx.sa_family = ovpn->sa_family;
+			peer_ctx.sa_family = AF_UNSPEC;
 			peer_ctx.asymm_id = ovpn->asymm_id;
 
 			peer_ctx.socket = ovpn_accept(ovpn);
