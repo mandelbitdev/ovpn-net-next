@@ -10,6 +10,7 @@
 #include <linux/scatterlist.h>
 #include <linux/unaligned.h>
 #include <crypto/dh.h>
+#include <crypto/hkdf.h>
 #include <crypto/sha2.h>
 #include <linux/nvme.h>
 #include <linux/nvme-auth.h>
@@ -691,14 +692,19 @@ EXPORT_SYMBOL_GPL(nvme_auth_generate_digest);
 int nvme_auth_derive_tls_psk(int hmac_id, const u8 *psk, size_t psk_len,
 			     const char *psk_digest, u8 **ret_psk)
 {
-	static const u8 default_salt[NVME_AUTH_MAX_DIGEST_SIZE];
 	static const char label[] = "tls13 nvme-tls-psk";
-	const size_t label_len = sizeof(label) - 1;
-	u8 prk[NVME_AUTH_MAX_DIGEST_SIZE];
-	size_t hash_len, ctx_len;
-	u8 *hmac_data = NULL, *tls_key;
-	size_t i;
-	int ret;
+	const u8 label_len = sizeof(label) - 1;
+	union {
+		struct hmac_sha256_key sha256;
+		struct hmac_sha384_key sha384;
+	} prk;
+	struct hkdf_seg info[6];
+	size_t hash_len;
+	u8 output_len[2];
+	u8 ctx_len;
+	char ctx_prefix[4];
+	size_t digest_len;
+	u8 *tls_key;
 
 	hash_len = nvme_auth_hmac_hash_len(hmac_id);
 	if (hash_len == 0) {
@@ -717,64 +723,74 @@ int nvme_auth_derive_tls_psk(int hmac_id, const u8 *psk, size_t psk_len,
 		return -EINVAL;
 	}
 
-	/* HKDF-Extract */
-	ret = nvme_auth_hmac(hmac_id, default_salt, hash_len, psk, psk_len,
-			     prk);
-	if (ret)
-		goto out;
-
 	/*
-	 * HKDF-Expand-Label (RFC 8446 section 7.1), with output length equal to
-	 * the hash length (so only a single HMAC operation is needed)
+	 * HKDF-Expand-Label (RFC 8446 section 7.1).  The HKDF-Expand info
+	 * parameter is an encoded HkdfLabel containing the output length,
+	 * label, and context.
 	 */
 
-	hmac_data = kmalloc(/* output length */ 2 +
-			    /* label */ 1 + label_len +
-			    /* context (max) */ 1 + 3 + 1 + strlen(psk_digest) +
-			    /* counter */ 1,
-			    GFP_KERNEL);
-	if (!hmac_data) {
-		ret = -ENOMEM;
-		goto out;
-	}
 	/* output length */
-	i = 0;
-	hmac_data[i++] = hash_len >> 8;
-	hmac_data[i++] = hash_len;
+	output_len[0] = hash_len >> 8;
+	output_len[1] = hash_len;
+	info[0] = (struct hkdf_seg){
+		.data = output_len,
+		.len = sizeof(output_len),
+	};
 
 	/* label */
-	static_assert(label_len <= 255);
-	hmac_data[i] = label_len;
-	memcpy(&hmac_data[i + 1], label, label_len);
-	i += 1 + label_len;
+	static_assert(sizeof(label) - 1 <= 255);
+	info[1] = (struct hkdf_seg){
+		.data = &label_len,
+		.len = sizeof(label_len),
+	};
+	info[2] = (struct hkdf_seg){
+		.data = label,
+		.len = label_len,
+	};
 
 	/* context */
-	ctx_len = sprintf(&hmac_data[i + 1], "%02d %s", hmac_id, psk_digest);
-	if (ctx_len > 255) {
-		ret = -EINVAL;
-		goto out;
-	}
-	hmac_data[i] = ctx_len;
-	i += 1 + ctx_len;
+	digest_len = strlen(psk_digest);
+	if (digest_len > 255 - (sizeof(ctx_prefix) - 1))
+		return -EINVAL;
 
-	/* counter (this overwrites the NUL terminator written by sprintf) */
-	hmac_data[i++] = 1;
+	snprintf(ctx_prefix, sizeof(ctx_prefix), "%02d ", hmac_id);
+	ctx_len = sizeof(ctx_prefix) - 1 + digest_len;
+	info[3] = (struct hkdf_seg){
+		.data = &ctx_len,
+		.len = sizeof(ctx_len),
+	};
+	info[4] = (struct hkdf_seg){
+		.data = ctx_prefix,
+		.len = sizeof(ctx_prefix) - 1,
+	};
+	info[5] = (struct hkdf_seg){
+		.data = psk_digest,
+		.len = digest_len,
+	};
 
-	tls_key = kzalloc(psk_len, GFP_KERNEL);
-	if (!tls_key) {
-		ret = -ENOMEM;
-		goto out;
-	}
-	ret = nvme_auth_hmac(hmac_id, prk, hash_len, hmac_data, i, tls_key);
-	if (ret) {
+	tls_key = kmalloc(psk_len, GFP_KERNEL);
+	if (!tls_key)
+		return -ENOMEM;
+
+	switch (hmac_id) {
+	case NVME_AUTH_HASH_SHA256:
+		hkdf_sha256_extract(&prk.sha256, NULL, 0, psk, psk_len);
+		hkdf_sha256_expand(&prk.sha256, info, ARRAY_SIZE(info),
+				   tls_key, psk_len);
+		break;
+	case NVME_AUTH_HASH_SHA384:
+		hkdf_sha384_extract(&prk.sha384, NULL, 0, psk, psk_len);
+		hkdf_sha384_expand(&prk.sha384, info, ARRAY_SIZE(info),
+				   tls_key, psk_len);
+		break;
+	default:
+		WARN_ON_ONCE(1);
 		kfree_sensitive(tls_key);
-		goto out;
+		return -EINVAL;
 	}
+	memzero_explicit(&prk, sizeof(prk));
 	*ret_psk = tls_key;
-out:
-	kfree_sensitive(hmac_data);
-	memzero_explicit(prk, sizeof(prk));
-	return ret;
+	return 0;
 }
 EXPORT_SYMBOL_GPL(nvme_auth_derive_tls_psk);
 
