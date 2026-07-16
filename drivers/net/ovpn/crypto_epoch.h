@@ -10,7 +10,7 @@
 #ifndef _NET_OVPN_OVPNEPOCH_H_
 #define _NET_OVPN_OVPNEPOCH_H_
 
-#include <crypto/hash.h>
+#include <crypto/sha2.h>
 #include <linux/limits.h>
 #include <linux/rcupdate.h>
 #include <linux/types.h>
@@ -21,11 +21,11 @@
 
 struct ovpn_key_ctx;
 
-/* crypto handle used for key derivation through HKDF-Expand-Label */
+/* key derivation state for HKDF-Expand-Label */
 struct ovpn_epoch_key {
 	u16 epoch;
 	unsigned int cipher_key_len;
-	struct crypto_shash *shash;
+	struct hmac_sha256_key prk;
 };
 
 /* ring buffer of prederived future epoch data keys */
@@ -46,11 +46,10 @@ ovpn_epoch_future_keys_count(const struct ovpn_future_keys *fk)
 	       OVPN_EPOCH_FUTURE_KEYS_COUNT;
 }
 
-struct crypto_shash *ovpn_epoch_init_key(const u8 *key, size_t key_size);
 int ovpn_epoch_derive_next_prk(const struct ovpn_epoch_key *epoch_key,
 			       u8 next_prk[]);
-int ovpn_epoch_set_prk(struct ovpn_epoch_key *epoch_key, const u8 prk[],
-		       u16 epoch);
+void ovpn_epoch_set_prk(struct ovpn_epoch_key *epoch_key, const u8 prk[],
+			u16 epoch);
 int ovpn_epoch_iterate(struct ovpn_epoch_key *epoch_key);
 int ovpn_epoch_derive_key(const struct ovpn_epoch_key *epoch_key,
 			  u8 cipher_key[], u8 implicit_iv[]);

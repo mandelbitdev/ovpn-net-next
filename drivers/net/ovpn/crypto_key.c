@@ -8,7 +8,6 @@
  */
 
 #include <crypto/aead.h>
-#include <crypto/hash.h>
 #include <linux/workqueue.h>
 
 #include "ovpnpriv.h"
@@ -271,7 +270,6 @@ static void ovpn_refill_future_buffer(struct ovpn_crypto_key_slot *ks,
 	u16 replaced = 0, created = 0, free_slots, i;
 	const struct ovpn_epoch_key *source_key;
 	struct ovpn_epoch_key scratch_key = {};
-	size_t prk_size = OVPN_EPOCH_PRK_SIZE;
 	struct ovpn_future_keys *future_keys;
 	struct ovpn_epoch_key *epoch_key;
 	struct ovpn_key_ctx __rcu **slot;
@@ -304,26 +302,12 @@ static void ovpn_refill_future_buffer(struct ovpn_crypto_key_slot *ks,
 	/* derive new keys without holding the ring lock */
 	scratch_key.cipher_key_len = epoch_key->cipher_key_len;
 	for (created = 0; created < free_slots; created++) {
-		source_key = scratch_key.shash ? &scratch_key : epoch_key;
+		source_key = created ? &scratch_key : epoch_key;
 		ret = ovpn_epoch_derive_next_prk(source_key, next_prk);
 		if (ret)
 			goto err;
 
-		if (!scratch_key.shash) {
-			scratch_key.shash = ovpn_epoch_init_key(next_prk,
-								prk_size);
-			if (IS_ERR(scratch_key.shash)) {
-				ret = PTR_ERR(scratch_key.shash);
-				scratch_key.shash = NULL;
-				goto err;
-			}
-			scratch_key.epoch = epoch_key->epoch + 1;
-		} else {
-			ret = ovpn_epoch_set_prk(&scratch_key, next_prk,
-						 scratch_key.epoch + 1);
-			if (ret)
-				goto err;
-		}
+		ovpn_epoch_set_prk(&scratch_key, next_prk, source_key->epoch + 1);
 
 		new_futures[created] =
 			ovpn_key_ctx_create_epoch(encrypt, ks->alg_name,
@@ -334,9 +318,7 @@ static void ovpn_refill_future_buffer(struct ovpn_crypto_key_slot *ks,
 		}
 	}
 
-	ret = ovpn_epoch_set_prk(epoch_key, next_prk, scratch_key.epoch);
-	if (ret)
-		goto err;
+	ovpn_epoch_set_prk(epoch_key, next_prk, scratch_key.epoch);
 
 	/* insert generated keys under the selected ring lock */
 	spin_lock_bh(lock);
@@ -362,7 +344,7 @@ static void ovpn_refill_future_buffer(struct ovpn_crypto_key_slot *ks,
 	for (i = replaced; i < created; i++)
 		ovpn_key_ctx_put(new_futures[i]);
 
-	crypto_free_shash(scratch_key.shash);
+	memzero_explicit(&scratch_key.prk, sizeof(scratch_key.prk));
 	memzero_explicit(next_prk, sizeof(next_prk));
 
 	/* keep refilling until the ring is full */
@@ -374,8 +356,7 @@ static void ovpn_refill_future_buffer(struct ovpn_crypto_key_slot *ks,
 err:
 	for (i = 0; i < created; i++)
 		ovpn_key_ctx_put(new_futures[i]);
-	if (scratch_key.shash)
-		crypto_free_shash(scratch_key.shash);
+	memzero_explicit(&scratch_key.prk, sizeof(scratch_key.prk));
 	memzero_explicit(next_prk, sizeof(next_prk));
 }
 
@@ -409,10 +390,10 @@ void ovpn_crypto_key_slot_destroy(struct ovpn_crypto_key_slot *ks)
 	ovpn_key_ctx_put(rcu_access_pointer(ks->decrypt));
 
 	if (ks->epoch_format) {
-		if (ks->epoch_key_send.shash)
-			crypto_free_shash(ks->epoch_key_send.shash);
-		if (ks->epoch_key_recv.shash)
-			crypto_free_shash(ks->epoch_key_recv.shash);
+		memzero_explicit(&ks->epoch_key_send.prk,
+				 sizeof(ks->epoch_key_send.prk));
+		memzero_explicit(&ks->epoch_key_recv.prk,
+				 sizeof(ks->epoch_key_recv.prk));
 		ovpn_key_ctx_put(rcu_access_pointer(ks->retiring_key));
 		for (i = 0; i < OVPN_EPOCH_FUTURE_KEYS_COUNT; i++) {
 			future = rcu_access_pointer(ks->future_tx_keys.keys[i]);
@@ -428,17 +409,12 @@ void ovpn_crypto_key_slot_destroy(struct ovpn_crypto_key_slot *ks)
 static int ovpn_epoch_key_init(struct ovpn_epoch_key *epoch_key,
 			       const struct ovpn_epoch_prk *prk)
 {
-	int ret;
-
-	epoch_key->shash = ovpn_epoch_init_key(prk->key, prk->key_size);
-	if (IS_ERR(epoch_key->shash)) {
-		ret = PTR_ERR(epoch_key->shash);
-		epoch_key->shash = NULL;
-		return ret;
-	}
+	if (prk->key_size != OVPN_EPOCH_PRK_SIZE)
+		return -EINVAL;
 
 	/* epoch 0 is reserved for direct keys, so epoch keys start at 1 */
-	epoch_key->epoch = 1;
+	ovpn_epoch_set_prk(epoch_key, prk->key, 1);
+
 	epoch_key->cipher_key_len = prk->cipher_key_len;
 
 	return 0;
