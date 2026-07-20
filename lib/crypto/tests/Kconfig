@@ -52,6 +52,14 @@ config CRYPTO_LIB_GHASH_KUNIT_TEST
 	help
 	  KUnit tests for the GHASH library functions.
 
+config CRYPTO_LIB_HKDF_KUNIT_TEST
+	tristate "KUnit tests for HKDF" if !KUNIT_ALL_TESTS
+	depends on KUNIT && CRYPTO_LIB_SHA256 && CRYPTO_LIB_SHA512
+	default KUNIT_ALL_TESTS
+	help
+	  KUnit tests for the HKDF-SHA256, HKDF-SHA384, and HKDF-SHA512 key
+	  derivation functions.
+
 config CRYPTO_LIB_MD5_KUNIT_TEST
 	tristate "KUnit tests for MD5" if !KUNIT_ALL_TESTS
 	depends on KUNIT && CRYPTO_LIB_MD5
