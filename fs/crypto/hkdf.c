@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Implementation of HKDF ("HMAC-based Extract-and-Expand Key Derivation
- * Function"), aka RFC 5869.  See also the original paper (Krawczyk 2010):
- * "Cryptographic Extraction and Key Derivation: The HKDF Scheme".
+ * Key derivation using HKDF-SHA512.
  *
  * This is used to derive keys from the fscrypt master keys (or from the
  * "software secrets" which hardware derives from the fscrypt master keys, in
@@ -10,6 +8,8 @@
  *
  * Copyright 2019 Google LLC
  */
+
+#include <crypto/hkdf.h>
 
 #include "fscrypt_private.h"
 
@@ -24,19 +24,11 @@
  * HKDF-SHA512 being much faster than HKDF-SHA256, as the longer digest size of
  * SHA-512 causes HKDF-Expand to only need to do one iteration rather than two.
  */
-#define HKDF_HASHLEN		SHA512_DIGEST_SIZE
 
 /*
- * HKDF consists of two steps:
- *
- * 1. HKDF-Extract: extract a pseudorandom key of length HKDF_HASHLEN bytes from
- *    the input keying material and optional salt.
- * 2. HKDF-Expand: expand the pseudorandom key into output keying material of
- *    any length, parameterized by an application-specific info string.
- *
  * HKDF-Extract can be skipped if the input is already a pseudorandom key of
- * length HKDF_HASHLEN bytes.  However, cipher modes other than AES-256-XTS take
- * shorter keys, and we don't want to force users of those modes to provide
+ * length SHA512_DIGEST_SIZE bytes.  However, cipher modes other than AES-256-XTS
+ * take shorter keys, and we don't want to force users of those modes to provide
  * unnecessarily long master keys.  Thus fscrypt still does HKDF-Extract.  No
  * salt is used, since fscrypt master keys should already be pseudorandom and
  * there's no way to persist a random salt per master key from kernel mode.
@@ -50,13 +42,7 @@
 void fscrypt_init_hkdf(struct hmac_sha512_key *hkdf, const u8 *master_key,
 		       unsigned int master_key_size)
 {
-	static const u8 default_salt[HKDF_HASHLEN];
-	u8 prk[HKDF_HASHLEN];
-
-	hmac_sha512_usingrawkey(default_salt, sizeof(default_salt),
-				master_key, master_key_size, prk);
-	hmac_sha512_preparekey(hkdf, prk, sizeof(prk));
-	memzero_explicit(prk, sizeof(prk));
+	hkdf_sha512_extract(hkdf, NULL, 0, master_key, master_key_size);
 }
 
 /*
@@ -73,28 +59,12 @@ void fscrypt_hkdf_expand(const struct hmac_sha512_key *hkdf, u8 context,
 			 const u8 *info, unsigned int infolen,
 			 u8 *okm, unsigned int okmlen)
 {
-	struct hmac_sha512_ctx ctx;
-	u8 counter = 1;
-	u8 tmp[HKDF_HASHLEN];
+	const struct hkdf_seg info_segs[] = {
+		{ .data = "fscrypt\0", .len = 8 },
+		{ .data = &context, .len = 1 },
+		{ .data = info, .len = infolen },
+	};
 
-	WARN_ON_ONCE(okmlen > 255 * HKDF_HASHLEN);
-
-	for (unsigned int i = 0; i < okmlen; i += HKDF_HASHLEN) {
-		hmac_sha512_init(&ctx, hkdf);
-		if (i != 0)
-			hmac_sha512_update(&ctx, &okm[i - HKDF_HASHLEN],
-					   HKDF_HASHLEN);
-		hmac_sha512_update(&ctx, "fscrypt\0", 8);
-		hmac_sha512_update(&ctx, &context, 1);
-		hmac_sha512_update(&ctx, info, infolen);
-		hmac_sha512_update(&ctx, &counter, 1);
-		if (okmlen - i < HKDF_HASHLEN) {
-			hmac_sha512_final(&ctx, tmp);
-			memcpy(&okm[i], tmp, okmlen - i);
-			memzero_explicit(tmp, sizeof(tmp));
-		} else {
-			hmac_sha512_final(&ctx, &okm[i]);
-		}
-		counter++;
-	}
+	hkdf_sha512_expand(hkdf, info_segs, ARRAY_SIZE(info_segs),
+			   okm, okmlen);
 }
