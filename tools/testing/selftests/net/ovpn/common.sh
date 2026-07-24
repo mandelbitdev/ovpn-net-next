@@ -221,7 +221,7 @@ ovpn_add_peer() {
 				${OVPN_UDP_PEERS_FILE}
 
 			for p in $(seq 1 ${OVPN_NUM_PEERS}); do
-				ip netns exec "${server_ns}" ${OVPN_CLI} \
+				"${OVPN_CLI}" -n "${server_ns}" \
 					new_key tun0 ${p} 1 0 ${OVPN_ALG} 0 \
 					data64.key
 			done
@@ -244,7 +244,7 @@ ovpn_add_peer() {
 			ip netns exec "${peer_ns}" ${OVPN_CLI} new_peer \
 				tun${1} ${PEER_ID} ${TX_ID} ${LPORT} ${RADDR} \
 				${RPORT}
-			ip netns exec "${peer_ns}" ${OVPN_CLI} new_key tun${1} \
+			"${OVPN_CLI}" -n "${peer_ns}" new_key tun${1} \
 				${PEER_ID} 1 0 ${OVPN_ALG} 1 data64.key
 		fi
 	else
@@ -252,8 +252,8 @@ ovpn_add_peer() {
 			(ip netns exec "${server_ns}" ${OVPN_CLI} listen tun0 \
 				1 ${M_ID} ${OVPN_TCP_PEERS_FILE} && {
 				for p in $(seq 1 ${OVPN_NUM_PEERS}); do
-					ip netns exec "${server_ns}" \
-						${OVPN_CLI} new_key tun0 ${p} \
+					"${OVPN_CLI}" -n "${server_ns}" \
+						new_key tun0 ${p} \
 						1 0 ${OVPN_ALG} 0 data64.key
 				done
 			}) &

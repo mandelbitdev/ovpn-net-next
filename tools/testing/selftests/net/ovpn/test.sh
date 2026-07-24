@@ -48,10 +48,10 @@ ovpn_prepare_network() {
 	for p in $(seq 1 ${OVPN_NUM_PEERS}); do
 		peer_ns="ovpn_peer${p}"
 		ovpn_cmd_ok "set peer0 timeout for peer ${p}" \
-			ip netns exec ovpn_peer0 ${OVPN_CLI} set_peer tun0 \
+			"${OVPN_CLI}" -n ovpn_peer0 set_peer tun0 \
 				${p} 60 120
 		ovpn_cmd_ok "set peer${p} timeout for peer ${p}" \
-			ip netns exec "${peer_ns}" ${OVPN_CLI} set_peer \
+			"${OVPN_CLI}" -n "${peer_ns}" set_peer \
 				tun${p} $((p + OVPN_ID_OFFSET)) 60 120
 	done
 }
@@ -151,14 +151,14 @@ ovpn_run_key_rollover() {
 	for p in $(seq 1 ${OVPN_NUM_PEERS}); do
 		peer_ns="ovpn_peer${p}"
 		ovpn_cmd_ok "add secondary key on peer0 for peer ${p}" \
-			ip netns exec ovpn_peer0 ${OVPN_CLI} new_key tun0 \
+			"${OVPN_CLI}" -n ovpn_peer0 new_key tun0 \
 				${p} 2 1 ${OVPN_ALG} 0 data64.key
 		ovpn_cmd_ok "add secondary key on peer${p} for peer ${p}" \
-			ip netns exec "${peer_ns}" ${OVPN_CLI} new_key tun${p} \
+			"${OVPN_CLI}" -n "${peer_ns}" new_key tun${p} \
 				$((p + OVPN_ID_OFFSET)) 2 1 ${OVPN_ALG} 1 \
 				data64.key
 		ovpn_cmd_ok "swap keys on peer${p}" \
-			ip netns exec "${peer_ns}" ${OVPN_CLI} swap_keys \
+			"${OVPN_CLI}" -n "${peer_ns}" swap_keys \
 				tun${p} $((p + OVPN_ID_OFFSET))
 	done
 }
@@ -166,22 +166,22 @@ ovpn_run_key_rollover() {
 ovpn_run_queries() {
 	ovpn_log "Querying all peers:"
 
-	ovpn_cmd_ok "query all peers from peer0" \
-		ip netns exec ovpn_peer0 ${OVPN_CLI} get_peer tun0
-	ovpn_cmd_ok "query all peers from peer1" \
-		ip netns exec ovpn_peer1 ${OVPN_CLI} get_peer tun1
+	ovpn_cmd_ok "query all peers on peer0" \
+		"${OVPN_CLI}" -n ovpn_peer0 get_peer tun0
+	ovpn_cmd_ok "query all peers on peer1" \
+		"${OVPN_CLI}" -n ovpn_peer1 get_peer tun1
 
 	ovpn_log "Querying peer 1:"
 
-	ovpn_cmd_ok "query peer 1 from peer0" \
-		ip netns exec ovpn_peer0 ${OVPN_CLI} get_peer tun0 1
+	ovpn_cmd_ok "query peer 1 on peer0" \
+		"${OVPN_CLI}" -n ovpn_peer0 get_peer tun0 1
 }
 
 ovpn_query_peer_missing() {
 	ovpn_log "Querying non-existent peer 20:"
 
 	ovpn_cmd_fail "query missing peer 20 on peer0" \
-		ip netns exec ovpn_peer0 ${OVPN_CLI} get_peer tun0 20
+		"${OVPN_CLI}" -n ovpn_peer0 get_peer tun0 20
 }
 
 ovpn_run_peer_cleanup() {
@@ -191,9 +191,9 @@ ovpn_run_peer_cleanup() {
 	ovpn_log "Deleting peer 1:"
 
 	ovpn_cmd_ok "delete peer1 on peer0" \
-		ip netns exec ovpn_peer0 ${OVPN_CLI} del_peer tun0 1
+		"${OVPN_CLI}" -n ovpn_peer0 del_peer tun0 1
 	ovpn_cmd_ok "delete peer1 on peer1" \
-		ip netns exec ovpn_peer1 ${OVPN_CLI} del_peer tun1 \
+		"${OVPN_CLI}" -n ovpn_peer1 del_peer tun1 \
 			$((1 + OVPN_ID_OFFSET))
 
 	ovpn_log "Querying keys:"
@@ -201,10 +201,10 @@ ovpn_run_peer_cleanup() {
 	for p in $(seq 2 ${OVPN_NUM_PEERS}); do
 		peer_ns="ovpn_peer${p}"
 		ovpn_cmd_ok "query peer${p} key 1" \
-			ip netns exec "${peer_ns}" ${OVPN_CLI} get_key tun${p} \
+			"${OVPN_CLI}" -n "${peer_ns}" get_key tun${p} \
 				$((p + OVPN_ID_OFFSET)) 1
 		ovpn_cmd_ok "query peer${p} key 2" \
-			ip netns exec "${peer_ns}" ${OVPN_CLI} get_key tun${p} \
+			"${OVPN_CLI}" -n "${peer_ns}" get_key tun${p} \
 				$((p + OVPN_ID_OFFSET)) 2
 	done
 }
@@ -217,16 +217,16 @@ ovpn_run_traffic_delete_peer() {
 	ovpn_run_bg ping_pid ip netns exec ovpn_peer2 ping -qf -w 4 5.5.5.1
 	sleep 2
 	ovpn_cmd_ok "delete peer0 peer 2" \
-		ip netns exec ovpn_peer0 ${OVPN_CLI} del_peer tun0 2
+		"${OVPN_CLI}" -n ovpn_peer0 del_peer tun0 2
 
 	if [ "${OVPN_PROTO}" == "TCP" ]; then
 		# In TCP mode this command is expected to fail for both peers.
 		ovpn_cmd_mayfail "delete peer2 peer 2 (TCP non-fatal)" \
-			ip netns exec ovpn_peer2 ${OVPN_CLI} del_peer tun2 \
+			"${OVPN_CLI}" -n ovpn_peer2 del_peer tun2 \
 				$((2 + OVPN_ID_OFFSET))
 	else
-		ovpn_cmd_ok "delete peer2 peer 2" ip netns exec ovpn_peer2 \
-			${OVPN_CLI} del_peer tun2 $((2 + OVPN_ID_OFFSET))
+		ovpn_cmd_ok "delete peer2 peer 2" "${OVPN_CLI}" -n ovpn_peer2 \
+			del_peer tun2 $((2 + OVPN_ID_OFFSET))
 	fi
 
 	wait "${ping_pid}" || true
@@ -241,10 +241,10 @@ ovpn_run_key_cleanup() {
 	for p in $(seq 3 ${OVPN_NUM_PEERS}); do
 		peer_ns="ovpn_peer${p}"
 		ovpn_cmd_ok "delete key 1 for peer${p}" \
-			ip netns exec "${peer_ns}" ${OVPN_CLI} del_key tun${p} \
+			"${OVPN_CLI}" -n "${peer_ns}" del_key tun${p} \
 				$((p + OVPN_ID_OFFSET)) 1
 		ovpn_cmd_ok "delete key 2 for peer${p}" \
-			ip netns exec "${peer_ns}" ${OVPN_CLI} del_key tun${p} \
+			"${OVPN_CLI}" -n "${peer_ns}" del_key tun${p} \
 				$((p + OVPN_ID_OFFSET)) 2
 	done
 }
@@ -258,11 +258,11 @@ ovpn_run_timeouts() {
 	for p in $(seq 3 ${OVPN_NUM_PEERS}); do
 		# Non-fatal: this may fail in some protocol modes.
 		ovpn_cmd_mayfail "set peer0 timeout for peer ${p} (non-fatal)" \
-			ip netns exec ovpn_peer0 ${OVPN_CLI} set_peer tun0 \
+			"${OVPN_CLI}" -n ovpn_peer0 set_peer tun0 \
 				${p} 3 3
 		peer_ns="ovpn_peer${p}"
 		ovpn_cmd_ok "disable timeout on peer${p} while peer0 adjusts \
-			state" ip netns exec "${peer_ns}" ${OVPN_CLI} set_peer \
+			state" "${OVPN_CLI}" -n "${peer_ns}" set_peer \
 			tun${p} $((p + OVPN_ID_OFFSET)) 0 0
 	done
 	# wait for peers to timeout
@@ -273,7 +273,7 @@ ovpn_run_timeouts() {
 	for p in $(seq 3 ${OVPN_NUM_PEERS}); do
 		peer_ns="ovpn_peer${p}"
 		ovpn_cmd_ok "set peer${p} P2P timeout" \
-			ip netns exec "${peer_ns}" ${OVPN_CLI} set_peer \
+			"${OVPN_CLI}" -n "${peer_ns}" set_peer \
 				tun${p} $((p + OVPN_ID_OFFSET)) 3 3
 	done
 	sleep 5
