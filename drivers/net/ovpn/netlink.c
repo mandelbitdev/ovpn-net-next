@@ -9,6 +9,7 @@
 #include <linux/netdevice.h>
 #include <linux/types.h>
 #include <net/genetlink.h>
+#include <net/rtnetlink.h>
 
 #include <uapi/linux/ovpn.h>
 
@@ -26,24 +27,44 @@ MODULE_ALIAS_GENL_FAMILY(OVPN_FAMILY_NAME);
 /**
  * ovpn_get_dev_from_attrs - retrieve the ovpn private data from the netdevice
  *			     a netlink message is targeting
- * @net: network namespace where to look for the interface
+ * @sk: requesting netlink socket
  * @info: generic netlink info from the user request
  * @tracker: tracker object to be used for the netdev reference acquisition
  *
  * Return: the ovpn private data, if found, or an error otherwise
  */
 static struct ovpn_priv *
-ovpn_get_dev_from_attrs(struct net *net, const struct genl_info *info,
+ovpn_get_dev_from_attrs(struct sock *sk, const struct genl_info *info,
 			netdevice_tracker *tracker)
 {
+	struct net *target_net = NULL;
+	struct net *net = sock_net(sk);
 	struct ovpn_priv *ovpn;
 	struct net_device *dev;
-	int ifindex;
+	int ifindex, target_id;
 
 	if (GENL_REQ_ATTR_CHECK(info, OVPN_A_IFINDEX))
 		return ERR_PTR(-EINVAL);
 
 	ifindex = nla_get_u32(info->attrs[OVPN_A_IFINDEX]);
+
+	if (info->attrs[OVPN_A_TARGET_NETNSID]) {
+		/* Target netns IDs are relative to the requesting Netlink socket */
+		target_id = nla_get_s32(info->attrs[OVPN_A_TARGET_NETNSID]);
+		target_net = rtnl_get_net_ns_capable(sk, target_id);
+		if (IS_ERR(target_net)) {
+			if (PTR_ERR(target_net) == -EACCES)
+				NL_SET_ERR_MSG_MOD(info->extack,
+						   "insufficient permission for target network namespace");
+			else
+				NL_SET_ERR_MSG_MOD(info->extack,
+						   "invalid target network namespace ID");
+			NL_SET_BAD_ATTR(info->extack,
+					info->attrs[OVPN_A_TARGET_NETNSID]);
+			return ERR_CAST(target_net);
+		}
+		net = target_net;
+	}
 
 	rcu_read_lock();
 	dev = dev_get_by_index_rcu(net, ifindex);
@@ -51,6 +72,7 @@ ovpn_get_dev_from_attrs(struct net *net, const struct genl_info *info,
 		rcu_read_unlock();
 		NL_SET_ERR_MSG_MOD(info->extack,
 				   "ifindex does not match any interface");
+		put_net(target_net);
 		return ERR_PTR(-ENODEV);
 	}
 
@@ -59,12 +81,14 @@ ovpn_get_dev_from_attrs(struct net *net, const struct genl_info *info,
 		NL_SET_ERR_MSG_MOD(info->extack,
 				   "specified interface is not ovpn");
 		NL_SET_BAD_ATTR(info->extack, info->attrs[OVPN_A_IFINDEX]);
+		put_net(target_net);
 		return ERR_PTR(-EINVAL);
 	}
 
 	ovpn = netdev_priv(dev);
 	netdev_hold(dev, tracker, GFP_ATOMIC);
 	rcu_read_unlock();
+	put_net(target_net);
 
 	return ovpn;
 }
@@ -73,7 +97,7 @@ int ovpn_nl_pre_doit(const struct genl_split_ops *ops, struct sk_buff *skb,
 		     struct genl_info *info)
 {
 	netdevice_tracker *tracker = (netdevice_tracker *)&info->user_ptr[1];
-	struct ovpn_priv *ovpn = ovpn_get_dev_from_attrs(genl_info_net(info),
+	struct ovpn_priv *ovpn = ovpn_get_dev_from_attrs(NETLINK_CB(skb).sk,
 							 info, tracker);
 
 	if (IS_ERR(ovpn))
@@ -738,7 +762,7 @@ int ovpn_nl_peer_get_dumpit(struct sk_buff *skb, struct netlink_callback *cb)
 	struct ovpn_priv *ovpn;
 	struct ovpn_peer *peer;
 
-	ovpn = ovpn_get_dev_from_attrs(sock_net(cb->skb->sk), info, &tracker);
+	ovpn = ovpn_get_dev_from_attrs(NETLINK_CB(cb->skb).sk, info, &tracker);
 	if (IS_ERR(ovpn))
 		return PTR_ERR(ovpn);
 
