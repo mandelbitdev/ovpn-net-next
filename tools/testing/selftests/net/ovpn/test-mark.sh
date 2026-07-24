@@ -42,7 +42,7 @@ ovpn_mark_prepare_network() {
 			ASYMM "${OVPN_UDP_PEERS_FILE}" "${MARK}"
 	for p in $(seq 1 3); do
 		ovpn_cmd_ok "install server key for peer ${p}" \
-			ip netns exec ovpn_peer0 "${OVPN_CLI}" new_key tun0 \
+			"${OVPN_CLI}" -n ovpn_peer0 new_key tun0 \
 				"${p}" 1 0 "${OVPN_ALG}" 0 data64.key
 	done
 
@@ -53,10 +53,10 @@ ovpn_mark_prepare_network() {
 	for p in $(seq 1 3); do
 		peer_ns="ovpn_peer${p}"
 		ovpn_cmd_ok "set peer0 timeout for peer ${p}" \
-			ip netns exec ovpn_peer0 "${OVPN_CLI}" set_peer tun0 \
+			"${OVPN_CLI}" -n ovpn_peer0 set_peer tun0 \
 				"${p}" 60 120
 		ovpn_cmd_ok "set peer${p} timeout for peer ${p}" \
-			ip netns exec "${peer_ns}" "${OVPN_CLI}" set_peer \
+			"${OVPN_CLI}" -n "${peer_ns}" set_peer \
 				tun"${p}" $((p + OVPN_ID_OFFSET)) 60 120
 	done
 }

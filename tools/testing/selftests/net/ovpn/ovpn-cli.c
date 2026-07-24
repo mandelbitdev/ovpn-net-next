@@ -6,6 +6,7 @@
  *  Author:	Antonio Quartulli <antonio@openvpn.net>
  */
 
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <inttypes.h>
@@ -21,6 +22,7 @@
 #include <linux/ovpn.h>
 #include <linux/types.h>
 #include <linux/netlink.h>
+#include <linux/net_namespace.h>
 
 #include <netlink/socket.h>
 #include <netlink/netlink.h>
@@ -121,6 +123,8 @@ struct ovpn_ctx {
 
 	unsigned int ifindex;
 	char ifname[IFNAMSIZ];
+	const char *target_netns_name;
+	int target_netnsid;
 	enum ovpn_mode mode;
 	bool mode_set;
 
@@ -223,6 +227,10 @@ static struct nl_ctx *nl_ctx_alloc_flags(struct ovpn_ctx *ovpn, int cmd,
 
 	if (ovpn->ifindex > 0)
 		NLA_PUT_U32(ctx->nl_msg, OVPN_A_IFINDEX, ovpn->ifindex);
+
+	if (ovpn->target_netnsid >= 0)
+		NLA_PUT_S32(ctx->nl_msg, OVPN_A_TARGET_NETNSID,
+			    ovpn->target_netnsid);
 
 	return ctx;
 nla_put_failure:
@@ -1365,11 +1373,195 @@ out:
 	return ret;
 }
 
+static int ovpn_parse_netnsid(struct nlmsghdr *msg, void *arg)
+{
+	struct rtgenmsg *gen;
+	struct rtattr *attr;
+	int len;
+
+	if (msg->nlmsg_type != RTM_NEWNSID ||
+	    msg->nlmsg_len < NLMSG_LENGTH(sizeof(*gen)))
+		return -EINVAL;
+
+	gen = NLMSG_DATA(msg);
+	len = NLMSG_PAYLOAD(msg, sizeof(*gen));
+	attr = (struct rtattr *)((char *)gen + NLMSG_ALIGN(sizeof(*gen)));
+
+	for (; RTA_OK(attr, len); attr = RTA_NEXT(attr, len)) {
+		if (attr->rta_type != NETNSA_NSID)
+			continue;
+
+		if (RTA_PAYLOAD(attr) < sizeof(int32_t))
+			return -EINVAL;
+
+		memcpy(arg, RTA_DATA(attr), sizeof(int32_t));
+		return 0;
+	}
+
+	return -ENOENT;
+}
+
+struct ovpn_netns_req {
+	struct nlmsghdr n;
+	struct rtgenmsg g;
+	char buf[64];
+};
+
+static int ovpn_get_netnsid(int netns_fd, int *netnsid)
+{
+	struct ovpn_netns_req req = { 0 };
+	uint32_t fd = netns_fd;
+
+	req.n.nlmsg_len = NLMSG_LENGTH(sizeof(req.g));
+	req.n.nlmsg_flags = NLM_F_REQUEST;
+	req.n.nlmsg_type = RTM_GETNSID;
+	req.g.rtgen_family = AF_UNSPEC;
+
+	if (ovpn_addattr(&req.n, sizeof(req), NETNSA_FD, &fd,
+			 sizeof(fd)) < 0)
+		return -EMSGSIZE;
+
+	*netnsid = NETNSA_NSID_NOT_ASSIGNED;
+	return ovpn_rt_send(&req.n, 0, 0, ovpn_parse_netnsid, netnsid);
+}
+
+static int ovpn_assign_netnsid(int netns_fd)
+{
+	/* NETNSA_NSID_NOT_ASSIGNED asks the kernel to allocate an NSID. */
+	int32_t netnsid = NETNSA_NSID_NOT_ASSIGNED;
+	struct ovpn_netns_req req = { 0 };
+	uint32_t fd = netns_fd;
+
+	req.n.nlmsg_len = NLMSG_LENGTH(sizeof(req.g));
+	req.n.nlmsg_flags = NLM_F_REQUEST;
+	req.n.nlmsg_type = RTM_NEWNSID;
+	req.g.rtgen_family = AF_UNSPEC;
+
+	if (ovpn_addattr(&req.n, sizeof(req), NETNSA_NSID, &netnsid,
+			 sizeof(netnsid)) < 0 ||
+	    ovpn_addattr(&req.n, sizeof(req), NETNSA_FD, &fd,
+			 sizeof(fd)) < 0)
+		return -EMSGSIZE;
+
+	return ovpn_rt_send(&req.n, 0, 0, NULL, NULL);
+}
+
+/* Get the target NSID relative to the current netns, assigning one if necessary. */
+static int ovpn_get_or_assign_netnsid(int netns_fd)
+{
+	int netnsid, ret;
+
+	ret = ovpn_get_netnsid(netns_fd, &netnsid);
+	if (ret < 0)
+		return ret;
+
+	if (netnsid >= 0)
+		return netnsid;
+
+	ret = ovpn_assign_netnsid(netns_fd);
+	if (ret < 0 && ret != -EEXIST)
+		return ret;
+
+	ret = ovpn_get_netnsid(netns_fd, &netnsid);
+	if (ret < 0)
+		return ret;
+
+	if (netnsid < 0)
+		return -ENOENT;
+
+	return netnsid;
+}
+
+static int ovpn_parse_ifindex(struct nlmsghdr *msg, void *arg)
+{
+	struct ifinfomsg *ifinfo;
+
+	if (msg->nlmsg_type != RTM_NEWLINK ||
+	    msg->nlmsg_len < NLMSG_LENGTH(sizeof(*ifinfo)))
+		return -EINVAL;
+
+	ifinfo = NLMSG_DATA(msg);
+	if (ifinfo->ifi_index <= 0)
+		return -EINVAL;
+
+	*(unsigned int *)arg = ifinfo->ifi_index;
+
+	return 0;
+}
+
 struct ovpn_link_req {
 	struct nlmsghdr n;
 	struct ifinfomsg i;
 	char buf[256];
 };
+
+static int ovpn_get_ifindex(int netnsid, const char *ifname,
+			    unsigned int *ifindex)
+{
+	struct ovpn_link_req req = { 0 };
+	int32_t id = netnsid;
+
+	req.n.nlmsg_len = NLMSG_LENGTH(sizeof(req.i));
+	req.n.nlmsg_flags = NLM_F_REQUEST;
+	req.n.nlmsg_type = RTM_GETLINK;
+	req.i.ifi_family = AF_UNSPEC;
+
+	if (ovpn_addattr(&req.n, sizeof(req), IFLA_TARGET_NETNSID, &id,
+			 sizeof(id)) < 0 ||
+	    ovpn_addattr(&req.n, sizeof(req), IFLA_IFNAME, ifname,
+			 strlen(ifname) + 1) < 0)
+		return -EMSGSIZE;
+
+	return ovpn_rt_send(&req.n, 0, 0, ovpn_parse_ifindex, ifindex);
+}
+
+#define NETNS_RUN_DIR "/var/run/netns"
+
+static int ovpn_resolve_netns(struct ovpn_ctx *ovpn)
+{
+	int target_fd, ret;
+	char path[PATH_MAX];
+	int len;
+
+	if (!ovpn->target_netns_name[0] ||
+	    strchr(ovpn->target_netns_name, '/')) {
+		fprintf(stderr, "invalid network namespace name: %s\n",
+			ovpn->target_netns_name);
+		return -EINVAL;
+	}
+
+	len = snprintf(path, sizeof(path), "%s/%s", NETNS_RUN_DIR,
+		       ovpn->target_netns_name);
+	if (len < 0 || len >= (int)sizeof(path))
+		return -ENAMETOOLONG;
+
+	target_fd = open(path, O_RDONLY);
+	if (target_fd < 0) {
+		ret = errno;
+		fprintf(stderr, "cannot open network namespace %s: %s\n",
+			ovpn->target_netns_name, strerror(ret));
+		return -ret;
+	}
+
+	ovpn->target_netnsid = ovpn_get_or_assign_netnsid(target_fd);
+	if (ovpn->target_netnsid < 0) {
+		ret = ovpn->target_netnsid;
+		fprintf(stderr, "cannot resolve network namespace ID for %s\n",
+			ovpn->target_netns_name);
+		goto out;
+	}
+
+	ret = ovpn_get_ifindex(ovpn->target_netnsid, ovpn->ifname,
+			       &ovpn->ifindex);
+	if (ret < 0) {
+		fprintf(stderr, "cannot find interface %s in namespace %s\n",
+			ovpn->ifname, ovpn->target_netns_name);
+	}
+out:
+	close(target_fd);
+
+	return ret;
+}
 
 static int ovpn_new_iface(struct ovpn_ctx *ovpn)
 {
@@ -1662,8 +1854,10 @@ err_free:
 static void usage(const char *cmd)
 {
 	fprintf(stderr,
-		"Usage %s <command> <iface> [arguments..]\n",
+		"Usage %s [-n <netns>] <command> <iface> [arguments..]\n",
 		cmd);
+	fprintf(stderr,
+		"\t-n netns: run peer/key operations on an interface in the named network namespace\n");
 	fprintf(stderr, "where <command> can be one of the following\n\n");
 
 	fprintf(stderr, "* new_iface <iface> [mode]: create new ovpn interface\n");
@@ -1968,6 +2162,26 @@ static enum ovpn_cmd ovpn_parse_cmd(const char *cmd)
 	return CMD_INVALID;
 }
 
+static bool ovpn_cmd_supports_target_netns(enum ovpn_cmd cmd)
+{
+	switch (cmd) {
+	case CMD_LISTEN:
+	case CMD_CONNECT:
+	case CMD_NEW_PEER:
+	case CMD_NEW_MULTI_PEER:
+	case CMD_SET_PEER:
+	case CMD_DEL_PEER:
+	case CMD_GET_PEER:
+	case CMD_NEW_KEY:
+	case CMD_DEL_KEY:
+	case CMD_GET_KEY:
+	case CMD_SWAP_KEYS:
+		return true;
+	default:
+		return false;
+	}
+}
+
 /* Send process to background and waits for signal.
  *
  * This helper is called at the end of commands
@@ -2023,6 +2237,7 @@ static int ovpn_run_cmd(struct ovpn_ctx *ovpn)
 			}
 
 			peer_ctx.ifindex = ovpn->ifindex;
+			peer_ctx.target_netnsid = ovpn->target_netnsid;
 			peer_ctx.sa_family = ovpn->sa_family;
 			peer_ctx.asymm_id = ovpn->asymm_id;
 
@@ -2109,6 +2324,7 @@ static int ovpn_run_cmd(struct ovpn_ctx *ovpn)
 			struct ovpn_ctx peer_ctx = { 0 };
 
 			peer_ctx.ifindex = ovpn->ifindex;
+			peer_ctx.target_netnsid = ovpn->target_netnsid;
 			peer_ctx.socket = ovpn->socket;
 			peer_ctx.sa_family = AF_UNSPEC;
 			peer_ctx.asymm_id = ovpn->asymm_id;
@@ -2181,13 +2397,19 @@ static int ovpn_parse_cmd_args(struct ovpn_ctx *ovpn, int argc, char *argv[])
 	strscpy(ovpn->ifname, argv[2], IFNAMSIZ - 1);
 	ovpn->ifname[IFNAMSIZ - 1] = '\0';
 
-	/* all commands, except NEW_IFNAME, needs an ifindex */
+	/* all commands, except NEW_IFACE, need an ifindex */
 	if (ovpn->cmd != CMD_NEW_IFACE) {
-		ovpn->ifindex = if_nametoindex(ovpn->ifname);
-		if (!ovpn->ifindex) {
-			fprintf(stderr, "cannot find interface: %s\n",
-				strerror(errno));
-			return -1;
+		if (ovpn->target_netns_name) {
+			ret = ovpn_resolve_netns(ovpn);
+			if (ret < 0)
+				return ret;
+		} else {
+			ovpn->ifindex = if_nametoindex(ovpn->ifname);
+			if (!ovpn->ifindex) {
+				fprintf(stderr, "cannot find interface: %s\n",
+					strerror(errno));
+				return -1;
+			}
 		}
 	}
 
@@ -2434,29 +2656,51 @@ static int ovpn_parse_cmd_args(struct ovpn_ctx *ovpn, int argc, char *argv[])
 int main(int argc, char *argv[])
 {
 	struct ovpn_ctx ovpn;
+	const char *program = argv[0];
 	int ret;
 
+	memset(&ovpn, 0, sizeof(ovpn));
+	if (argc > 1 && !strcmp(argv[1], "-n")) {
+		if (argc < 4) {
+			fprintf(stderr,
+				"Error: -n requires a namespace and a command.\n\n");
+			usage(program);
+			return -EINVAL;
+		}
+
+		ovpn.target_netns_name = argv[2];
+		argc -= 2;
+		argv += 2;
+	}
+
 	if (argc < 2) {
-		usage(argv[0]);
+		usage(program);
 		return -1;
 	}
 
-	memset(&ovpn, 0, sizeof(ovpn));
+	ovpn.target_netnsid = NETNSA_NSID_NOT_ASSIGNED;
 	ovpn.sa_family = AF_UNSPEC;
 	ovpn.cipher = OVPN_CIPHER_ALG_NONE;
 
 	ovpn.cmd = ovpn_parse_cmd(argv[1]);
 	if (ovpn.cmd == CMD_INVALID) {
 		fprintf(stderr, "Error: unknown command.\n\n");
-		usage(argv[0]);
+		usage(program);
 		return -1;
+	}
+
+	if (ovpn.target_netns_name &&
+	    !ovpn_cmd_supports_target_netns(ovpn.cmd)) {
+		fprintf(stderr, "Error: -n is not supported for command %s.\n",
+			argv[1]);
+		return -EOPNOTSUPP;
 	}
 
 	ret = ovpn_parse_cmd_args(&ovpn, argc, argv);
 	if (ret < 0) {
 		fprintf(stderr, "Error: invalid arguments.\n\n");
 		if (ret == -EINVAL)
-			usage(argv[0]);
+			usage(program);
 		return ret;
 	}
 
