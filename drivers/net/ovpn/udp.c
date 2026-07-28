@@ -147,7 +147,10 @@ static int ovpn_udp4_output(struct ovpn_peer *peer, struct ovpn_bind *bind,
 {
 	struct rtable *rt;
 	struct flowi4 fl = {
-		.saddr = bind->local.ipv4.s_addr,
+		/* bind->local is updated in place under peer->lock; a single
+		 * aligned word is read/written atomically via {READ,WRITE}_ONCE
+		 */
+		.saddr = READ_ONCE(bind->local.ipv4.s_addr),
 		.daddr = bind->remote.in4.sin_addr.s_addr,
 		.fl4_sport = inet_sk(sk)->inet_sport,
 		.fl4_dport = bind->remote.in4.sin_port,
@@ -169,7 +172,7 @@ static int ovpn_udp4_output(struct ovpn_peer *peer, struct ovpn_bind *bind,
 		 */
 		fl.saddr = 0;
 		spin_lock_bh(&peer->lock);
-		bind->local.ipv4.s_addr = 0;
+		WRITE_ONCE(bind->local.ipv4.s_addr, 0);
 		spin_unlock_bh(&peer->lock);
 		dst_cache_reset(cache);
 	}
@@ -178,7 +181,7 @@ static int ovpn_udp4_output(struct ovpn_peer *peer, struct ovpn_bind *bind,
 	if (IS_ERR(rt) && PTR_ERR(rt) == -EINVAL) {
 		fl.saddr = 0;
 		spin_lock_bh(&peer->lock);
-		bind->local.ipv4.s_addr = 0;
+		WRITE_ONCE(bind->local.ipv4.s_addr, 0);
 		spin_unlock_bh(&peer->lock);
 		dst_cache_reset(cache);
 
@@ -224,7 +227,6 @@ static int ovpn_udp6_output(struct ovpn_peer *peer, struct ovpn_bind *bind,
 	int ret;
 
 	struct flowi6 fl = {
-		.saddr = bind->local.ipv6,
 		.daddr = bind->remote.in6.sin6_addr,
 		.fl6_sport = inet_sk(sk)->inet_sport,
 		.fl6_dport = bind->remote.in6.sin6_port,
@@ -232,6 +234,11 @@ static int ovpn_udp6_output(struct ovpn_peer *peer, struct ovpn_bind *bind,
 		.flowi6_mark = sk->sk_mark,
 		.flowi6_oif = bind->remote.in6.sin6_scope_id,
 	};
+
+	/* bind->local is updated in place under peer->lock; read the 128-bit
+	 * address under the peer seqcount to avoid a torn read
+	 */
+	ovpn_peer_local_ipv6(peer, bind, &fl.saddr);
 
 	local_bh_disable();
 	dst = dst_cache_get_ip6(cache, &fl.saddr);
@@ -245,7 +252,9 @@ static int ovpn_udp6_output(struct ovpn_peer *peer, struct ovpn_bind *bind,
 		 */
 		fl.saddr = in6addr_any;
 		spin_lock_bh(&peer->lock);
+		write_seqcount_begin(&peer->bind_local_seq);
 		bind->local.ipv6 = in6addr_any;
+		write_seqcount_end(&peer->bind_local_seq);
 		spin_unlock_bh(&peer->lock);
 		dst_cache_reset(cache);
 	}

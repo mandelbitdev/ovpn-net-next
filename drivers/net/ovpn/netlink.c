@@ -610,14 +610,23 @@ static int ovpn_nl_send_peer(struct sk_buff *skb, const struct genl_info *info,
 	bind = rcu_dereference(peer->bind);
 	if (bind) {
 		if (bind->remote.in4.sin_family == AF_INET) {
+			/* bind->local is updated in place under peer->lock;
+			 * READ_ONCE() pairs with the WRITE_ONCE() updaters
+			 */
 			if (nla_put_in_addr(skb, OVPN_A_PEER_REMOTE_IPV4,
 					    bind->remote.in4.sin_addr.s_addr) ||
 			    nla_put_net16(skb, OVPN_A_PEER_REMOTE_PORT,
 					  bind->remote.in4.sin_port) ||
 			    nla_put_in_addr(skb, OVPN_A_PEER_LOCAL_IPV4,
-					    bind->local.ipv4.s_addr))
+					    READ_ONCE(bind->local.ipv4.s_addr)))
 				goto err_unlock;
 		} else if (bind->remote.in4.sin_family == AF_INET6) {
+			struct in6_addr local_ipv6;
+
+			/* read the 128-bit local address under the peer
+			 * seqcount to avoid a torn read
+			 */
+			ovpn_peer_local_ipv6(peer, bind, &local_ipv6);
 			if (nla_put_in6_addr(skb, OVPN_A_PEER_REMOTE_IPV6,
 					     &bind->remote.in6.sin6_addr) ||
 			    nla_put_u32(skb, OVPN_A_PEER_REMOTE_IPV6_SCOPE_ID,
@@ -625,7 +634,7 @@ static int ovpn_nl_send_peer(struct sk_buff *skb, const struct genl_info *info,
 			    nla_put_net16(skb, OVPN_A_PEER_REMOTE_PORT,
 					  bind->remote.in6.sin6_port) ||
 			    nla_put_in6_addr(skb, OVPN_A_PEER_LOCAL_IPV6,
-					     &bind->local.ipv6))
+					     &local_ipv6))
 				goto err_unlock;
 		}
 	}

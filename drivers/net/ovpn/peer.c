@@ -113,6 +113,7 @@ struct ovpn_peer *ovpn_peer_new(struct ovpn_priv *ovpn, u32 id)
 	RCU_INIT_POINTER(peer->bind, NULL);
 	ovpn_crypto_state_init(&peer->crypto);
 	spin_lock_init(&peer->lock);
+	seqcount_spinlock_init(&peer->bind_local_seq, &peer->lock);
 	kref_init(&peer->refcount);
 	ovpn_peer_stats_init(&peer->vpn_stats);
 	ovpn_peer_stats_init(&peer->link_stats);
@@ -174,6 +175,27 @@ int ovpn_peer_reset_sockaddr(struct ovpn_peer *peer,
 	ovpn_bind_reset(peer, bind);
 
 	return 0;
+}
+
+/**
+ * ovpn_peer_local_ipv6 - read the cached local IPv6 endpoint of a peer
+ * @peer: the peer owning the binding
+ * @bind: the binding to read the local address from
+ * @dst: where the local IPv6 address is copied to
+ *
+ * bind->local is updated in place under peer->lock (TX error path and RX
+ * float path). Read the 128-bit address under the peer seqcount so that
+ * lockless readers never observe a torn value.
+ */
+void ovpn_peer_local_ipv6(const struct ovpn_peer *peer,
+			  const struct ovpn_bind *bind, struct in6_addr *dst)
+{
+	unsigned int seq;
+
+	do {
+		seq = read_seqcount_begin(&peer->bind_local_seq);
+		*dst = bind->local.ipv6;
+	} while (read_seqcount_retry(&peer->bind_local_seq, seq));
 }
 
 /* variable name __tbl2 needs to be different from __tbl1
@@ -238,7 +260,7 @@ void ovpn_peer_endpoints_update(struct ovpn_peer *peer, struct sk_buff *skb)
 					    netdev_name(peer->ovpn->dev),
 					    peer->id, &bind->local.ipv4.s_addr,
 					    &ip_hdr(skb)->daddr);
-			bind->local.ipv4.s_addr = ip_hdr(skb)->daddr;
+			WRITE_ONCE(bind->local.ipv4.s_addr, ip_hdr(skb)->daddr);
 			reset_cache = true;
 		}
 		break;
@@ -269,7 +291,9 @@ void ovpn_peer_endpoints_update(struct ovpn_peer *peer, struct sk_buff *skb)
 					    netdev_name(peer->ovpn->dev),
 					    peer->id, &bind->local.ipv6,
 					    &ipv6_hdr(skb)->daddr);
+			write_seqcount_begin(&peer->bind_local_seq);
 			bind->local.ipv6 = ipv6_hdr(skb)->daddr;
+			write_seqcount_end(&peer->bind_local_seq);
 			reset_cache = true;
 		}
 		break;
