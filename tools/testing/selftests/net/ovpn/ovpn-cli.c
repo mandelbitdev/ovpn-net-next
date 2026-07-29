@@ -78,6 +78,7 @@ struct nl_ctx {
 enum ovpn_cmd {
 	CMD_INVALID,
 	CMD_NEW_IFACE,
+	CMD_GET_IFACE,
 	CMD_DEL_IFACE,
 	CMD_LISTEN,
 	CMD_CONNECT,
@@ -1417,6 +1418,143 @@ err:
 	return ret;
 }
 
+static const char *ovpn_mode_str(enum ovpn_mode mode)
+{
+	switch (mode) {
+	case OVPN_MODE_P2P:
+		return "P2P";
+	case OVPN_MODE_MP:
+		return "MP";
+	}
+
+	return "unknown";
+}
+
+static int ovpn_handle_iface(struct nlmsghdr *msg, void *arg)
+{
+	struct nlattr *linkinfo[IFLA_INFO_MAX + 1];
+	struct nlattr *data[IFLA_OVPN_MAX + 1];
+	struct nlattr *attrs[IFLA_MAX + 1];
+	const struct ifinfomsg *ifinfo;
+	bool dump = *(bool *)arg;
+	enum ovpn_mode mode;
+	const char *kind;
+	int ret;
+
+	if (msg->nlmsg_type != RTM_NEWLINK) {
+		fprintf(stderr, "unexpected rtnl message type: %u\n",
+			msg->nlmsg_type);
+		return -EINVAL;
+	}
+
+	if (msg->nlmsg_len < NLMSG_LENGTH(sizeof(*ifinfo))) {
+		fprintf(stderr, "truncated rtnl link message\n");
+		return -EINVAL;
+	}
+
+	ifinfo = NLMSG_DATA(msg);
+	ret = nla_parse(attrs, IFLA_MAX, (struct nlattr *)IFLA_RTA(ifinfo),
+			IFLA_PAYLOAD(msg), NULL);
+	if (ret < 0) {
+		fprintf(stderr, "cannot parse rtnl link attributes: %d\n", ret);
+		return ret;
+	}
+
+	if (!attrs[IFLA_LINKINFO]) {
+		fprintf(stderr, "missing linkinfo for ifindex %d\n",
+			ifinfo->ifi_index);
+		return -EINVAL;
+	}
+
+	ret = nla_parse(linkinfo, IFLA_INFO_MAX,
+			nla_data(attrs[IFLA_LINKINFO]),
+			nla_len(attrs[IFLA_LINKINFO]), NULL);
+	if (ret < 0) {
+		fprintf(stderr, "cannot parse linkinfo attributes: %d\n", ret);
+		return ret;
+	}
+
+	if (!linkinfo[IFLA_INFO_KIND]) {
+		fprintf(stderr, "missing link kind for ifindex %d\n",
+			ifinfo->ifi_index);
+		return -EINVAL;
+	}
+
+	kind = nla_get_string(linkinfo[IFLA_INFO_KIND]);
+	if (strcmp(kind, OVPN_FAMILY_NAME)) {
+		fprintf(stderr, "unexpected link kind: %s\n", kind);
+		return -EINVAL;
+	}
+
+	if (!linkinfo[IFLA_INFO_DATA]) {
+		fprintf(stderr, "missing ovpn link data for ifindex %d\n",
+			ifinfo->ifi_index);
+		return -EINVAL;
+	}
+
+	ret = nla_parse(data, IFLA_OVPN_MAX,
+			nla_data(linkinfo[IFLA_INFO_DATA]),
+			nla_len(linkinfo[IFLA_INFO_DATA]), NULL);
+	if (ret < 0) {
+		fprintf(stderr, "cannot parse ovpn link data: %d\n", ret);
+		return ret;
+	}
+
+	if (!data[IFLA_OVPN_MODE]) {
+		fprintf(stderr, "missing ovpn mode for ifindex %d\n",
+			ifinfo->ifi_index);
+		return -EINVAL;
+	}
+
+	mode = nla_get_u8(data[IFLA_OVPN_MODE]);
+	fprintf(stdout, "ifindex %d\n", ifinfo->ifi_index);
+	if (attrs[IFLA_IFNAME])
+		fprintf(stdout, "ifname %s\n",
+			nla_get_string(attrs[IFLA_IFNAME]));
+	fprintf(stdout, "kind %s\n", kind);
+	fprintf(stdout, "mode %s\n", ovpn_mode_str(mode));
+
+	return dump;
+}
+
+static int ovpn_get_iface(struct ovpn_ctx *ovpn)
+{
+	uint32_t ext_filter_mask = RTEXT_FILTER_SKIP_STATS;
+	struct ovpn_link_req req = { 0 };
+	bool dump = !ovpn->ifindex;
+	struct rtattr *linkinfo;
+
+	req.n.nlmsg_len = NLMSG_LENGTH(sizeof(req.i));
+	req.n.nlmsg_flags = NLM_F_REQUEST;
+	if (dump)
+		req.n.nlmsg_flags |= NLM_F_DUMP;
+	req.n.nlmsg_type = RTM_GETLINK;
+
+	/* don't include stats */
+	if (ovpn_addattr(&req.n, sizeof(req), IFLA_EXT_MASK,
+			 &ext_filter_mask, sizeof(ext_filter_mask)) < 0)
+		return -1;
+
+	/* if no iface was provided as argument, dump only the ovpn ifaces */
+	if (dump) {
+		linkinfo = ovpn_nest_start(&req.n, sizeof(req), IFLA_LINKINFO);
+		if (!linkinfo)
+			return -1;
+
+		if (ovpn_addattr(&req.n, sizeof(req), IFLA_INFO_KIND,
+				 OVPN_FAMILY_NAME,
+				 strlen(OVPN_FAMILY_NAME) + 1) < 0)
+			return -1;
+
+		ovpn_nest_end(&req.n, linkinfo);
+	}
+
+	req.i.ifi_family = AF_PACKET;
+	req.i.ifi_index = ovpn->ifindex;
+
+	return ovpn_rt_send(&req.n, 0, 0, ovpn_handle_iface, &dump);
+}
+
 static int ovpn_del_iface(struct ovpn_ctx *ovpn)
 {
 	struct ovpn_link_req req = { 0 };
@@ -1672,6 +1810,11 @@ static void usage(const char *cmd)
 	fprintf(stderr, "\t\t- P2P for peer-to-peer mode (i.e. client)\n");
 	fprintf(stderr, "\t\t- MP for multi-peer mode (i.e. server)\n");
 
+	fprintf(stderr,
+		"* get_iface [iface]: dump ovpn interface attributes\n");
+	fprintf(stderr,
+		"\tiface: optional ovpn interface name; omit it to dump all ovpn interfaces in the current netns\n");
+
 	fprintf(stderr, "* del_iface <iface>: delete ovpn interface\n");
 	fprintf(stderr, "\tiface: ovpn interface name\n");
 
@@ -1926,6 +2069,9 @@ static enum ovpn_cmd ovpn_parse_cmd(const char *cmd)
 	if (!strcmp(cmd, "new_iface"))
 		return CMD_NEW_IFACE;
 
+	if (!strcmp(cmd, "get_iface"))
+		return CMD_GET_IFACE;
+
 	if (!strcmp(cmd, "del_iface"))
 		return CMD_DEL_IFACE;
 
@@ -1993,6 +2139,9 @@ static int ovpn_run_cmd(struct ovpn_ctx *ovpn)
 	switch (ovpn->cmd) {
 	case CMD_NEW_IFACE:
 		ret = ovpn_new_iface(ovpn);
+		break;
+	case CMD_GET_IFACE:
+		ret = ovpn_get_iface(ovpn);
 		break;
 	case CMD_DEL_IFACE:
 		ret = ovpn_del_iface(ovpn);
@@ -2170,8 +2319,9 @@ static int ovpn_parse_cmd_args(struct ovpn_ctx *ovpn, int argc, char *argv[])
 {
 	int ret;
 
-	/* no args required for LISTEN_MCAST */
-	if (ovpn->cmd == CMD_LISTEN_MCAST)
+	/* no args required for LISTEN_MCAST or GET_IFACE in dump mode */
+	if (ovpn->cmd == CMD_LISTEN_MCAST ||
+	    (ovpn->cmd == CMD_GET_IFACE && argc == 2))
 		return 0;
 
 	/* all commands need an ifname */
@@ -2181,7 +2331,7 @@ static int ovpn_parse_cmd_args(struct ovpn_ctx *ovpn, int argc, char *argv[])
 	strscpy(ovpn->ifname, argv[2], IFNAMSIZ - 1);
 	ovpn->ifname[IFNAMSIZ - 1] = '\0';
 
-	/* all commands, except NEW_IFNAME, needs an ifindex */
+	/* all commands, except CMD_NEW_IFACE, needs an ifindex */
 	if (ovpn->cmd != CMD_NEW_IFACE) {
 		ovpn->ifindex = if_nametoindex(ovpn->ifname);
 		if (!ovpn->ifindex) {
@@ -2207,6 +2357,7 @@ static int ovpn_parse_cmd_args(struct ovpn_ctx *ovpn, int argc, char *argv[])
 		}
 		ovpn->mode_set = true;
 		break;
+	case CMD_GET_IFACE:
 	case CMD_DEL_IFACE:
 		break;
 	case CMD_LISTEN:
