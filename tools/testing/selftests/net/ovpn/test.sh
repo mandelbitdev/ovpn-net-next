@@ -56,6 +56,49 @@ ovpn_prepare_network() {
 	done
 }
 
+ovpn_check_iface() {
+	local expected
+	local peer_ns
+	local actual
+	local ifname
+	local count
+	local mode
+	local dump
+	local p
+
+	for p in $(seq 0 ${OVPN_NUM_PEERS}); do
+		peer_ns="ovpn_peer${p}"
+		ifname="tun${p}"
+		mode="P2P"
+		[ "${p}" -eq 0 ] && mode="MP"
+
+		if ! dump=$(ip netns exec "${peer_ns}" ${OVPN_CLI} get_iface);
+		then
+			printf 'failed to dump ovpn ifaces in %s\n' "${peer_ns}"
+			return 1
+		fi
+
+		# ensure exactly 1 iface is reported
+		count=$(printf '%s\n' "${dump}" | grep -c '^ifindex ' || true)
+		if [ "${count}" -ne 1 ]; then
+			printf 'unexpected iface count (%d) in %s\n' \
+				"${count}" "${peer_ns}"
+			return 1
+		fi
+
+		# validate the stable interface attributes
+		printf -v expected 'ifname %s\nmode %s' "${ifname}" "${mode}"
+		actual=$(printf '%s\n' "${dump}" |
+			sed -n -e '/^ifname /p' -e '/^mode /p')
+		if [[ "${actual}" != "${expected}" ]]; then
+			printf 'unexpected ovpn interface in %s:\n' "${peer_ns}"
+			printf 'expected:\n%s\nactual:\n%s\n' \
+				"${expected}" "${actual}"
+			return 1
+		fi
+	done
+}
+
 ovpn_run_basic_traffic() {
 	local p
 	local header1
@@ -293,15 +336,16 @@ trap ovpn_stage_err ERR
 
 ktap_print_header
 if [ "${OVPN_FLOAT}" == "1" ]; then
-	ktap_set_plan 13
+	ktap_set_plan 14
 else
-	ktap_set_plan 12
+	ktap_set_plan 13
 fi
 
 ovpn_cleanup
 modprobe -q ovpn || true
 
 ovpn_run_stage "setup network topology" ovpn_prepare_network
+ovpn_run_stage "validate iface modes" ovpn_check_iface
 ovpn_run_stage "run baseline data traffic" ovpn_run_basic_traffic
 ovpn_run_stage "run LAN traffic behind peer1" ovpn_run_lan_traffic
 [ "${OVPN_FLOAT}" == "1" ] && ovpn_run_stage "run floating peer checks" \
