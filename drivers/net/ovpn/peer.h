@@ -26,6 +26,7 @@
  * @entropy_min: minimum UDP source port to use for entropy
  * @entropy_max: maximum UDP source port to use for entropy
  * @entropy_tx: whether to use UDP source-port entropy on TX
+ * @entropy_rx: whether to accept UDP source-port entropy on RX
  * @vpn_addrs: IP addresses assigned over the tunnel
  * @vpn_addrs.ipv4: IPv4 assigned to peer on the tunnel
  * @vpn_addrs.ipv6: IPv6 assigned to peer on the tunnel
@@ -72,6 +73,7 @@ struct ovpn_peer {
 	u16 entropy_min;
 	u16 entropy_max;
 	bool entropy_tx;
+	bool entropy_rx;
 	struct {
 		struct in_addr ipv4;
 		struct in6_addr ipv6;

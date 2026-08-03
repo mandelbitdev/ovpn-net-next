@@ -74,8 +74,14 @@ static void ovpn_netdev_write(struct ovpn_peer *peer, struct sk_buff *skb)
 	 */
 	skb->ip_summed = CHECKSUM_NONE;
 
-	/* skb hash for transport packet no longer valid after decapsulation */
-	skb_clear_hash(skb);
+	/* With source-port entropy, a valid outer L4 hash represents the inner
+	 * flow and can steer its processing after decapsulation. Other outer
+	 * hashes are not useful for the inner packet.
+	 */
+	if (peer->entropy_rx)
+		skb_clear_hash_if_not_l4(skb);
+	else
+		skb_clear_hash(skb);
 
 	/* post-decrypt scrub -- prepare to inject encapsulated packet onto the
 	 * interface, based on __skb_tunnel_rx() in dst.h
