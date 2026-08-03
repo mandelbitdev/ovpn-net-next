@@ -121,6 +121,7 @@ static int ovpn_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
 
 	/* pop off outer UDP header */
 	__skb_pull(skb, sizeof(struct udphdr));
+	skb_mark_not_on_list(skb);
 	ovpn_recv(peer, skb);
 	return 0;
 
@@ -344,8 +345,18 @@ void ovpn_udp_send_skb(struct ovpn_peer *peer, struct sock *sk,
 
 	skb->dev = peer->ovpn->dev;
 	skb->mark = READ_ONCE(sk->sk_mark);
-	/* no checksum performed at this layer */
-	skb->ip_summed = CHECKSUM_NONE;
+	if (skb_is_gso(skb)) {
+		/* udp_tunnel_xmit_skb installs the outer UDP header after this
+		 * function returns: point CHECKSUM_PARTIAL at that future
+		 * header so both hw and sw UDP GSO can complete the checksum.
+		 */
+		skb->ip_summed = CHECKSUM_PARTIAL;
+		skb->csum_start = skb_headroom(skb) - sizeof(struct udphdr);
+		skb->csum_offset = offsetof(struct udphdr, check);
+	} else {
+		/* no checksum performed at this layer */
+		skb->ip_summed = CHECKSUM_NONE;
+	}
 
 	/* crypto layer -> transport (UDP) */
 	ret = ovpn_udp_output(peer, &peer->dst_cache, sk, skb);
