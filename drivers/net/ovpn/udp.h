@@ -21,5 +21,6 @@ void ovpn_udp_socket_detach(struct ovpn_socket *ovpn_sock);
 
 void ovpn_udp_send_skb(struct ovpn_peer *peer, struct sock *sk,
 		       struct sk_buff *skb);
+unsigned int ovpn_udp_keepalive_size(struct ovpn_peer *peer, struct sock *sk);
 
 #endif /* _NET_OVPN_UDP_H_ */

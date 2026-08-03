@@ -12,7 +12,7 @@
 
 /* DATA_V2 header size with AEAD encryption */
 #define OVPN_HEAD_ROOM (OVPN_OPCODE_SIZE + OVPN_NONCE_WIRE_SIZE +	   \
-			16 /* AEAD TAG length */ +			   \
+			OVPN_AUTH_TAG_SIZE +				   \
 			max(sizeof(struct udphdr), sizeof(struct tcphdr)) +\
 			max(sizeof(struct ipv6hdr), sizeof(struct iphdr)))
 
@@ -25,8 +25,7 @@ extern const unsigned char ovpn_keepalive_message[OVPN_KEEPALIVE_SIZE];
 netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev);
 
 void ovpn_recv(struct ovpn_peer *peer, struct sk_buff *skb);
-void ovpn_xmit_special(struct ovpn_peer *peer, const void *data,
-		       const unsigned int len);
+void ovpn_xmit_special(struct ovpn_peer *peer, unsigned int len);
 
 void ovpn_encrypt_post(void *data, int ret);
 void ovpn_decrypt_post(void *data, int ret);

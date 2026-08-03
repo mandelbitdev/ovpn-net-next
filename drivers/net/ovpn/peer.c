@@ -21,6 +21,7 @@
 #include "netlink.h"
 #include "peer.h"
 #include "socket.h"
+#include "udp.h"
 
 static void unlock_ovpn(struct ovpn_priv *ovpn,
 			 struct llist_head *release_list)
@@ -63,6 +64,37 @@ void ovpn_peer_keepalive_set(struct ovpn_peer *peer, u32 interval, u32 timeout)
 	 * off the worker so that the next delay can be recomputed
 	 */
 	mod_delayed_work(system_percpu_wq, &peer->ovpn->keepalive_work, 0);
+
+	ovpn_peer_keepalive_send_now(peer);
+}
+
+/**
+ * ovpn_peer_keepalive_send_now - schedule an immediate keepalive
+ * @peer: the peer to send the keepalive to
+ */
+void ovpn_peer_keepalive_send_now(struct ovpn_peer *peer)
+{
+	const u8 primary_idx = READ_ONCE(peer->crypto.primary_idx);
+
+	/* Entropy keepalives act as canonical endpoint beacons. Sending one
+	 * immediately also provides a best-effort PMTUD probe that regular
+	 * entropy traffic cannot reliably provide, since the stack does not
+	 * correlate ICMP errors quoting synthetic flows with the ovpn socket.
+	 */
+	if (!peer->entropy_tx || !READ_ONCE(peer->keepalive_interval))
+		return;
+
+	/* Keepalive configuration and primary-key installation may happen in
+	 * either order. Schedule the first keepalive only once both are ready.
+	 */
+	if (!rcu_access_pointer(peer->crypto.slots[primary_idx]))
+		return;
+
+	if (!ovpn_peer_hold(peer))
+		return;
+
+	if (!schedule_work(&peer->keepalive_work))
+		ovpn_peer_put(peer);
 }
 
 /**
@@ -76,10 +108,23 @@ static void ovpn_peer_keepalive_send(struct work_struct *work)
 {
 	struct ovpn_peer *peer = container_of(work, struct ovpn_peer,
 					      keepalive_work);
+	unsigned int len = OVPN_KEEPALIVE_SIZE;
+	struct ovpn_socket *sock;
 
 	local_bh_disable();
-	ovpn_xmit_special(peer, ovpn_keepalive_message,
-			  sizeof(ovpn_keepalive_message));
+	if (peer->entropy_tx) {
+		rcu_read_lock();
+		sock = rcu_dereference(peer->sock);
+		if (sock && sock->sk->sk_protocol == IPPROTO_UDP)
+			len = ovpn_udp_keepalive_size(peer, sock->sk);
+		rcu_read_unlock();
+		if (!len) {
+			ovpn_peer_put(peer);
+			goto out;
+		}
+	}
+	ovpn_xmit_special(peer, len);
+out:
 	local_bh_enable();
 }
 
@@ -1268,15 +1313,25 @@ static time64_t ovpn_peer_keepalive_work_single(struct ovpn_peer *peer,
 	/* check for peer keepalive */
 	expired = false;
 	interval = peer->keepalive_interval;
-	last_sent = READ_ONCE(peer->last_sent);
-	if (now < last_sent + interval) {
-		peer->keepalive_xmit_exp = last_sent + interval;
-		next_run2 = peer->keepalive_xmit_exp;
-	} else if (peer->keepalive_xmit_exp > now) {
-		next_run2 = peer->keepalive_xmit_exp;
+	if (peer->entropy_tx) {
+		if (peer->keepalive_xmit_exp > now) {
+			next_run2 = peer->keepalive_xmit_exp;
+		} else {
+			expired = true;
+			peer->keepalive_xmit_exp = now + interval;
+			next_run2 = peer->keepalive_xmit_exp;
+		}
 	} else {
-		expired = true;
-		next_run2 = now + interval;
+		last_sent = READ_ONCE(peer->last_sent);
+		if (now < last_sent + interval) {
+			peer->keepalive_xmit_exp = last_sent + interval;
+			next_run2 = peer->keepalive_xmit_exp;
+		} else if (peer->keepalive_xmit_exp > now) {
+			next_run2 = peer->keepalive_xmit_exp;
+		} else {
+			expired = true;
+			next_run2 = now + interval;
+		}
 	}
 	spin_unlock_bh(&peer->lock);
 
@@ -1349,8 +1404,10 @@ static time64_t ovpn_peer_keepalive_work_p2p(struct ovpn_priv *ovpn,
  * Each peer has two timers (if configured):
  * 1. peer timeout: when no data is received for a certain interval,
  *    the peer is considered dead and it gets killed.
- * 2. peer keepalive: when no data is sent to a certain peer for a
- *    certain interval, a special 'keepalive' packet is explicitly sent.
+ * 2. peer keepalive: for fixed-port TX, when no data is sent to a peer for a
+ *    certain interval, a special 'keepalive' packet is explicitly sent. For
+ *    entropy TX, the keepalive is sent unconditionally at that interval to
+ *    maintain the canonical endpoint.
  *
  * This function iterates across the whole peer collection while
  * checking the timers described above.

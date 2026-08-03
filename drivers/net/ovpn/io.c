@@ -34,24 +34,38 @@ const unsigned char ovpn_keepalive_message[OVPN_KEEPALIVE_SIZE] = {
 
 /**
  * ovpn_is_keepalive - check if skb contains a keepalive message
+ * @peer: peer the packet was received from
  * @skb: packet to check
- *
- * Assumes that the first byte of skb->data is defined.
+ * @offset: offset of the decrypted payload
  *
  * Return: true if skb contains a keepalive or false otherwise
  */
-static bool ovpn_is_keepalive(struct sk_buff *skb)
+static bool ovpn_is_keepalive(const struct ovpn_peer *peer,
+			      struct sk_buff *skb, unsigned int offset)
 {
-	if (*skb->data != ovpn_keepalive_message[0])
+	unsigned int len;
+
+	if (offset > skb->len)
+		return false;
+	len = skb->len - offset;
+
+	if (len < OVPN_KEEPALIVE_SIZE)
 		return false;
 
-	if (skb->len != OVPN_KEEPALIVE_SIZE)
+	/* entropy keepalives also act as full-sized path probes, so they are
+	 * zero-padded to the path MTU
+	 */
+	if (!peer->entropy_rx && len != OVPN_KEEPALIVE_SIZE)
 		return false;
 
-	if (!pskb_may_pull(skb, OVPN_KEEPALIVE_SIZE))
+	if (!pskb_may_pull(skb, offset + OVPN_KEEPALIVE_SIZE))
 		return false;
 
-	return !memcmp(skb->data, ovpn_keepalive_message, OVPN_KEEPALIVE_SIZE);
+	if (skb->data[offset] != ovpn_keepalive_message[0])
+		return false;
+
+	return !memcmp(skb->data + offset, ovpn_keepalive_message,
+		       OVPN_KEEPALIVE_SIZE);
 }
 
 /* Called after decrypt to write the IP packet to the device.
@@ -118,6 +132,7 @@ void ovpn_decrypt_post(void *data, int ret)
 	struct sk_buff *skb = data;
 	struct ovpn_socket *sock;
 	struct ovpn_peer *peer;
+	bool is_keepalive;
 	__be16 proto;
 	__be32 *pid;
 
@@ -150,15 +165,26 @@ void ovpn_decrypt_post(void *data, int ret)
 	/* keep track of last received authenticated packet for keepalive */
 	WRITE_ONCE(peer->last_recv, ktime_get_boottime_seconds());
 
-	rcu_read_lock();
-	sock = rcu_dereference(peer->sock);
-	if (sock && sock->sk->sk_protocol == IPPROTO_UDP)
-		/* check if this peer changed local or remote endpoint */
-		ovpn_peer_endpoints_update(peer, skb);
-	rcu_read_unlock();
+	is_keepalive = ovpn_is_keepalive(peer, skb, payload_offset);
+	if (!peer->entropy_rx || is_keepalive) {
+		rcu_read_lock();
+		sock = rcu_dereference(peer->sock);
+		if (sock && sock->sk->sk_protocol == IPPROTO_UDP)
+			/* check if this peer changed local/remote endpoint */
+			ovpn_peer_endpoints_update(peer, skb);
+		rcu_read_unlock();
+	}
 
 	/* point to encapsulated IP packet */
 	__skb_pull(skb, payload_offset);
+
+	if (is_keepalive) {
+		net_dbg_ratelimited("%s: ping received from peer %u\n",
+				    netdev_name(peer->ovpn->dev), peer->id);
+		/* we drop the packet, but this is not a failure */
+		consume_skb(skb);
+		goto drop_nocount;
+	}
 
 	/* check if this is a valid datapacket that has to be delivered to the
 	 * ovpn interface
@@ -172,15 +198,6 @@ void ovpn_decrypt_post(void *data, int ret)
 					     netdev_name(peer->ovpn->dev),
 					     peer->id);
 			goto drop;
-		}
-
-		if (ovpn_is_keepalive(skb)) {
-			net_dbg_ratelimited("%s: ping received from peer %u\n",
-					    netdev_name(peer->ovpn->dev),
-					    peer->id);
-			/* we drop the packet, but this is not a failure */
-			consume_skb(skb);
-			goto drop_nocount;
 		}
 
 		net_info_ratelimited("%s: unsupported protocol received from peer %u\n",
@@ -457,19 +474,18 @@ drop_no_peer:
 }
 
 /**
- * ovpn_xmit_special - encrypt and transmit an out-of-band message to peer
- * @peer: peer to send the message to
- * @data: message content
- * @len: message length
+ * ovpn_xmit_special - encrypt and transmit a padded keepalive
+ * @peer: peer to send the keepalive to
+ * @len: plaintext keepalive length
  *
  * Assumes that caller holds a reference to peer, which will be
  * passed to ovpn_send()
  */
-void ovpn_xmit_special(struct ovpn_peer *peer, const void *data,
-		       const unsigned int len)
+void ovpn_xmit_special(struct ovpn_peer *peer, unsigned int len)
 {
 	struct ovpn_priv *ovpn;
 	struct sk_buff *skb;
+	void *data;
 
 	ovpn = peer->ovpn;
 	if (unlikely(!ovpn)) {
@@ -477,6 +493,7 @@ void ovpn_xmit_special(struct ovpn_peer *peer, const void *data,
 		return;
 	}
 
+	len = max_t(unsigned int, len, OVPN_KEEPALIVE_SIZE);
 	skb = alloc_skb(256 + len, GFP_ATOMIC);
 	if (unlikely(!skb)) {
 		ovpn_peer_put(peer);
@@ -485,7 +502,9 @@ void ovpn_xmit_special(struct ovpn_peer *peer, const void *data,
 
 	skb_reserve(skb, 128);
 	skb->priority = TC_PRIO_BESTEFFORT;
-	__skb_put_data(skb, data, len);
+	/* clear the padding so that stale kernel memory is never disclosed */
+	data = skb_put_zero(skb, len);
+	memcpy(data, ovpn_keepalive_message, OVPN_KEEPALIVE_SIZE);
 
 	ovpn_send(ovpn, skb, peer);
 }

@@ -948,6 +948,11 @@ int ovpn_nl_key_new_doit(struct sk_buff *skb, struct genl_info *info)
 				       peer_id);
 		goto out;
 	}
+	/* A newly installed primary key can transmit a configured keepalive,
+	 * so send one immediately (a secondary key is not active for TX).
+	 */
+	if (pkr.slot == OVPN_KEY_SLOT_PRIMARY)
+		ovpn_peer_keepalive_send_now(peer);
 
 	netdev_dbg(ovpn->dev, "new key installed (id=%u) for peer %u\n",
 		   pkr.key.key_id, peer_id);
