@@ -89,7 +89,7 @@ int ovpn_crypto_state_reset(struct ovpn_crypto_state *cs,
 	    pkr->slot != OVPN_KEY_SLOT_SECONDARY)
 		return -EINVAL;
 
-	new = ovpn_aead_crypto_key_slot_new(&pkr->key);
+	new = ovpn_aead_crypto_key_slot_new(&pkr->key, cs->recv_window_size);
 	if (IS_ERR(new))
 		return PTR_ERR(new);
 

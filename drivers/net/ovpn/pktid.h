@@ -23,6 +23,7 @@ struct ovpn_pktid_xmit {
 };
 
 #define REPLAY_WINDOW_SIZE 2048
+#define REPLAY_WINDOW_SIZE_UDP_ENTROPY 32768
 #define REPLAY_INDEX(base, i, size) (((base) + (i)) & ((size) - 1))
 
 /* Packet-ID state for receiver. */

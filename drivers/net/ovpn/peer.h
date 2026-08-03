@@ -146,7 +146,9 @@ static inline void ovpn_peer_put(struct ovpn_peer *peer)
 	kref_put(&peer->refcount, ovpn_peer_release_kref);
 }
 
-struct ovpn_peer *ovpn_peer_new(struct ovpn_priv *ovpn, u32 id);
+struct ovpn_peer *ovpn_peer_new(struct ovpn_priv *ovpn, u32 id,
+				bool entropy_tx, bool entropy_rx,
+				u16 entropy_min, u16 entropy_max);
 int ovpn_peer_add(struct ovpn_priv *ovpn, struct ovpn_peer *peer);
 int ovpn_peer_del(struct ovpn_peer *peer, enum ovpn_del_peer_reason reason);
 void ovpn_peers_free(struct ovpn_priv *ovpn, struct sock *sock,

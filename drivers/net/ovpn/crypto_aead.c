@@ -391,7 +391,8 @@ void ovpn_aead_crypto_key_slot_destroy(struct ovpn_crypto_key_slot *ks)
 }
 
 struct ovpn_crypto_key_slot *
-ovpn_aead_crypto_key_slot_new(const struct ovpn_key_config *kc)
+ovpn_aead_crypto_key_slot_new(const struct ovpn_key_config *kc,
+			      unsigned int recv_window_size)
 {
 	struct ovpn_crypto_key_slot *ks = NULL;
 	const char *alg_name;
@@ -423,7 +424,7 @@ ovpn_aead_crypto_key_slot_new(const struct ovpn_key_config *kc)
 	kref_init(&ks->refcount);
 	ks->key_id = kc->key_id;
 	ovpn_pktid_xmit_init(&ks->pid_xmit);
-	ret = ovpn_pktid_recv_init(&ks->pid_recv, REPLAY_WINDOW_SIZE);
+	ret = ovpn_pktid_recv_init(&ks->pid_recv, recv_window_size);
 	if (ret < 0)
 		goto destroy_ks;
 

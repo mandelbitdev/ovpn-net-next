@@ -171,6 +171,23 @@ attribute-sets:
           will advertise the tx-id to be used on the link.
         checks:
           max: 0xFFFFFF
+      -
+        name: sport-entropy-tx-min
+        type: u16
+        doc: >-
+          Inclusive minimum UDP source port to use for TX entropy. Zero
+          together with a zero maximum selects the local ephemeral port range.
+      -
+        name: sport-entropy-tx-max
+        type: u16
+        doc: >-
+          Inclusive maximum UDP source port to use for TX entropy. Zero
+          together with a zero minimum selects the local ephemeral port range.
+      -
+        name: sport-entropy-rx
+        type: flag
+        doc: >-
+          Accept flow-derived UDP source ports from this peer
   -
     name: peer-new-input
     subset-of: peer
@@ -201,6 +218,12 @@ attribute-sets:
         name: keepalive-timeout
       -
         name: tx-id
+      -
+        name: sport-entropy-tx-min
+      -
+        name: sport-entropy-tx-max
+      -
+        name: sport-entropy-rx
   -
     name: peer-set-input
     subset-of: peer

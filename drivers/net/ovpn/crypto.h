@@ -52,6 +52,7 @@ struct ovpn_crypto_key_slot {
 struct ovpn_crypto_state {
 	struct ovpn_crypto_key_slot __rcu *slots[2];
 	u8 primary_idx;
+	unsigned int recv_window_size;
 
 	/* protects primary and secondary slots */
 	spinlock_t lock;
@@ -62,11 +63,13 @@ static inline bool ovpn_crypto_key_slot_hold(struct ovpn_crypto_key_slot *ks)
 	return kref_get_unless_zero(&ks->refcount);
 }
 
-static inline void ovpn_crypto_state_init(struct ovpn_crypto_state *cs)
+static inline void ovpn_crypto_state_init(struct ovpn_crypto_state *cs,
+					  unsigned int recv_window_size)
 {
 	RCU_INIT_POINTER(cs->slots[0], NULL);
 	RCU_INIT_POINTER(cs->slots[1], NULL);
 	cs->primary_idx = 0;
+	cs->recv_window_size = recv_window_size;
 	spin_lock_init(&cs->lock);
 }
 

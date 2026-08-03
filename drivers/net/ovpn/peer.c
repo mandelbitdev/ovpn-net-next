@@ -132,10 +132,16 @@ out:
  * ovpn_peer_new - allocate and initialize a new peer object
  * @ovpn: the openvpn instance inside which the peer should be created
  * @id: the ID assigned to this peer
+ * @entropy_tx: whether to use UDP source-port entropy on TX
+ * @entropy_rx: whether to accept UDP source-port entropy on RX
+ * @entropy_min: minimum UDP source port to use for entropy
+ * @entropy_max: maximum UDP source port to use for entropy
  *
  * Return: a pointer to the new peer on success or an error code otherwise
  */
-struct ovpn_peer *ovpn_peer_new(struct ovpn_priv *ovpn, u32 id)
+struct ovpn_peer *ovpn_peer_new(struct ovpn_priv *ovpn, u32 id,
+				bool entropy_tx, bool entropy_rx,
+				u16 entropy_min, u16 entropy_max)
 {
 	struct ovpn_peer *peer;
 	int ret;
@@ -150,13 +156,20 @@ struct ovpn_peer *ovpn_peer_new(struct ovpn_priv *ovpn, u32 id)
 	 */
 	peer->id = id;
 	peer->tx_id = id;
+	peer->entropy_tx = entropy_tx;
+	peer->entropy_rx = entropy_rx;
+	peer->entropy_min = entropy_min;
+	peer->entropy_max = entropy_max;
 	peer->ovpn = ovpn;
 
 	peer->vpn_addrs.ipv4.s_addr = htonl(INADDR_ANY);
 	peer->vpn_addrs.ipv6 = in6addr_any;
 
 	RCU_INIT_POINTER(peer->bind, NULL);
-	ovpn_crypto_state_init(&peer->crypto);
+	ovpn_crypto_state_init(&peer->crypto,
+			       entropy_rx ?
+			       REPLAY_WINDOW_SIZE_UDP_ENTROPY :
+			       REPLAY_WINDOW_SIZE);
 	spin_lock_init(&peer->lock);
 	kref_init(&peer->refcount);
 	ovpn_peer_stats_init(&peer->vpn_stats);
