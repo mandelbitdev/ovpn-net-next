@@ -23,14 +23,27 @@ void ovpn_pktid_xmit_init(struct ovpn_pktid_xmit *pid)
 	atomic_set(&pid->seq_num, 1);
 }
 
-void ovpn_pktid_recv_init(struct ovpn_pktid_recv *pr)
+int ovpn_pktid_recv_init(struct ovpn_pktid_recv *pr,
+			 unsigned int window_size)
 {
 	memset(pr, 0, sizeof(*pr));
+	pr->history = bitmap_zalloc(window_size, GFP_KERNEL);
+	if (!pr->history)
+		return -ENOMEM;
+
+	pr->window_size = window_size;
 	spin_lock_init(&pr->lock);
+
+	return 0;
+}
+
+void ovpn_pktid_recv_cleanup(struct ovpn_pktid_recv *pr)
+{
+	bitmap_free(pr->history);
 }
 
 /* Packet replay detection.
- * Allows ID backtrack of up to REPLAY_WINDOW_SIZE - 1.
+ * Allows ID backtrack of up to pr->window_size - 1.
  */
 int ovpn_pktid_recv(struct ovpn_pktid_recv *pr, u32 pkt_id, u32 pkt_time)
 {
@@ -66,46 +79,48 @@ int ovpn_pktid_recv(struct ovpn_pktid_recv *pr, u32 pkt_id, u32 pkt_time)
 
 	if (likely(pkt_id == pr->id + 1)) {
 		/* well-formed ID sequence (incremented by 1) */
-		pr->base = REPLAY_INDEX(pr->base, -1);
+		pr->base = REPLAY_INDEX(pr->base, -1, pr->window_size);
 		__set_bit(pr->base, pr->history);
-		if (pr->extent < REPLAY_WINDOW_SIZE)
+		if (pr->extent < pr->window_size)
 			++pr->extent;
 		pr->id = pkt_id;
 	} else if (pkt_id > pr->id) {
 		/* ID jumped forward by more than one */
 		const unsigned int delta = pkt_id - pr->id;
 
-		if (delta < REPLAY_WINDOW_SIZE) {
-			pr->base = REPLAY_INDEX(pr->base, -delta);
+		if (delta < pr->window_size) {
+			pr->base = REPLAY_INDEX(pr->base, -delta,
+						pr->window_size);
 			__set_bit(pr->base, pr->history);
 			pr->extent += delta;
-			if (pr->extent > REPLAY_WINDOW_SIZE)
-				pr->extent = REPLAY_WINDOW_SIZE;
+			if (pr->extent > pr->window_size)
+				pr->extent = pr->window_size;
 
-			clear_start = REPLAY_INDEX(pr->base, 1);
+			clear_start = REPLAY_INDEX(pr->base, 1,
+						   pr->window_size);
 			clear_len = delta - 1;
-			first = min(clear_len,
-				    REPLAY_WINDOW_SIZE - clear_start);
+			first = min(clear_len, pr->window_size - clear_start);
 			bitmap_clear(pr->history, clear_start, first);
 			if (clear_len > first)
 				bitmap_clear(pr->history, 0, clear_len - first);
 		} else {
 			pr->base = 0;
-			pr->extent = REPLAY_WINDOW_SIZE;
-			bitmap_zero(pr->history, REPLAY_WINDOW_SIZE);
+			pr->extent = pr->window_size;
+			bitmap_zero(pr->history, pr->window_size);
 			__set_bit(0, pr->history);
 		}
 		pr->id = pkt_id;
 	} else {
 		/* ID backtrack */
 		const unsigned int delta = pr->id - pkt_id;
+		unsigned int ri;
 
 		if (delta > pr->max_backtrack)
 			pr->max_backtrack = delta;
 		if (delta < pr->extent) {
 			if (pkt_id > pr->id_floor) {
-				const unsigned int ri = REPLAY_INDEX(pr->base,
-								     delta);
+				ri = REPLAY_INDEX(pr->base, delta,
+						  pr->window_size);
 
 				if (__test_and_set_bit(ri, pr->history)) {
 					ret = -EINVAL;

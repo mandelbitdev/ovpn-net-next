@@ -22,19 +22,15 @@ struct ovpn_pktid_xmit {
 	atomic_t seq_num;
 };
 
-/* replay window sizing in bytes = 2^REPLAY_WINDOW_ORDER */
-#define REPLAY_WINDOW_ORDER 8
+#define REPLAY_WINDOW_SIZE 2048
+#define REPLAY_INDEX(base, i, size) (((base) + (i)) & ((size) - 1))
 
-#define REPLAY_WINDOW_BYTES BIT(REPLAY_WINDOW_ORDER)
-#define REPLAY_WINDOW_SIZE  (REPLAY_WINDOW_BYTES * 8)
-#define REPLAY_INDEX(base, i) (((base) + (i)) & (REPLAY_WINDOW_SIZE - 1))
-
-/* Packet-ID state for receiver.
- * Other than lock member, can be zeroed to initialize.
- */
+/* Packet-ID state for receiver. */
 struct ovpn_pktid_recv {
-	/* "sliding window" bitmask of recent packet IDs received */
-	DECLARE_BITMAP(history, REPLAY_WINDOW_SIZE);
+	/* replay history currently in use */
+	unsigned long *history;
+	/* immutable number of packet IDs tracked by the replay window */
+	unsigned int window_size;
 	/* bit position of deque base in history */
 	unsigned int base;
 	/* extent (in bits) of deque in history */
@@ -79,7 +75,9 @@ static inline void ovpn_pktid_aead_write(const u32 pktid,
 }
 
 void ovpn_pktid_xmit_init(struct ovpn_pktid_xmit *pid);
-void ovpn_pktid_recv_init(struct ovpn_pktid_recv *pr);
+int ovpn_pktid_recv_init(struct ovpn_pktid_recv *pr,
+			 unsigned int window_size);
+void ovpn_pktid_recv_cleanup(struct ovpn_pktid_recv *pr);
 
 int ovpn_pktid_recv(struct ovpn_pktid_recv *pr, u32 pkt_id, u32 pkt_time);
 
