@@ -8,6 +8,7 @@
  */
 
 #include <linux/atomic.h>
+#include <linux/bitmap.h>
 #include <linux/jiffies.h>
 #include <linux/net.h>
 #include <linux/netdevice.h>
@@ -33,6 +34,7 @@ void ovpn_pktid_recv_init(struct ovpn_pktid_recv *pr)
  */
 int ovpn_pktid_recv(struct ovpn_pktid_recv *pr, u32 pkt_id, u32 pkt_time)
 {
+	unsigned int clear_start, clear_len, first;
 	const unsigned long now = jiffies;
 	int ret;
 
@@ -74,23 +76,24 @@ int ovpn_pktid_recv(struct ovpn_pktid_recv *pr, u32 pkt_id, u32 pkt_time)
 		const unsigned int delta = pkt_id - pr->id;
 
 		if (delta < REPLAY_WINDOW_SIZE) {
-			unsigned int i;
-
 			pr->base = REPLAY_INDEX(pr->base, -delta);
 			__set_bit(pr->base, pr->history);
 			pr->extent += delta;
 			if (pr->extent > REPLAY_WINDOW_SIZE)
 				pr->extent = REPLAY_WINDOW_SIZE;
-			for (i = 1; i < delta; ++i) {
-				unsigned int newb = REPLAY_INDEX(pr->base, i);
 
-				__clear_bit(newb, pr->history);
-			}
+			clear_start = REPLAY_INDEX(pr->base, 1);
+			clear_len = delta - 1;
+			first = min(clear_len,
+				    REPLAY_WINDOW_SIZE - clear_start);
+			bitmap_clear(pr->history, clear_start, first);
+			if (clear_len > first)
+				bitmap_clear(pr->history, 0, clear_len - first);
 		} else {
 			pr->base = 0;
 			pr->extent = REPLAY_WINDOW_SIZE;
-			memset(pr->history, 0, sizeof(pr->history));
-			pr->history[0] = 1;
+			bitmap_zero(pr->history, REPLAY_WINDOW_SIZE);
+			__set_bit(0, pr->history);
 		}
 		pr->id = pkt_id;
 	} else {
