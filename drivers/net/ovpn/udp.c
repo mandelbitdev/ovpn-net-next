@@ -121,6 +121,7 @@ static int ovpn_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
 
 	/* pop off outer UDP header */
 	__skb_pull(skb, sizeof(struct udphdr));
+	skb_mark_not_on_list(skb);
 	ovpn_recv(peer, skb);
 	return 0;
 
@@ -288,9 +289,13 @@ static int ovpn_udp4_output(struct ovpn_peer *peer, struct ovpn_bind *bind,
 	spin_unlock_bh(&peer->lock);
 
 transmit:
+	/* an already-built UDP GSO needs a checksum seed even if the socket's
+	 * no-check option changed while encryption was in flight
+	 */
 	udp_tunnel_xmit_skb(rt, sk, skb, fl.saddr, fl.daddr, 0,
 			    ip4_dst_hoplimit(&rt->dst), 0, fl.fl4_sport,
-			    fl.fl4_dport, false, sk->sk_no_check_tx, 0);
+			    fl.fl4_dport, false,
+			    !skb_is_gso(skb) && sk->sk_no_check_tx, 0);
 	ret = 0;
 err:
 	local_bh_enable();
@@ -388,9 +393,13 @@ transmit:
 	 * udp_tunnel_xmit_skb()
 	 */
 	skb->ignore_df = 1;
+	/* keep checksum offload enabled for an in-flight UDP GSO batch even if
+	 * the socket's no-check option has changed since batch creation
+	 */
 	udp_tunnel6_xmit_skb(dst, sk, skb, skb->dev, &fl.saddr, &fl.daddr, 0,
 			     ip6_dst_hoplimit(dst), 0, fl.fl6_sport,
-			     fl.fl6_dport, udp_get_no_check6_tx(sk), 0);
+			     fl.fl6_dport,
+			     !skb_is_gso(skb) && udp_get_no_check6_tx(sk), 0);
 	ret = 0;
 err:
 	local_bh_enable();
@@ -467,8 +476,18 @@ void ovpn_udp_send_skb(struct ovpn_peer *peer, struct sock *sk,
 
 	skb->dev = peer->ovpn->dev;
 	skb->mark = key.mark;
-	/* no checksum performed at this layer */
-	skb->ip_summed = CHECKSUM_NONE;
+	if (skb_is_gso(skb)) {
+		/* udp_tunnel_xmit_skb installs the outer UDP header after this
+		 * function returns: point CHECKSUM_PARTIAL at that future
+		 * header so both hw and sw UDP GSO can complete the checksum.
+		 */
+		skb->ip_summed = CHECKSUM_PARTIAL;
+		skb->csum_start = skb_headroom(skb) - sizeof(struct udphdr);
+		skb->csum_offset = offsetof(struct udphdr, check);
+	} else {
+		/* no checksum performed at this layer */
+		skb->ip_summed = CHECKSUM_NONE;
+	}
 
 	ovpn_dst_cache_check_key(peer, &peer->dst_cache, &key);
 
