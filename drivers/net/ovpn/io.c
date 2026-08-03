@@ -391,6 +391,10 @@ netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
 	/* dst was needed for peer selection - it can now be dropped */
 	skb_dst_drop(skb);
 
+	/* materialize the inner flow hash before segmentation and encryption */
+	if (peer->entropy_tx)
+		skb_get_hash(skb);
+
 	if (skb_is_gso(skb)) {
 		segments = skb_gso_segment(skb, 0);
 		if (IS_ERR(segments)) {
