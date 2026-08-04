@@ -470,6 +470,22 @@ static int ovpn_parse_key_direction(const char *dir, struct ovpn_ctx *ctx)
 	return 0;
 }
 
+static int ovpn_tcp_nodelay(int socket)
+{
+	const char *nodelay = getenv("OVPN_TCP_NODELAY");
+	int opt = 1;
+	int ret;
+
+	if (nodelay && !strcmp(nodelay, "0"))
+		opt = 0;
+
+	ret = setsockopt(socket, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+	if (ret < 0)
+		perror("setsockopt for TCP_NODELAY");
+
+	return ret;
+}
+
 static int ovpn_socket(struct ovpn_ctx *ctx, sa_family_t family, int proto)
 {
 	struct sockaddr_storage local_sock = { 0 };
@@ -606,6 +622,12 @@ static int ovpn_accept(struct ovpn_ctx *ctx)
 		goto err;
 	}
 
+	if (ovpn_tcp_nodelay(ret) < 0) {
+		close(ret);
+		ret = -1;
+		goto err;
+	}
+
 	return ret;
 err:
 	close(ctx->socket);
@@ -622,6 +644,10 @@ static int ovpn_connect(struct ovpn_ctx *ovpn)
 		perror("cannot create socket");
 		return -1;
 	}
+
+	ret = ovpn_tcp_nodelay(s);
+	if (ret < 0)
+		goto err;
 
 	switch (ovpn->remote.in4.sin_family) {
 	case AF_INET:
@@ -1779,6 +1805,8 @@ static void usage(const char *cmd)
 
 	fprintf(stderr,
 		"* listen_mcast: listen to ovpn netlink multicast messages\n");
+	fprintf(stderr,
+		"\nEnvironment: OVPN_TCP_NODELAY=0 enables Nagle for listen/connect (default: 1)\n");
 }
 
 static int ovpn_parse_remote(struct ovpn_ctx *ovpn, const char *host,
