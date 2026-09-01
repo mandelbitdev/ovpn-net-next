@@ -77,6 +77,10 @@ static void ovpn_peer_keepalive_send(struct work_struct *work)
 	struct ovpn_peer *peer = container_of(work, struct ovpn_peer,
 					      keepalive_work);
 
+	/* count attempted keepalives: if the TX path fails afterwards,
+	 * keepalive_tx will include a transmission that was not sent
+	 */
+	atomic64_inc(&peer->estats.keepalive_tx);
 	local_bh_disable();
 	ovpn_xmit_special(peer, ovpn_keepalive_message,
 			  sizeof(ovpn_keepalive_message));
@@ -309,6 +313,7 @@ void ovpn_peer_endpoints_update(struct ovpn_peer *peer, struct sk_buff *skb)
 
 	spin_unlock_bh(&peer->lock);
 
+	atomic64_inc(&peer->estats.floats);
 	ovpn_nl_peer_float_notify(peer, &ss);
 
 	/* rehashing is required only in MP mode as P2P has one peer

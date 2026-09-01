@@ -551,9 +551,9 @@ static int ovpn_nl_send_peer(struct sk_buff *skb, const struct genl_info *info,
 			     int flags)
 {
 	const struct ovpn_bind *bind;
+	struct nlattr *attr, *estats;
 	struct ovpn_socket *sock;
 	int ret = -EMSGSIZE;
-	struct nlattr *attr;
 	__be16 local_port;
 	void *hdr;
 	int id;
@@ -653,6 +653,41 @@ static int ovpn_nl_send_peer(struct sk_buff *skb, const struct genl_info *info,
 	    nla_put_uint(skb, OVPN_A_PEER_LINK_TX_PACKETS,
 			 atomic64_read(&peer->link_stats.tx.packets)))
 		goto err;
+
+	estats = nla_nest_start(skb, OVPN_A_PEER_ESTATS);
+	if (!estats)
+		goto err;
+
+	if (/* drop/event counters */
+	    nla_put_uint(skb, OVPN_A_PEER_ESTATS_RX_DECRYPT_ERRORS,
+			 atomic64_read(&peer->estats.rx_decrypt_errors)) ||
+	    nla_put_uint(skb, OVPN_A_PEER_ESTATS_RX_REPLAY_ERRORS,
+			 atomic64_read(&peer->estats.rx_replay_errors)) ||
+	    nla_put_uint(skb, OVPN_A_PEER_ESTATS_RX_UNKNOWN_KEYID,
+			 atomic64_read(&peer->estats.rx_unknown_keyid)) ||
+	    nla_put_uint(skb, OVPN_A_PEER_ESTATS_RX_UNSUPPORTED_PROTO,
+			 atomic64_read(&peer->estats.rx_unsupported_proto)) ||
+	    nla_put_uint(skb, OVPN_A_PEER_ESTATS_RX_RPF_ERRORS,
+			 atomic64_read(&peer->estats.rx_rpf_errors)) ||
+	    nla_put_uint(skb, OVPN_A_PEER_ESTATS_TX_ENCRYPT_ERRORS,
+			 atomic64_read(&peer->estats.tx_encrypt_errors)) ||
+	    nla_put_uint(skb, OVPN_A_PEER_ESTATS_TX_IV_EXHAUSTED,
+			 atomic64_read(&peer->estats.tx_iv_exhausted)) ||
+	    nla_put_uint(skb, OVPN_A_PEER_ESTATS_TX_NO_KEY,
+			 atomic64_read(&peer->estats.tx_no_key)) ||
+	    nla_put_uint(skb, OVPN_A_PEER_ESTATS_TX_NO_TRANSPORT,
+			 atomic64_read(&peer->estats.tx_no_transport)) ||
+	    nla_put_uint(skb, OVPN_A_PEER_ESTATS_TX_GSO_ERRORS,
+			 atomic64_read(&peer->estats.tx_gso_errors)) ||
+	    nla_put_uint(skb, OVPN_A_PEER_ESTATS_KEEPALIVE_RX,
+			 atomic64_read(&peer->estats.keepalive_rx)) ||
+	    nla_put_uint(skb, OVPN_A_PEER_ESTATS_KEEPALIVE_TX,
+			 atomic64_read(&peer->estats.keepalive_tx)) ||
+	    nla_put_uint(skb, OVPN_A_PEER_ESTATS_FLOAT_COUNT,
+			 atomic64_read(&peer->estats.floats)))
+		goto err;
+
+	nla_nest_end(skb, estats);
 
 	nla_nest_end(skb, attr);
 	genlmsg_end(skb, hdr);

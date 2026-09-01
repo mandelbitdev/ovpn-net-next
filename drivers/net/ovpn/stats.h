@@ -25,6 +25,39 @@ struct ovpn_peer_stats {
 	struct ovpn_peer_stat tx;
 };
 
+/**
+ * struct ovpn_peer_estats - per-peer drop/event counters
+ * @rx_decrypt_errors: packets dropped due to decryption/auth failure
+ * @rx_replay_errors: packets dropped by the replay protection check
+ * @rx_unknown_keyid: packets dropped due to unknown key ID
+ * @rx_unsupported_proto: packets dropped due to unsupported or malformed
+ *			  inner protocol
+ * @rx_rpf_errors: packets dropped by the reverse path filtering check
+ * @tx_encrypt_errors: packets dropped due to encryption failure
+ * @tx_iv_exhausted: packets dropped due to packet ID (IV) exhaustion
+ * @tx_no_key: packets dropped due to missing primary key
+ * @tx_no_transport: packets dropped due to missing transport socket
+ * @tx_gso_errors: packets dropped due to GSO segmentation failure
+ * @keepalive_rx: keepalive packets received from this peer
+ * @keepalive_tx: keepalive packets sent to this peer
+ * @floats: number of times the peer endpoint floated
+ */
+struct ovpn_peer_estats {
+	atomic64_t rx_decrypt_errors;
+	atomic64_t rx_replay_errors;
+	atomic64_t rx_unknown_keyid;
+	atomic64_t rx_unsupported_proto;
+	atomic64_t rx_rpf_errors;
+	atomic64_t tx_encrypt_errors;
+	atomic64_t tx_iv_exhausted;
+	atomic64_t tx_no_key;
+	atomic64_t tx_no_transport;
+	atomic64_t tx_gso_errors;
+	atomic64_t keepalive_rx;
+	atomic64_t keepalive_tx;
+	atomic64_t floats;
+};
+
 void ovpn_peer_stats_init(struct ovpn_peer_stats *ps);
 
 static inline void ovpn_peer_stats_increment(struct ovpn_peer_stat *stat,
