@@ -60,6 +60,7 @@
  * @rcu: used to free peer in an RCU safe way
  * @release_entry: entry for the socket release list
  * @keepalive_work: used to schedule keepalive sending
+ * @estats: per-peer drop/event counters
  */
 struct ovpn_peer {
 	struct ovpn_priv *ovpn;
@@ -114,6 +115,7 @@ struct ovpn_peer {
 	struct rcu_head rcu;
 	struct llist_node release_entry;
 	struct work_struct keepalive_work;
+	struct ovpn_peer_estats estats;
 };
 
 /**

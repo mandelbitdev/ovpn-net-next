@@ -175,6 +175,68 @@ attribute-sets:
           will advertise the tx-id to be used on the link.
         checks:
           max: 0xFFFFFF
+      -
+        name: estats
+        type: nest
+        doc: Extended statistics, per-peer drop/event counters
+        nested-attributes: peer-estats
+  -
+    name: peer-estats
+    attributes:
+      -
+        name: rx-decrypt-errors
+        type: uint
+        doc: Number of packets dropped due to decryption failure
+      -
+        name: rx-replay-errors
+        type: uint
+        doc: Number of packets dropped by the replay protection check
+      -
+        name: rx-unknown-keyid
+        type: uint
+        doc: Number of packets dropped due to unknown key ID
+      -
+        name: rx-unsupported-proto
+        type: uint
+        doc: >-
+          Number of packets dropped due to unsupported or malformed inner
+          protocol
+      -
+        name: rx-rpf-errors
+        type: uint
+        doc: Number of packets dropped by the reverse path filtering check
+      -
+        name: tx-encrypt-errors
+        type: uint
+        doc: Number of packets dropped due to encryption failure
+      -
+        name: tx-iv-exhausted
+        type: uint
+        doc: Number of packets dropped due to packet ID (IV) exhaustion
+      -
+        name: tx-no-key
+        type: uint
+        doc: Number of packets dropped due to missing primary key
+      -
+        name: tx-no-transport
+        type: uint
+        doc: Number of packets dropped due to missing transport socket
+      -
+        name: tx-gso-errors
+        type: uint
+        doc: Number of packets dropped due to GSO segmentation failure
+      -
+        name: keepalive-rx
+        type: uint
+        doc: Number of keepalive packets received from this peer
+      -
+        name: keepalive-tx
+        type: uint
+        doc: Number of keepalive packets sent to this peer
+      -
+        name: float-count
+        type: uint
+        doc: Number of times the peer endpoint floated
   -
     name: peer-new-input
     subset-of: peer

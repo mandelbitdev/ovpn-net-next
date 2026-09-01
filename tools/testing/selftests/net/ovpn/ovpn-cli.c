@@ -893,6 +893,66 @@ static int ovpn_handle_peer(struct nl_msg *msg, void (*arg)__always_unused)
 		fprintf(stderr, "\tLINK TX packets: %" PRIu64 "\n",
 			ovpn_nla_get_uint(pattrs[OVPN_A_PEER_LINK_TX_PACKETS]));
 
+	if (pattrs[OVPN_A_PEER_ESTATS]) {
+		struct nlattr *eattrs[OVPN_A_PEER_ESTATS_MAX + 1];
+
+		nla_parse(eattrs, OVPN_A_PEER_ESTATS_MAX,
+			  nla_data(pattrs[OVPN_A_PEER_ESTATS]),
+			  nla_len(pattrs[OVPN_A_PEER_ESTATS]), NULL);
+
+		if (eattrs[OVPN_A_PEER_ESTATS_RX_DECRYPT_ERRORS])
+			fprintf(stderr, "\tRX decrypt errors: %" PRIu64 "\n",
+				ovpn_nla_get_uint(eattrs[OVPN_A_PEER_ESTATS_RX_DECRYPT_ERRORS]));
+
+		if (eattrs[OVPN_A_PEER_ESTATS_RX_REPLAY_ERRORS])
+			fprintf(stderr, "\tRX replay errors: %" PRIu64 "\n",
+				ovpn_nla_get_uint(eattrs[OVPN_A_PEER_ESTATS_RX_REPLAY_ERRORS]));
+
+		if (eattrs[OVPN_A_PEER_ESTATS_RX_UNKNOWN_KEYID])
+			fprintf(stderr, "\tRX unknown key-id: %" PRIu64 "\n",
+				ovpn_nla_get_uint(eattrs[OVPN_A_PEER_ESTATS_RX_UNKNOWN_KEYID]));
+
+		if (eattrs[OVPN_A_PEER_ESTATS_RX_UNSUPPORTED_PROTO])
+			fprintf(stderr, "\tRX unsupported/malformed proto: %" PRIu64 "\n",
+				ovpn_nla_get_uint(eattrs[OVPN_A_PEER_ESTATS_RX_UNSUPPORTED_PROTO]));
+
+		if (eattrs[OVPN_A_PEER_ESTATS_RX_RPF_ERRORS])
+			fprintf(stderr, "\tRX RPF errors: %" PRIu64 "\n",
+				ovpn_nla_get_uint(eattrs[OVPN_A_PEER_ESTATS_RX_RPF_ERRORS]));
+
+		if (eattrs[OVPN_A_PEER_ESTATS_TX_ENCRYPT_ERRORS])
+			fprintf(stderr, "\tTX encrypt errors: %" PRIu64 "\n",
+				ovpn_nla_get_uint(eattrs[OVPN_A_PEER_ESTATS_TX_ENCRYPT_ERRORS]));
+
+		if (eattrs[OVPN_A_PEER_ESTATS_TX_IV_EXHAUSTED])
+			fprintf(stderr, "\tTX IV exhausted: %" PRIu64 "\n",
+				ovpn_nla_get_uint(eattrs[OVPN_A_PEER_ESTATS_TX_IV_EXHAUSTED]));
+
+		if (eattrs[OVPN_A_PEER_ESTATS_TX_NO_KEY])
+			fprintf(stderr, "\tTX no key: %" PRIu64 "\n",
+				ovpn_nla_get_uint(eattrs[OVPN_A_PEER_ESTATS_TX_NO_KEY]));
+
+		if (eattrs[OVPN_A_PEER_ESTATS_TX_NO_TRANSPORT])
+			fprintf(stderr, "\tTX no transport: %" PRIu64 "\n",
+				ovpn_nla_get_uint(eattrs[OVPN_A_PEER_ESTATS_TX_NO_TRANSPORT]));
+
+		if (eattrs[OVPN_A_PEER_ESTATS_TX_GSO_ERRORS])
+			fprintf(stderr, "\tTX GSO errors: %" PRIu64 "\n",
+				ovpn_nla_get_uint(eattrs[OVPN_A_PEER_ESTATS_TX_GSO_ERRORS]));
+
+		if (eattrs[OVPN_A_PEER_ESTATS_KEEPALIVE_RX])
+			fprintf(stderr, "\tKeepalive RX: %" PRIu64 "\n",
+				ovpn_nla_get_uint(eattrs[OVPN_A_PEER_ESTATS_KEEPALIVE_RX]));
+
+		if (eattrs[OVPN_A_PEER_ESTATS_KEEPALIVE_TX])
+			fprintf(stderr, "\tKeepalive TX: %" PRIu64 "\n",
+				ovpn_nla_get_uint(eattrs[OVPN_A_PEER_ESTATS_KEEPALIVE_TX]));
+
+		if (eattrs[OVPN_A_PEER_ESTATS_FLOAT_COUNT])
+			fprintf(stderr, "\tFloat count: %" PRIu64 "\n",
+				ovpn_nla_get_uint(eattrs[OVPN_A_PEER_ESTATS_FLOAT_COUNT]));
+	}
+
 	return NL_SKIP;
 }
 

@@ -63,7 +63,7 @@ const struct nla_policy ovpn_keydir_nl_policy[OVPN_A_KEYDIR_NONCE_TAIL + 1] = {
 	[OVPN_A_KEYDIR_NONCE_TAIL] = NLA_POLICY_EXACT_LEN(OVPN_NONCE_TAIL_SIZE),
 };
 
-const struct nla_policy ovpn_peer_nl_policy[OVPN_A_PEER_TX_ID + 1] = {
+const struct nla_policy ovpn_peer_nl_policy[OVPN_A_PEER_ESTATS + 1] = {
 	[OVPN_A_PEER_ID] = NLA_POLICY_FULL_RANGE(NLA_U32, &ovpn_a_peer_id_range),
 	[OVPN_A_PEER_REMOTE_IPV4] = { .type = NLA_BE32, },
 	[OVPN_A_PEER_REMOTE_IPV6] = NLA_POLICY_EXACT_LEN(16),
@@ -88,10 +88,27 @@ const struct nla_policy ovpn_peer_nl_policy[OVPN_A_PEER_TX_ID + 1] = {
 	[OVPN_A_PEER_LINK_RX_PACKETS] = { .type = NLA_UINT, },
 	[OVPN_A_PEER_LINK_TX_PACKETS] = { .type = NLA_UINT, },
 	[OVPN_A_PEER_TX_ID] = NLA_POLICY_FULL_RANGE(NLA_U32, &ovpn_a_peer_tx_id_range),
+	[OVPN_A_PEER_ESTATS] = NLA_POLICY_NESTED(ovpn_peer_estats_nl_policy),
 };
 
 const struct nla_policy ovpn_peer_del_input_nl_policy[OVPN_A_PEER_ID + 1] = {
 	[OVPN_A_PEER_ID] = NLA_POLICY_FULL_RANGE(NLA_U32, &ovpn_a_peer_id_range),
+};
+
+const struct nla_policy ovpn_peer_estats_nl_policy[OVPN_A_PEER_ESTATS_FLOAT_COUNT + 1] = {
+	[OVPN_A_PEER_ESTATS_RX_DECRYPT_ERRORS] = { .type = NLA_UINT, },
+	[OVPN_A_PEER_ESTATS_RX_REPLAY_ERRORS] = { .type = NLA_UINT, },
+	[OVPN_A_PEER_ESTATS_RX_UNKNOWN_KEYID] = { .type = NLA_UINT, },
+	[OVPN_A_PEER_ESTATS_RX_UNSUPPORTED_PROTO] = { .type = NLA_UINT, },
+	[OVPN_A_PEER_ESTATS_RX_RPF_ERRORS] = { .type = NLA_UINT, },
+	[OVPN_A_PEER_ESTATS_TX_ENCRYPT_ERRORS] = { .type = NLA_UINT, },
+	[OVPN_A_PEER_ESTATS_TX_IV_EXHAUSTED] = { .type = NLA_UINT, },
+	[OVPN_A_PEER_ESTATS_TX_NO_KEY] = { .type = NLA_UINT, },
+	[OVPN_A_PEER_ESTATS_TX_NO_TRANSPORT] = { .type = NLA_UINT, },
+	[OVPN_A_PEER_ESTATS_TX_GSO_ERRORS] = { .type = NLA_UINT, },
+	[OVPN_A_PEER_ESTATS_KEEPALIVE_RX] = { .type = NLA_UINT, },
+	[OVPN_A_PEER_ESTATS_KEEPALIVE_TX] = { .type = NLA_UINT, },
+	[OVPN_A_PEER_ESTATS_FLOAT_COUNT] = { .type = NLA_UINT, },
 };
 
 const struct nla_policy ovpn_peer_new_input_nl_policy[OVPN_A_PEER_TX_ID + 1] = {
