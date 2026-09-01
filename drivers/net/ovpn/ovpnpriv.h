@@ -45,6 +45,7 @@ struct ovpn_peer_collection {
  * @peer: in P2P mode, this is the only remote peer
  * @gro_cells: pointer to the Generic Receive Offload cell
  * @keepalive_work: struct used to schedule keepalive periodic job
+ * @estats: monotonic per-CPU device-wide drop/event counters
  */
 struct ovpn_priv {
 	struct net_device *dev;
@@ -54,6 +55,7 @@ struct ovpn_priv {
 	struct ovpn_peer __rcu *peer;
 	struct gro_cells gro_cells;
 	struct delayed_work keepalive_work;
+	struct ovpn_dev_estats __percpu *estats;
 };
 
 #endif /* _NET_OVPN_OVPNSTRUCT_H_ */

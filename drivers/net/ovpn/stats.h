@@ -58,6 +58,71 @@ struct ovpn_peer_estats {
 	atomic64_t floats;
 };
 
+#define OVPN_PEER_DROP_ESTATS(R)			\
+	R(rx_decrypt_errors, RX_DECRYPT_ERRORS)		\
+	R(rx_replay_errors, RX_REPLAY_ERRORS)		\
+	R(rx_unknown_keyid, RX_UNKNOWN_KEYID)		\
+	R(rx_unsupported_proto, RX_UNSUPPORTED_PROTO)	\
+	R(rx_rpf_errors, RX_RPF_ERRORS)			\
+	R(tx_encrypt_errors, TX_ENCRYPT_ERRORS)		\
+	R(tx_iv_exhausted, TX_IV_EXHAUSTED)		\
+	R(tx_no_key, TX_NO_KEY)				\
+	R(tx_no_transport, TX_NO_TRANSPORT)		\
+	R(tx_gso_errors, TX_GSO_ERRORS)
+
+#define OVPN_PEER_EVENT_ESTATS(R)			\
+	R(keepalive_rx, KEEPALIVE_RX)			\
+	R(keepalive_tx, KEEPALIVE_TX)			\
+	R(floats, FLOATS)
+
+#define OVPN_DEV_DROP_ESTATS(R)				\
+	R(rx_no_peer, RX_NO_PEER)			\
+	R(tx_no_peer, TX_NO_PEER)			\
+	R(tx_bad_proto, TX_BAD_PROTO)
+
+#define OVPN_PEER_ESTAT_IDX(_counter) \
+	(offsetof(struct ovpn_peer_estats, _counter) / sizeof(atomic64_t))
+
+enum ovpn_dev_estat {
+#define OVPN_ESTAT_COUNT_ONE(_counter, _name) + 1
+	OVPN_PEER_ESTAT_COUNT = 0
+	OVPN_PEER_DROP_ESTATS(OVPN_ESTAT_COUNT_ONE)
+	OVPN_PEER_EVENT_ESTATS(OVPN_ESTAT_COUNT_ONE),
+#undef OVPN_ESTAT_COUNT_ONE
+#define OVPN_PEER_ESTAT_ENUM(_counter, _name) \
+	OVPN_DEV_ESTAT_##_name = OVPN_PEER_ESTAT_IDX(_counter),
+	OVPN_PEER_DROP_ESTATS(OVPN_PEER_ESTAT_ENUM)
+	OVPN_PEER_EVENT_ESTATS(OVPN_PEER_ESTAT_ENUM)
+#undef OVPN_PEER_ESTAT_ENUM
+	__OVPN_DEV_ESTAT_PEER_LAST = OVPN_PEER_ESTAT_COUNT - 1,
+#define OVPN_DEV_ESTAT_ENUM(_counter, _name) OVPN_DEV_ESTAT_##_name,
+	OVPN_DEV_DROP_ESTATS(OVPN_DEV_ESTAT_ENUM)
+#undef OVPN_DEV_ESTAT_ENUM
+	OVPN_DEV_ESTAT_COUNT,
+};
+
+static_assert(OVPN_PEER_ESTAT_COUNT ==
+	      sizeof(struct ovpn_peer_estats) / sizeof(atomic64_t));
+
+struct ovpn_dev_estats {
+	u64_stats_t counters[OVPN_DEV_ESTAT_COUNT];
+	struct u64_stats_sync syncp;
+};
+
+static inline void
+ovpn_dev_estats_inc(struct ovpn_dev_estats __percpu *estats,
+		    unsigned int index)
+{
+	struct ovpn_dev_estats *stats;
+
+	local_bh_disable();
+	stats = this_cpu_ptr(estats);
+	u64_stats_update_begin(&stats->syncp);
+	u64_stats_inc(&stats->counters[index]);
+	u64_stats_update_end(&stats->syncp);
+	local_bh_enable();
+}
+
 void ovpn_peer_stats_init(struct ovpn_peer_stats *ps);
 
 static inline void ovpn_peer_stats_increment(struct ovpn_peer_stat *stat,

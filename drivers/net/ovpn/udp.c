@@ -116,8 +116,11 @@ static int ovpn_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
 	else
 		peer = ovpn_peer_get_by_id(ovpn, peer_id);
 
-	if (unlikely(!peer))
+	if (unlikely(!peer)) {
+		ovpn_dev_estats_inc(ovpn->estats,
+				    OVPN_DEV_ESTAT_RX_NO_PEER);
 		goto drop;
+	}
 
 	/* pop off outer UDP header */
 	__skb_pull(skb, sizeof(struct udphdr));

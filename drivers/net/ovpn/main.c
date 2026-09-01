@@ -34,6 +34,7 @@ static void ovpn_priv_free(struct net_device *net)
 {
 	struct ovpn_priv *ovpn = netdev_priv(net);
 
+	free_percpu(ovpn->estats);
 	kfree(ovpn->peers);
 }
 
@@ -64,18 +65,29 @@ static int ovpn_mp_alloc(struct ovpn_priv *ovpn)
 static int ovpn_net_init(struct net_device *dev)
 {
 	struct ovpn_priv *ovpn = netdev_priv(dev);
-	int err = gro_cells_init(&ovpn->gro_cells, dev);
+	int err;
+
+	ovpn->estats = netdev_alloc_pcpu_stats(struct ovpn_dev_estats);
+	if (!ovpn->estats)
+		return -ENOMEM;
+
+	err = gro_cells_init(&ovpn->gro_cells, dev);
 
 	if (err < 0)
-		return err;
+		goto err_free_estats;
 
 	err = ovpn_mp_alloc(ovpn);
 	if (err < 0) {
 		gro_cells_destroy(&ovpn->gro_cells);
-		return err;
+		goto err_free_estats;
 	}
 
 	return 0;
+
+err_free_estats:
+	free_percpu(ovpn->estats);
+	ovpn->estats = NULL;
+	return err;
 }
 
 static void ovpn_net_uninit(struct net_device *dev)
@@ -149,10 +161,65 @@ static void ovpn_get_drvinfo(struct net_device *dev,
 	strscpy(info->bus_info, "ovpn", sizeof(info->bus_info));
 }
 
+static const char * const ovpn_ethtool_stats[] = {
+#define OVPN_ETHTOOL_ESTAT(_counter, _name) \
+	[OVPN_DEV_ESTAT_##_name] = #_counter,
+	OVPN_PEER_DROP_ESTATS(OVPN_ETHTOOL_ESTAT)
+	OVPN_PEER_EVENT_ESTATS(OVPN_ETHTOOL_ESTAT)
+	OVPN_DEV_DROP_ESTATS(OVPN_ETHTOOL_ESTAT)
+#undef OVPN_ETHTOOL_ESTAT
+};
+
+static void ovpn_get_strings(struct net_device *dev, u32 stringset, u8 *data)
+{
+	unsigned int i;
+
+	if (stringset != ETH_SS_STATS)
+		return;
+
+	for (i = 0; i < ARRAY_SIZE(ovpn_ethtool_stats); i++)
+		ethtool_puts(&data, ovpn_ethtool_stats[i]);
+}
+
+static int ovpn_get_sset_count(struct net_device *dev, int sset)
+{
+	if (sset == ETH_SS_STATS)
+		return ARRAY_SIZE(ovpn_ethtool_stats);
+
+	return -EOPNOTSUPP;
+}
+
+static void ovpn_get_ethtool_stats(struct net_device *dev,
+				   struct ethtool_stats *stats, u64 *data)
+{
+	struct ovpn_priv *ovpn = netdev_priv(dev);
+	struct ovpn_dev_estats *estats;
+	const u64_stats_t *counter;
+	unsigned int start, i;
+	u64 value;
+	int cpu;
+
+	for (i = 0; i < ARRAY_SIZE(ovpn_ethtool_stats); i++) {
+		data[i] = 0;
+		for_each_possible_cpu(cpu) {
+			estats = per_cpu_ptr(ovpn->estats, cpu);
+			counter = &estats->counters[i];
+			do {
+				start = u64_stats_fetch_begin(&estats->syncp);
+				value = u64_stats_read(counter);
+			} while (u64_stats_fetch_retry(&estats->syncp, start));
+			data[i] += value;
+		}
+	}
+}
+
 static const struct ethtool_ops ovpn_ethtool_ops = {
 	.get_drvinfo		= ovpn_get_drvinfo,
 	.get_link		= ethtool_op_get_link,
 	.get_ts_info		= ethtool_op_get_ts_info,
+	.get_strings		= ovpn_get_strings,
+	.get_sset_count		= ovpn_get_sset_count,
+	.get_ethtool_stats	= ovpn_get_ethtool_stats,
 };
 
 static void ovpn_setup(struct net_device *dev)
