@@ -119,6 +119,22 @@ struct ovpn_peer {
 };
 
 /**
+ * ovpn_estats_inc - increment a counter in both the per-peer and the
+ *		     device-wide extended statistics
+ * @peer: peer whose counter should be incremented
+ * @counter: name of the counter member in struct ovpn_peer_estats
+ *
+ * Device-wide counters are monotonic, they do not decrease when a peer
+ * is deleted. For device only counters use ovpn_dev_estats_inc() instead.
+ */
+#define ovpn_estats_inc(peer, counter)					\
+	do {								\
+		atomic64_inc(&(peer)->estats.counter);			\
+		ovpn_dev_estats_inc((peer)->ovpn->estats,		\
+				    OVPN_PEER_ESTAT_IDX(counter));	\
+	} while (0)
+
+/**
  * ovpn_peer_hold - increase reference counter
  * @peer: the peer whose counter should be increased
  *

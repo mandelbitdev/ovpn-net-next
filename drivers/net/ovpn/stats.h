@@ -58,6 +58,37 @@ struct ovpn_peer_estats {
 	atomic64_t floats;
 };
 
+#define OVPN_PEER_ESTAT_COUNT \
+	(sizeof(struct ovpn_peer_estats) / sizeof(atomic64_t))
+#define OVPN_PEER_ESTAT_IDX(_counter) \
+	(offsetof(struct ovpn_peer_estats, _counter) / sizeof(atomic64_t))
+
+enum ovpn_dev_estat {
+	OVPN_DEV_ESTAT_RX_NO_PEER = OVPN_PEER_ESTAT_COUNT,
+	OVPN_DEV_ESTAT_TX_NO_PEER,
+	OVPN_DEV_ESTAT_TX_BAD_PROTO,
+	OVPN_DEV_ESTAT_COUNT,
+};
+
+struct ovpn_dev_estats {
+	u64_stats_t counters[OVPN_DEV_ESTAT_COUNT];
+	struct u64_stats_sync syncp;
+};
+
+static inline void
+ovpn_dev_estats_inc(struct ovpn_dev_estats __percpu *estats,
+		    unsigned int index)
+{
+	struct ovpn_dev_estats *stats;
+
+	local_bh_disable();
+	stats = this_cpu_ptr(estats);
+	u64_stats_update_begin(&stats->syncp);
+	u64_stats_inc(&stats->counters[index]);
+	u64_stats_update_end(&stats->syncp);
+	local_bh_enable();
+}
+
 void ovpn_peer_stats_init(struct ovpn_peer_stats *ps);
 
 static inline void ovpn_peer_stats_increment(struct ovpn_peer_stat *stat,

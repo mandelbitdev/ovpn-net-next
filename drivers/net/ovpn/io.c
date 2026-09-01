@@ -129,7 +129,7 @@ void ovpn_decrypt_post(void *data, int ret)
 	kfree(ovpn_skb_cb(skb)->crypto_tmp);
 
 	if (unlikely(ret < 0)) {
-		atomic64_inc(&peer->estats.rx_decrypt_errors);
+		ovpn_estats_inc(peer, rx_decrypt_errors);
 		goto drop;
 	}
 
@@ -140,7 +140,7 @@ void ovpn_decrypt_post(void *data, int ret)
 		net_err_ratelimited("%s: PKT ID RX error for peer %u: %d\n",
 				    netdev_name(peer->ovpn->dev), peer->id,
 				    ret);
-		atomic64_inc(&peer->estats.rx_replay_errors);
+		ovpn_estats_inc(peer, rx_replay_errors);
 		goto drop;
 	}
 
@@ -168,7 +168,7 @@ void ovpn_decrypt_post(void *data, int ret)
 			net_info_ratelimited("%s: NULL packet received from peer %u\n",
 					     netdev_name(peer->ovpn->dev),
 					     peer->id);
-			atomic64_inc(&peer->estats.rx_unsupported_proto);
+			ovpn_estats_inc(peer, rx_unsupported_proto);
 			goto drop;
 		}
 
@@ -176,7 +176,7 @@ void ovpn_decrypt_post(void *data, int ret)
 			net_dbg_ratelimited("%s: ping received from peer %u\n",
 					    netdev_name(peer->ovpn->dev),
 					    peer->id);
-			atomic64_inc(&peer->estats.keepalive_rx);
+			ovpn_estats_inc(peer, keepalive_rx);
 			/* we drop the packet, but this is not a failure */
 			consume_skb(skb);
 			goto drop_nocount;
@@ -184,7 +184,7 @@ void ovpn_decrypt_post(void *data, int ret)
 
 		net_info_ratelimited("%s: unsupported protocol received from peer %u\n",
 				     netdev_name(peer->ovpn->dev), peer->id);
-		atomic64_inc(&peer->estats.rx_unsupported_proto);
+		ovpn_estats_inc(peer, rx_unsupported_proto);
 		goto drop;
 	}
 	skb->protocol = proto;
@@ -199,7 +199,7 @@ void ovpn_decrypt_post(void *data, int ret)
 			net_dbg_ratelimited("%s: RPF dropped packet from peer %u, src: %pI4\n",
 					    netdev_name(peer->ovpn->dev),
 					    peer->id, &ip_hdr(skb)->saddr);
-		atomic64_inc(&peer->estats.rx_rpf_errors);
+		ovpn_estats_inc(peer, rx_rpf_errors);
 		goto drop;
 	}
 
@@ -232,7 +232,7 @@ void ovpn_recv(struct ovpn_peer *peer, struct sk_buff *skb)
 		net_info_ratelimited("%s: no available key for peer %u, key-id: %u\n",
 				     netdev_name(peer->ovpn->dev), peer->id,
 				     key_id);
-		atomic64_inc(&peer->estats.rx_unknown_keyid);
+		ovpn_estats_inc(peer, rx_unknown_keyid);
 		ovpn_dev_dstats_rx_dropped(peer->ovpn->dev);
 		kfree_skb(skb);
 		ovpn_peer_put(peer);
@@ -274,12 +274,12 @@ void ovpn_encrypt_post(void *data, int ret)
 			/* let userspace know so that a new key must be negotiated */
 			ovpn_nl_key_swap_notify(peer, ks->key_id);
 
-		atomic64_inc(&peer->estats.tx_iv_exhausted);
+		ovpn_estats_inc(peer, tx_iv_exhausted);
 		goto err;
 	}
 
 	if (unlikely(ret < 0)) {
-		atomic64_inc(&peer->estats.tx_encrypt_errors);
+		ovpn_estats_inc(peer, tx_encrypt_errors);
 		goto err;
 	}
 
@@ -289,7 +289,7 @@ void ovpn_encrypt_post(void *data, int ret)
 	rcu_read_lock();
 	sock = rcu_dereference(peer->sock);
 	if (unlikely(!sock)) {
-		atomic64_inc(&peer->estats.tx_no_transport);
+		ovpn_estats_inc(peer, tx_no_transport);
 		goto err_unlock;
 	}
 
@@ -302,7 +302,7 @@ void ovpn_encrypt_post(void *data, int ret)
 		break;
 	default:
 		/* no transport configured yet */
-		atomic64_inc(&peer->estats.tx_no_transport);
+		ovpn_estats_inc(peer, tx_no_transport);
 		goto err_unlock;
 	}
 
@@ -330,7 +330,7 @@ static bool ovpn_encrypt_one(struct ovpn_peer *peer, struct sk_buff *skb)
 	/* get primary key to be used for encrypting data */
 	ks = ovpn_crypto_key_slot_primary(&peer->crypto);
 	if (unlikely(!ks)) {
-		atomic64_inc(&peer->estats.tx_no_key);
+		ovpn_estats_inc(peer, tx_no_key);
 		return false;
 	}
 
@@ -384,8 +384,11 @@ netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
 
 	/* verify IP header size in network packet */
 	proto = ovpn_ip_check_protocol(skb);
-	if (unlikely(!proto || skb->protocol != proto))
+	if (unlikely(!proto || skb->protocol != proto)) {
+		ovpn_dev_estats_inc(ovpn->estats,
+				    OVPN_DEV_ESTAT_TX_BAD_PROTO);
 		goto drop_no_peer;
+	}
 
 	/* retrieve peer serving the destination IP of this packet */
 	peer = ovpn_peer_get_by_dst(ovpn, skb);
@@ -402,6 +405,8 @@ netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
 					    &ipv6_hdr(skb)->daddr);
 			break;
 		}
+		ovpn_dev_estats_inc(ovpn->estats,
+				    OVPN_DEV_ESTAT_TX_NO_PEER);
 		goto drop_no_peer;
 	}
 	/* dst was needed for peer selection - it can now be dropped */
@@ -413,7 +418,7 @@ netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
 			ret = PTR_ERR(segments);
 			net_err_ratelimited("%s: cannot segment payload packet: %d\n",
 					    netdev_name(dev), ret);
-			atomic64_inc(&peer->estats.tx_gso_errors);
+			ovpn_estats_inc(peer, tx_gso_errors);
 			goto drop;
 		}
 
