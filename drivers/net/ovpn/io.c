@@ -20,6 +20,7 @@
 #include "bind.h"
 #include "crypto.h"
 #include "crypto_aead.h"
+#include "drop.h"
 #include "netlink.h"
 #include "proto.h"
 #include "tcp.h"
@@ -109,6 +110,7 @@ void ovpn_decrypt_post(void *data, int ret)
 {
 	struct ovpn_crypto_key_slot *ks;
 	unsigned int payload_offset = 0;
+	enum ovpn_drop_reason reason;
 	struct sk_buff *skb = data;
 	struct ovpn_socket *sock;
 	struct ovpn_peer *peer;
@@ -130,6 +132,7 @@ void ovpn_decrypt_post(void *data, int ret)
 
 	if (unlikely(ret < 0)) {
 		ovpn_estats_inc(peer, rx_decrypt_errors);
+		reason = OVPN_DROP_RX_DECRYPT_ERRORS;
 		goto drop;
 	}
 
@@ -141,6 +144,7 @@ void ovpn_decrypt_post(void *data, int ret)
 				    netdev_name(peer->ovpn->dev), peer->id,
 				    ret);
 		ovpn_estats_inc(peer, rx_replay_errors);
+		reason = OVPN_DROP_RX_REPLAY_ERRORS;
 		goto drop;
 	}
 
@@ -169,6 +173,7 @@ void ovpn_decrypt_post(void *data, int ret)
 					     netdev_name(peer->ovpn->dev),
 					     peer->id);
 			ovpn_estats_inc(peer, rx_unsupported_proto);
+			reason = OVPN_DROP_RX_UNSUPPORTED_PROTO;
 			goto drop;
 		}
 
@@ -185,6 +190,7 @@ void ovpn_decrypt_post(void *data, int ret)
 		net_info_ratelimited("%s: unsupported protocol received from peer %u\n",
 				     netdev_name(peer->ovpn->dev), peer->id);
 		ovpn_estats_inc(peer, rx_unsupported_proto);
+		reason = OVPN_DROP_RX_UNSUPPORTED_PROTO;
 		goto drop;
 	}
 	skb->protocol = proto;
@@ -200,6 +206,7 @@ void ovpn_decrypt_post(void *data, int ret)
 					    netdev_name(peer->ovpn->dev),
 					    peer->id, &ip_hdr(skb)->saddr);
 		ovpn_estats_inc(peer, rx_rpf_errors);
+		reason = OVPN_DROP_RX_RPF_ERRORS;
 		goto drop;
 	}
 
@@ -207,9 +214,10 @@ void ovpn_decrypt_post(void *data, int ret)
 	/* skb is passed to upper layer - don't free it */
 	skb = NULL;
 drop:
-	if (unlikely(skb))
+	if (unlikely(skb)) {
 		ovpn_dev_dstats_rx_dropped(peer->ovpn->dev);
-	kfree_skb(skb);
+		ovpn_kfree_skb_reason(skb, reason);
+	}
 drop_nocount:
 	if (likely(ks))
 		ovpn_crypto_key_slot_put(ks);
@@ -234,7 +242,7 @@ void ovpn_recv(struct ovpn_peer *peer, struct sk_buff *skb)
 				     key_id);
 		ovpn_estats_inc(peer, rx_unknown_keyid);
 		ovpn_dev_dstats_rx_dropped(peer->ovpn->dev);
-		kfree_skb(skb);
+		ovpn_kfree_skb_reason(skb, OVPN_DROP_RX_UNKNOWN_KEYID);
 		ovpn_peer_put(peer);
 		return;
 	}
@@ -246,6 +254,7 @@ void ovpn_recv(struct ovpn_peer *peer, struct sk_buff *skb)
 void ovpn_encrypt_post(void *data, int ret)
 {
 	struct ovpn_crypto_key_slot *ks;
+	enum ovpn_drop_reason reason;
 	struct sk_buff *skb = data;
 	struct ovpn_socket *sock;
 	struct ovpn_peer *peer;
@@ -275,11 +284,13 @@ void ovpn_encrypt_post(void *data, int ret)
 			ovpn_nl_key_swap_notify(peer, ks->key_id);
 
 		ovpn_estats_inc(peer, tx_iv_exhausted);
+		reason = OVPN_DROP_TX_IV_EXHAUSTED;
 		goto err;
 	}
 
 	if (unlikely(ret < 0)) {
 		ovpn_estats_inc(peer, tx_encrypt_errors);
+		reason = OVPN_DROP_TX_ENCRYPT_ERRORS;
 		goto err;
 	}
 
@@ -290,6 +301,7 @@ void ovpn_encrypt_post(void *data, int ret)
 	sock = rcu_dereference(peer->sock);
 	if (unlikely(!sock)) {
 		ovpn_estats_inc(peer, tx_no_transport);
+		reason = OVPN_DROP_TX_NO_TRANSPORT;
 		goto err_unlock;
 	}
 
@@ -303,6 +315,7 @@ void ovpn_encrypt_post(void *data, int ret)
 	default:
 		/* no transport configured yet */
 		ovpn_estats_inc(peer, tx_no_transport);
+		reason = OVPN_DROP_TX_NO_TRANSPORT;
 		goto err_unlock;
 	}
 
@@ -314,16 +327,18 @@ void ovpn_encrypt_post(void *data, int ret)
 err_unlock:
 	rcu_read_unlock();
 err:
-	if (unlikely(skb))
+	if (unlikely(skb)) {
 		ovpn_dev_dstats_tx_dropped(peer->ovpn->dev);
-	kfree_skb(skb);
+		ovpn_kfree_skb_reason(skb, reason);
+	}
 	if (likely(ks))
 		ovpn_crypto_key_slot_put(ks);
 	if (likely(peer))
 		ovpn_peer_put(peer);
 }
 
-static bool ovpn_encrypt_one(struct ovpn_peer *peer, struct sk_buff *skb)
+static enum skb_drop_reason ovpn_encrypt_one(struct ovpn_peer *peer,
+					     struct sk_buff *skb)
 {
 	struct ovpn_crypto_key_slot *ks;
 
@@ -331,7 +346,7 @@ static bool ovpn_encrypt_one(struct ovpn_peer *peer, struct sk_buff *skb)
 	ks = ovpn_crypto_key_slot_primary(&peer->crypto);
 	if (unlikely(!ks)) {
 		ovpn_estats_inc(peer, tx_no_key);
-		return false;
+		return (enum skb_drop_reason)OVPN_DROP_TX_NO_KEY;
 	}
 
 	/* take a reference to the peer because the crypto code may run async.
@@ -340,12 +355,12 @@ static bool ovpn_encrypt_one(struct ovpn_peer *peer, struct sk_buff *skb)
 	if (unlikely(!ovpn_peer_hold(peer))) {
 		DEBUG_NET_WARN_ON_ONCE(1);
 		ovpn_crypto_key_slot_put(ks);
-		return false;
+		return SKB_DROP_REASON_NOT_SPECIFIED;
 	}
 
 	memset(ovpn_skb_cb(skb), 0, sizeof(struct ovpn_cb));
 	ovpn_encrypt_post(skb, ovpn_aead_encrypt(peer, ks, skb));
-	return true;
+	return SKB_NOT_DROPPED_YET;
 }
 
 /* send skb to connected peer, if any */
@@ -353,14 +368,16 @@ static void ovpn_send(struct ovpn_priv *ovpn, struct sk_buff *skb,
 		      struct ovpn_peer *peer)
 {
 	struct sk_buff *curr, *next;
+	enum skb_drop_reason reason;
 
 	/* this might be a GSO-segmented skb list: process each skb
 	 * independently
 	 */
 	skb_list_walk_safe(skb, curr, next) {
-		if (unlikely(!ovpn_encrypt_one(peer, curr))) {
+		reason = ovpn_encrypt_one(peer, curr);
+		if (unlikely(reason != SKB_NOT_DROPPED_YET)) {
 			ovpn_dev_dstats_tx_dropped(ovpn->dev);
-			kfree_skb(curr);
+			kfree_skb_reason(curr, reason);
 		}
 	}
 
@@ -374,6 +391,7 @@ netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
 	struct ovpn_priv *ovpn = netdev_priv(dev);
 	struct sk_buff *segments, *curr, *next;
 	struct sk_buff_head skb_list;
+	enum ovpn_drop_reason reason;
 	unsigned int tx_bytes = 0;
 	struct ovpn_peer *peer;
 	__be16 proto;
@@ -387,6 +405,7 @@ netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
 	if (unlikely(!proto || skb->protocol != proto)) {
 		ovpn_dev_estats_inc(ovpn->estats,
 				    OVPN_DEV_ESTAT_TX_BAD_PROTO);
+		reason = OVPN_DROP_TX_BAD_PROTO;
 		goto drop_no_peer;
 	}
 
@@ -407,6 +426,7 @@ netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
 		}
 		ovpn_dev_estats_inc(ovpn->estats,
 				    OVPN_DEV_ESTAT_TX_NO_PEER);
+		reason = OVPN_DROP_TX_NO_PEER;
 		goto drop_no_peer;
 	}
 	/* dst was needed for peer selection - it can now be dropped */
@@ -419,6 +439,7 @@ netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
 			net_err_ratelimited("%s: cannot segment payload packet: %d\n",
 					    netdev_name(dev), ret);
 			ovpn_estats_inc(peer, tx_gso_errors);
+			reason = OVPN_DROP_TX_GSO_ERRORS;
 			goto drop;
 		}
 
@@ -464,7 +485,7 @@ drop:
 drop_no_peer:
 	ovpn_dev_dstats_tx_dropped(ovpn->dev);
 	skb_tx_error(skb);
-	kfree_skb_list(skb);
+	ovpn_kfree_skb_list_reason(skb, reason);
 	return NETDEV_TX_OK;
 }
 

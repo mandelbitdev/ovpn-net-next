@@ -29,6 +29,12 @@ enum skb_drop_reason_subsys {
 	 */
 	SKB_DROP_REASON_SUBSYS_QDISC,
 
+	/**
+	 * @SKB_DROP_REASON_SUBSYS_OVPN: OpenVPN data channel drop reasons,
+	 * see drivers/net/ovpn/drop.h
+	 */
+	SKB_DROP_REASON_SUBSYS_OVPN,
+
 	/** @SKB_DROP_REASON_SUBSYS_NUM: number of subsystems defined */
 	SKB_DROP_REASON_SUBSYS_NUM
 };

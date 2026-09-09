@@ -21,6 +21,7 @@
 #include "ovpnpriv.h"
 #include "main.h"
 #include "bind.h"
+#include "drop.h"
 #include "io.h"
 #include "peer.h"
 #include "proto.h"
@@ -66,6 +67,7 @@ static struct ovpn_socket *ovpn_socket_from_udp_sock(struct sock *sk)
  */
 static int ovpn_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
 {
+	enum skb_drop_reason reason = SKB_DROP_REASON_NOT_SPECIFIED;
 	struct ovpn_socket *ovpn_sock;
 	struct ovpn_priv *ovpn;
 	struct ovpn_peer *peer;
@@ -89,18 +91,22 @@ static int ovpn_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
 	 * header are accessible.
 	 * They are required to fetch the OP code, the key ID and the peer ID.
 	 */
-	if (unlikely(!pskb_may_pull(skb, sizeof(struct udphdr) +
-				    OVPN_OPCODE_SIZE))) {
-		net_dbg_ratelimited("%s: packet too small from UDP socket\n",
-				    netdev_name(ovpn->dev));
+	reason = pskb_may_pull_reason(skb, sizeof(struct udphdr) +
+				    OVPN_OPCODE_SIZE);
+	if (unlikely(reason != SKB_NOT_DROPPED_YET)) {
+		if (reason == SKB_DROP_REASON_PKT_TOO_SMALL)
+			net_dbg_ratelimited("%s: packet too small from UDP socket\n",
+					    netdev_name(ovpn->dev));
 		goto drop;
 	}
 
 	opcode = ovpn_opcode_from_skb(skb, sizeof(struct udphdr));
 	if (unlikely(opcode != OVPN_DATA_V2)) {
 		/* DATA_V1 is not supported */
-		if (opcode == OVPN_DATA_V1)
+		if (opcode == OVPN_DATA_V1) {
+			reason = SKB_DROP_REASON_UNHANDLED_PROTO;
 			goto drop;
+		}
 
 		/* unknown or control packet: let it bubble up to userspace */
 		return 1;
@@ -119,6 +125,7 @@ static int ovpn_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
 	if (unlikely(!peer)) {
 		ovpn_dev_estats_inc(ovpn->estats,
 				    OVPN_DEV_ESTAT_RX_NO_PEER);
+		reason = (enum skb_drop_reason)OVPN_DROP_RX_NO_PEER;
 		goto drop;
 	}
 
@@ -130,7 +137,7 @@ static int ovpn_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
 drop:
 	ovpn_dev_dstats_rx_dropped(ovpn->dev);
 drop_noovpn:
-	kfree_skb(skb);
+	kfree_skb_reason(skb, reason);
 	return 0;
 }
 

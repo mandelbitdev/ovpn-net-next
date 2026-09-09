@@ -19,6 +19,7 @@
 #include <uapi/linux/if_arp.h>
 
 #include "ovpnpriv.h"
+#include "drop.h"
 #include "main.h"
 #include "netlink.h"
 #include "io.h"
@@ -168,6 +169,20 @@ static const char * const ovpn_ethtool_stats[] = {
 	OVPN_PEER_EVENT_ESTATS(OVPN_ETHTOOL_ESTAT)
 	OVPN_DEV_DROP_ESTATS(OVPN_ETHTOOL_ESTAT)
 #undef OVPN_ETHTOOL_ESTAT
+};
+
+static const char * const ovpn_drop_reasons[] = {
+#define OVPN_DROP_REASON_STRING(_counter, _name)		\
+	[(OVPN_DROP_##_name) & ~SKB_DROP_REASON_SUBSYS_MASK] =	\
+		"OVPN_DROP_" #_name,
+	OVPN_PEER_DROP_ESTATS(OVPN_DROP_REASON_STRING)
+	OVPN_DEV_DROP_ESTATS(OVPN_DROP_REASON_STRING)
+#undef OVPN_DROP_REASON_STRING
+};
+
+static const struct drop_reason_list ovpn_drop_reason_list = {
+	.reasons = ovpn_drop_reasons,
+	.n_reasons = ARRAY_SIZE(ovpn_drop_reasons),
 };
 
 static void ovpn_get_strings(struct net_device *dev, u32 stringset, u8 *data)
@@ -353,6 +368,9 @@ static int __init ovpn_init(void)
 		goto unreg_rtnl;
 	}
 
+	drop_reasons_register_subsys(SKB_DROP_REASON_SUBSYS_OVPN,
+				     &ovpn_drop_reason_list);
+
 	return 0;
 
 unreg_rtnl:
@@ -369,6 +387,7 @@ static __exit void ovpn_cleanup(void)
 	rtnl_link_unregister(&ovpn_link_ops);
 
 	flush_workqueue(ovpn_wq);
+	drop_reasons_unregister_subsys(SKB_DROP_REASON_SUBSYS_OVPN);
 	rcu_barrier();
 
 	destroy_workqueue(ovpn_wq);
