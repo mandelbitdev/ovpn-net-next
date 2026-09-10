@@ -213,23 +213,12 @@ static struct ovpn_socket *ovpn_socket_from_udp_sock(struct sock *sk)
 	return ovpn_sock;
 }
 
-/**
- * ovpn_udp_encap_recv - Start processing a received UDP packet.
- * @sk: socket over which the packet was received
- * @skb: the received packet
- *
- * If the first byte of the payload is:
- * - DATA_V2 the packet is accepted for further processing,
- * - DATA_V1 the packet is dropped as not supported,
- * - anything else the packet is forwarded to the UDP stack for
- *   delivery to user space.
- *
- * Return:
- *  0 if skb was consumed or dropped
- * >0 if skb should be passed up to userspace as UDP (packet not consumed)
- * <0 if skb should be resubmitted as proto -N (packet not consumed)
+/* Process one packet after the caller has made its OpenVPN header visible at
+ * @payload_offset. A zero return means the skb was consumed. A positive return
+ * leaves a control packet for the UDP socket.
  */
-static int ovpn_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
+static int ovpn_udp_data_recv(struct sock *sk, struct sk_buff *skb,
+			      unsigned int payload_offset)
 {
 	struct ovpn_socket *ovpn_sock;
 	struct ovpn_priv *ovpn;
@@ -250,18 +239,16 @@ static int ovpn_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
 		goto drop_noovpn;
 	}
 
-	/* Make sure the first 4 bytes of the skb data buffer after the UDP
-	 * header are accessible.
+	/* Make sure the first 4 bytes of the OpenVPN header are accessible.
 	 * They are required to fetch the OP code, the key ID and the peer ID.
 	 */
-	if (unlikely(!pskb_may_pull(skb, sizeof(struct udphdr) +
-				    OVPN_OPCODE_SIZE))) {
+	if (unlikely(!pskb_may_pull(skb, payload_offset + OVPN_OPCODE_SIZE))) {
 		net_dbg_ratelimited("%s: packet too small from UDP socket\n",
 				    netdev_name(ovpn->dev));
 		goto drop;
 	}
 
-	opcode = ovpn_opcode_from_skb(skb, sizeof(struct udphdr));
+	opcode = ovpn_opcode_from_skb(skb, payload_offset);
 	if (unlikely(opcode != OVPN_DATA_V2)) {
 		/* DATA_V1 is not supported */
 		if (opcode == OVPN_DATA_V1)
@@ -271,7 +258,7 @@ static int ovpn_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
 		return 1;
 	}
 
-	peer_id = ovpn_peer_id_from_skb(skb, sizeof(struct udphdr));
+	peer_id = ovpn_peer_id_from_skb(skb, payload_offset);
 	/* some OpenVPN server implementations send data packets with the
 	 * peer-id set to UNDEF. In this case we skip the peer lookup by peer-id
 	 * and we try with the transport address
@@ -284,8 +271,10 @@ static int ovpn_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
 	if (unlikely(!peer))
 		goto drop;
 
-	/* pop off outer UDP header */
-	__skb_pull(skb, sizeof(struct udphdr));
+	/* the crypto receive path expects skb->data to begin at the OpenVPN
+	 * header and takes ownership of the skb
+	 */
+	__skb_pull(skb, payload_offset);
 	ovpn_udp_recv(peer, skb);
 	return 0;
 
@@ -294,6 +283,60 @@ drop:
 drop_noovpn:
 	kfree_skb(skb);
 	return 0;
+}
+
+/* Consume DATA_V2 directly from UDP GRO. These packets deliberately bypass
+ * packet taps, TC ingress, the outer IP and netfilter receive paths, the final
+ * UDP lookup, and normal UDP accounting. Control packets are restored and
+ * continue through all of those layers normally.
+ */
+static struct sk_buff *ovpn_udp_gro_receive_direct(struct sock *sk,
+						   struct list_head *head,
+						   struct sk_buff *skb)
+{
+	unsigned int offset = skb_gro_offset(skb);
+
+	/* if the OpenVPN header is not accessible, leave validation and drop
+	 * handling to the ordinary UDP receive path
+	 */
+	if (unlikely(!pskb_pull(skb, offset)))
+		goto flush;
+
+	/* tell UDP GRO not to touch the skb if it was consumed by the direct
+	 * receive path
+	 */
+	if (likely(!ovpn_udp_data_recv(sk, skb, 0)))
+		return ERR_PTR(-EINPROGRESS);
+
+	/* control packets still belongs to the socket so we restore the data
+	 * pointer because the normal receive path expects the outer headers
+	 */
+	skb_push(skb, offset);
+
+flush:
+	NAPI_GRO_CB(skb)->same_flow = 0;
+	NAPI_GRO_CB(skb)->flush = 1;
+	return NULL;
+}
+
+/**
+ * ovpn_udp_encap_recv - Start processing a received UDP packet.
+ * @sk: socket over which the packet was received
+ * @skb: the received packet
+ *
+ * If the first byte of the payload is:
+ * - DATA_V2 the packet is accepted for further processing,
+ * - DATA_V1 the packet is dropped as not supported,
+ * - anything else the packet is forwarded to the UDP stack for
+ *   delivery to user space.
+ *
+ * Return:
+ * 0 if @skb was consumed or dropped
+ * 1 if @skb should continue through normal UDP delivery
+ */
+static int ovpn_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
+{
+	return ovpn_udp_data_recv(sk, skb, sizeof(struct udphdr));
 }
 
 /**
@@ -564,7 +607,12 @@ int ovpn_udp_socket_attach(struct ovpn_socket *ovpn_sock, struct socket *sock,
 		.encap_type = UDP_ENCAP_OVPNINUDP,
 		.encap_rcv = ovpn_udp_encap_recv,
 		.encap_destroy = ovpn_udp_encap_destroy,
-		.gro_receive = ovpn_udp_gro_receive_fraglist,
+		/* GRO mode cannot change after the interface is created so
+		 * select the socket callback once at socket setup
+		 */
+		.gro_receive = ovpn->gro_mode == OVPN_UDP_GRO_MODE_DIRECT ?
+			       ovpn_udp_gro_receive_direct :
+			       ovpn_udp_gro_receive_fraglist,
 		.gro_complete = ovpn_udp_gro_complete,
 	};
 	struct ovpn_socket *old_data;

@@ -123,6 +123,8 @@ struct ovpn_ctx {
 	char ifname[IFNAMSIZ];
 	enum ovpn_mode mode;
 	bool mode_set;
+	enum ovpn_udp_gro_mode udp_gro_mode;
+	bool udp_gro_mode_set;
 
 	int socket;
 	int cli_sockets[MAX_PEERS];
@@ -1377,8 +1379,9 @@ static int ovpn_new_iface(struct ovpn_ctx *ovpn)
 	struct ovpn_link_req req = { 0 };
 	int ret = -1;
 
-	fprintf(stdout, "Creating interface %s with mode %u\n", ovpn->ifname,
-		ovpn->mode);
+	fprintf(stdout,
+		"Creating interface %s with mode %u and UDP GRO mode %u\n",
+		ovpn->ifname, ovpn->mode, ovpn->udp_gro_mode);
 
 	req.n.nlmsg_len = NLMSG_LENGTH(sizeof(req.i));
 	req.n.nlmsg_flags = NLM_F_REQUEST | NLM_F_CREATE | NLM_F_EXCL;
@@ -1396,13 +1399,19 @@ static int ovpn_new_iface(struct ovpn_ctx *ovpn)
 			 strlen(OVPN_FAMILY_NAME) + 1) < 0)
 		goto err;
 
-	if (ovpn->mode_set) {
+	if (ovpn->mode_set || ovpn->udp_gro_mode_set) {
 		data = ovpn_nest_start(&req.n, sizeof(req), IFLA_INFO_DATA);
 		if (!data)
 			goto err;
 
-		if (ovpn_addattr(&req.n, sizeof(req), IFLA_OVPN_MODE,
+		if (ovpn->mode_set &&
+		    ovpn_addattr(&req.n, sizeof(req), IFLA_OVPN_MODE,
 				 &ovpn->mode, sizeof(uint8_t)) < 0)
+			goto err;
+
+		if (ovpn->udp_gro_mode_set &&
+		    ovpn_addattr(&req.n, sizeof(req), IFLA_OVPN_UDP_GRO_MODE,
+				 &ovpn->udp_gro_mode, sizeof(uint8_t)) < 0)
 			goto err;
 
 		ovpn_nest_end(&req.n, data);
@@ -1666,11 +1675,16 @@ static void usage(const char *cmd)
 		cmd);
 	fprintf(stderr, "where <command> can be one of the following\n\n");
 
-	fprintf(stderr, "* new_iface <iface> [mode]: create new ovpn interface\n");
+	fprintf(stderr,
+		"* new_iface <iface> [mode] [udp-gro-mode]: create new ovpn interface\n");
 	fprintf(stderr, "\tiface: ovpn interface name\n");
 	fprintf(stderr, "\tmode:\n");
 	fprintf(stderr, "\t\t- P2P for peer-to-peer mode (i.e. client)\n");
 	fprintf(stderr, "\t\t- MP for multi-peer mode (i.e. server)\n");
+	fprintf(stderr, "\tudp-gro-mode:\n");
+	fprintf(stderr, "\t\t- FULL_STACK for the normal receive stack\n");
+	fprintf(stderr,
+		"\t\t- DIRECT to decrypt data from the UDP GRO callback\n");
 
 	fprintf(stderr, "* del_iface <iface>: delete ovpn interface\n");
 	fprintf(stderr, "\tiface: ovpn interface name\n");
@@ -2206,6 +2220,20 @@ static int ovpn_parse_cmd_args(struct ovpn_ctx *ovpn, int argc, char *argv[])
 			return -1;
 		}
 		ovpn->mode_set = true;
+
+		if (argc < 5)
+			break;
+
+		if (!strcmp(argv[4], "FULL_STACK")) {
+			ovpn->udp_gro_mode = OVPN_UDP_GRO_MODE_FULL_STACK;
+		} else if (!strcmp(argv[4], "DIRECT")) {
+			ovpn->udp_gro_mode = OVPN_UDP_GRO_MODE_DIRECT;
+		} else {
+			fprintf(stderr, "Cannot parse UDP GRO mode: %s\n",
+				argv[4]);
+			return -1;
+		}
+		ovpn->udp_gro_mode_set = true;
 		break;
 	case CMD_DEL_IFACE:
 		break;

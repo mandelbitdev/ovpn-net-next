@@ -37,6 +37,7 @@ TEST_PROGS := \
 	test-close-socket-tcp.sh \
 	test-close-socket.sh \
 	test-float.sh \
+	test-gro-direct.sh \
 	test-large-mtu.sh \
 	test-mark.sh \
 	test-symmetric-id-float.sh \

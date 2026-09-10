@@ -41,7 +41,7 @@ struct udp_tunnel_type_entry {
 			      IS_ENABLED(CONFIG_VXLAN) * 2 + \
 			      IS_ENABLED(CONFIG_NET_FOU) * 2 + \
 			      IS_ENABLED(CONFIG_XFRM) * 2 + \
-			      IS_ENABLED(CONFIG_OVPN))
+			      IS_ENABLED(CONFIG_OVPN) * 2)
 
 DEFINE_STATIC_CALL(udp_tunnel_gro_rcv, dummy_gro_rcv);
 static DEFINE_STATIC_KEY_FALSE(udp_tunnel_static_call);

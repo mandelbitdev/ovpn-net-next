@@ -2066,9 +2066,15 @@ enum ovpn_mode {
 	OVPN_MODE_MP,
 };
 
+enum ovpn_udp_gro_mode {
+	OVPN_UDP_GRO_MODE_FULL_STACK,
+	OVPN_UDP_GRO_MODE_DIRECT,
+};
+
 enum {
 	IFLA_OVPN_UNSPEC,
 	IFLA_OVPN_MODE,
+	IFLA_OVPN_UDP_GRO_MODE,
 	__IFLA_OVPN_MAX,
 };
 

@@ -841,6 +841,14 @@ definitions:
       - p2p
       - mp
   -
+    name: ovpn-udp-gro-mode
+    enum-name: ovpn-udp-gro-mode
+    name-prefix: ovpn-udp-gro-mode
+    type: enum
+    entries:
+      - full-stack
+      - direct
+  -
     name: br-stp-mode
     type: enum
     enum-name: br-stp-mode
@@ -2355,6 +2363,10 @@ attribute-sets:
         name: mode
         type: u8
         enum: ovpn-mode
+      -
+        name: udp-gro-mode
+        type: u8
+        enum: ovpn-udp-gro-mode
 
 sub-messages:
   -

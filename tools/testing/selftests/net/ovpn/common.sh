@@ -10,6 +10,7 @@ source "$OVPN_COMMON_DIR/../../kselftest/ktap_helpers.sh"
 OVPN_UDP_PEERS_FILE=${OVPN_UDP_PEERS_FILE:-udp_peers.txt}
 OVPN_TCP_PEERS_FILE=${OVPN_TCP_PEERS_FILE:-tcp_peers.txt}
 OVPN_CLI=${OVPN_CLI:-${OVPN_COMMON_DIR}/ovpn-cli}
+OVPN_UDP_GRO_MODE=${OVPN_UDP_GRO_MODE:-FULL_STACK}
 OVPN_YNL=${OVPN_YNL:-${OVPN_COMMON_DIR}/../../../../net/ynl/pyynl/cli.py}
 OVPN_ALG=${OVPN_ALG:-aes}
 OVPN_PROTO=${OVPN_PROTO:-UDP}
@@ -162,7 +163,8 @@ ovpn_setup_ns() {
 		done
 	fi
 
-	ip netns exec "${peer}" ${OVPN_CLI} new_iface tun${1} $MODE
+	ip netns exec "${peer}" ${OVPN_CLI} new_iface tun${1} $MODE \
+		"${OVPN_UDP_GRO_MODE}"
 	ip -n "${peer}" addr add ${2} dev tun${1}
 	# add a secondary IP to peer 1, to test a LAN behind a client
 	if [ ${1} -eq 1 -a -n "${OVPN_LAN_IP}" ]; then

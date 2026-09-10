@@ -40,6 +40,7 @@ struct ovpn_peer_collection {
  * struct ovpn_priv - per ovpn interface state
  * @dev: the actual netdev representing the tunnel
  * @mode: device operation mode (i.e. p2p, mp, ..)
+ * @gro_mode: whether UDP data follows the full stack or is decrypted from GRO
  * @lock: protect this object
  * @peers: data structures holding multi-peer references
  * @peer: in P2P mode, this is the only remote peer
@@ -49,6 +50,7 @@ struct ovpn_peer_collection {
 struct ovpn_priv {
 	struct net_device *dev;
 	enum ovpn_mode mode;
+	enum ovpn_udp_gro_mode gro_mode;
 	spinlock_t lock; /* protect writing to the ovpn_priv object */
 	struct ovpn_peer_collection *peers;
 	struct ovpn_peer __rcu *peer;

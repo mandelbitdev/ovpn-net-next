@@ -113,6 +113,64 @@ ovpn_run_lan_traffic() {
 		ip netns exec ovpn_peer0 ping -qfc 100 -w 3 "${OVPN_LAN_IP}"
 }
 
+ovpn_udp_gro_counter_add() {
+	[ "${OVPN_PROTO}" == "UDP" ] || return 0
+
+	# Enable UDP forwarding GRO on the receiving endpoint so this test
+	# exercises the configured ovpn callback.
+	ovpn_cmd_ok "enable UDP GRO on the iperf receive path" \
+		ip netns exec ovpn_peer0 ethtool -K veth1 gro on \
+		rx-udp-gro-forwarding on
+
+	ovpn_cmd_ok "create UDP GRO path counter table" \
+		ip netns exec ovpn_peer0 nft add table inet ovpn_gro_test
+	ovpn_cmd_ok "create UDP GRO path counter chain" \
+		ip netns exec ovpn_peer0 nft \
+		"add chain inet ovpn_gro_test prerouting { type filter hook \
+		prerouting priority filter; policy accept; }"
+
+	# Count only aggregated outer packets after they enter the normal
+	# receive stack in peer0. Direct GRO consumes those DATA_V2 aggregates
+	# before this hook, while small packets which bypass veth's GRO path
+	# are deliberately ignored.
+	ovpn_cmd_ok "add UDP GRO path counter" \
+		ip netns exec ovpn_peer0 nft add rule inet ovpn_gro_test \
+		prerouting iifname "veth1" meta length gt 1500 udp dport 1 \
+		counter
+}
+
+ovpn_udp_gro_counter_check() {
+	local packets
+
+	[ "${OVPN_PROTO}" == "UDP" ] || return 0
+
+	packets=$(ip netns exec ovpn_peer0 nft list chain inet ovpn_gro_test \
+		prerouting | sed -n \
+		's/.*counter packets \([0-9][0-9]*\) bytes.*/\1/p')
+	ovpn_cmd_ok "remove UDP GRO path counter table" \
+		ip netns exec ovpn_peer0 nft delete table inet ovpn_gro_test
+
+	if [ -z "${packets}" ]; then
+		printf '%s\n' "unable to read UDP GRO path counter"
+		return 1
+	fi
+
+	if [ "${OVPN_UDP_GRO_MODE}" == "FULL_STACK" ]; then
+		if [ "${packets}" -eq 0 ]; then
+			printf '%s\n' \
+				"full-stack UDP GRO did not reach PRE_ROUTING"
+			return 1
+		fi
+		return 0
+	fi
+
+	if [ "${packets}" -ne 0 ]; then
+		printf '%s\n' \
+			"direct UDP GRO reached PRE_ROUTING ${packets} times"
+		return 1
+	fi
+}
+
 ovpn_run_float_mode() {
 	local p
 	local peer_ns
@@ -134,12 +192,16 @@ ovpn_run_float_mode() {
 ovpn_run_iperf() {
 	local iperf_pid
 
+	ovpn_udp_gro_counter_add
+
 	ovpn_run_bg iperf_pid ip netns exec ovpn_peer0 iperf3 -1 -s
 	sleep 1
 
 	ovpn_cmd_ok "run iperf throughput flow" \
 		ip netns exec ovpn_peer1 iperf3 -Z -t 3 -c 5.5.5.1
 	wait "${iperf_pid}" || return 1
+
+	ovpn_udp_gro_counter_check
 }
 
 ovpn_run_key_rollover() {
