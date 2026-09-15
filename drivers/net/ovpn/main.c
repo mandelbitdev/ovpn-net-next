@@ -129,6 +129,9 @@ static const struct device_type ovpn_type = {
 static const struct nla_policy ovpn_policy[IFLA_OVPN_MAX + 1] = {
 	[IFLA_OVPN_MODE] = NLA_POLICY_RANGE(NLA_U8, OVPN_MODE_P2P,
 					    OVPN_MODE_MP),
+	[IFLA_OVPN_UDP_GRO_MODE] =
+		NLA_POLICY_RANGE(NLA_U8, OVPN_UDP_GRO_MODE_FULL_STACK,
+				 OVPN_UDP_GRO_MODE_DIRECT),
 };
 
 /**
@@ -200,6 +203,7 @@ static int ovpn_newlink(struct net_device *dev,
 			struct rtnl_newlink_params *params,
 			struct netlink_ext_ack *extack)
 {
+	enum ovpn_udp_gro_mode gro_mode = OVPN_UDP_GRO_MODE_FULL_STACK;
 	struct ovpn_priv *ovpn = netdev_priv(dev);
 	struct nlattr **data = params->data;
 	enum ovpn_mode mode = OVPN_MODE_P2P;
@@ -209,9 +213,14 @@ static int ovpn_newlink(struct net_device *dev,
 		mode = nla_get_u8(data[IFLA_OVPN_MODE]);
 		netdev_dbg(dev, "setting device mode: %u\n", mode);
 	}
+	if (data && data[IFLA_OVPN_UDP_GRO_MODE]) {
+		gro_mode = nla_get_u8(data[IFLA_OVPN_UDP_GRO_MODE]);
+		netdev_dbg(dev, "setting UDP GRO mode: %u\n", gro_mode);
+	}
 
 	ovpn->dev = dev;
 	ovpn->mode = mode;
+	ovpn->gro_mode = gro_mode;
 	spin_lock_init(&ovpn->lock);
 	INIT_DELAYED_WORK(&ovpn->keepalive_work, ovpn_peer_keepalive_work);
 
@@ -237,8 +246,8 @@ static int ovpn_newlink(struct net_device *dev,
 
 static size_t ovpn_get_size(const struct net_device *dev)
 {
-	/* IFLA_OVPN_MODE */
-	return nla_total_size(sizeof(u8));
+	/* IFLA_OVPN_MODE and IFLA_OVPN_UDP_GRO_MODE */
+	return nla_total_size(sizeof(u8)) + nla_total_size(sizeof(u8));
 }
 
 static int ovpn_fill_info(struct sk_buff *skb, const struct net_device *dev)
@@ -246,6 +255,8 @@ static int ovpn_fill_info(struct sk_buff *skb, const struct net_device *dev)
 	struct ovpn_priv *ovpn = netdev_priv(dev);
 
 	if (nla_put_u8(skb, IFLA_OVPN_MODE, ovpn->mode))
+		return -EMSGSIZE;
+	if (nla_put_u8(skb, IFLA_OVPN_UDP_GRO_MODE, ovpn->gro_mode))
 		return -EMSGSIZE;
 
 	return 0;
