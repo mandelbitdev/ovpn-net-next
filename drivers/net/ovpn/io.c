@@ -107,6 +107,7 @@ static void ovpn_netdev_write(struct ovpn_peer *peer, struct sk_buff *skb)
 
 void ovpn_decrypt_post(void *data, int ret)
 {
+	struct ovpn_pktid_recv *pktid_recv;
 	struct ovpn_crypto_key_slot *ks;
 	unsigned int payload_offset = 0;
 	struct sk_buff *skb = data;
@@ -140,9 +141,14 @@ void ovpn_decrypt_post(void *data, int ret)
 	if (unlikely(ret < 0))
 		goto drop;
 
+	/* retrieve or allocate the replay state */
+	pktid_recv = ovpn_key_ctx_replay_state(key);
+	if (unlikely(!pktid_recv))
+		goto drop;
+
 	pktid = ovpn_pktid_read(skb->data + OVPN_OPCODE_SIZE, false,
 				&pkt_epoch);
-	ret = ovpn_pktid_recv(&key->pid.recv, pktid, 0);
+	ret = ovpn_pktid_recv(pktid_recv, pktid, 0);
 	if (unlikely(ret < 0)) {
 		net_err_ratelimited("%s: PKT ID RX error for peer %u: %d\n",
 				    netdev_name(peer->ovpn->dev), peer->id,
@@ -152,7 +158,7 @@ void ovpn_decrypt_post(void *data, int ret)
 
 	aead_blocks = ovpn_aead_limit_blocks(ks->cipher_alg, ks->aad_size,
 					     skb->len - payload_offset);
-	if (unlikely(ovpn_pktid_recv_update_aead(&key->pid.recv, &key->usage,
+	if (unlikely(ovpn_pktid_recv_update_aead(pktid_recv, &key->usage,
 						 &ks->usage_limit,
 						 aead_blocks)))
 		ovpn_nl_key_swap_notify(peer, ks->key_id);

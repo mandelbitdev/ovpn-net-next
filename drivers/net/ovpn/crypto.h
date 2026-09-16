@@ -44,10 +44,9 @@ struct ovpn_peer_key_reset {
 struct ovpn_key_ctx {
 	struct crypto_aead *tfm;
 	u8 implicit_iv[OVPN_NONCE_SIZE];
-	union {
-		struct ovpn_pktid_recv recv;
-		struct ovpn_pktid_xmit xmit;
-	} pid ____cacheline_aligned_in_smp;
+	struct ovpn_pktid_xmit pktid_xmit ____cacheline_aligned_in_smp;
+	/* allocated after an RX key first authenticates a packet */
+	struct ovpn_pktid_recv *pktid_recv;
 	struct ovpn_key_usage usage;
 	atomic64_t decrypt_failures;
 	/* whether userspace was notified of excessive decrypt failures */
@@ -171,6 +170,8 @@ static inline int ovpn_key_ctx_get(struct ovpn_key_ctx **out,
 	*out = key;
 	return 0;
 }
+
+struct ovpn_pktid_recv *ovpn_key_ctx_replay_state(struct ovpn_key_ctx *key);
 
 int ovpn_crypto_state_reset(struct ovpn_crypto_state *cs,
 			    const struct ovpn_peer_key_reset *pkr);
