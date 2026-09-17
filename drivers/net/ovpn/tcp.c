@@ -140,21 +140,18 @@ static void ovpn_tcp_rcv(struct strparser *strp, struct sk_buff *skb)
 	/* hold reference to peer as required by ovpn_recv().
 	 *
 	 * NOTE: in this context we should already be holding a reference to
-	 * this peer, therefore ovpn_peer_hold() is not expected to fail
+	 * this peer
 	 */
-	if (WARN_ON(!ovpn_peer_hold(peer)))
-		goto err_nopeer;
+	ovpn_peer_hold(peer);
 
 	ovpn_recv(peer, skb);
 	return;
 err:
-	/* take reference for deferred peer deletion. should never fail */
-	if (WARN_ON(!ovpn_peer_hold(peer)))
-		goto err_nopeer;
+	/* take reference for deferred peer deletion */
+	ovpn_peer_hold(peer);
 	if (!queue_work(ovpn_wq, &peer->tcp.defer_del_work))
 		ovpn_peer_put(peer);
 	ovpn_dev_dstats_rx_dropped(peer->ovpn->dev);
-err_nopeer:
 	kfree_skb(skb);
 }
 
@@ -168,11 +165,12 @@ static int ovpn_tcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
 
 	rcu_read_lock();
 	sock = rcu_dereference_sk_user_data(sk);
-	if (unlikely(!sock || !sock->peer || !ovpn_peer_hold(sock->peer))) {
+	if (unlikely(!sock || !sock->peer)) {
 		rcu_read_unlock();
 		return -EBADF;
 	}
 	peer = sock->peer;
+	ovpn_peer_hold(peer);
 	rcu_read_unlock();
 
 	skb = __skb_recv_datagram(sk, &peer->tcp.user_queue, flags, &off, &err);
@@ -385,10 +383,11 @@ static void ovpn_tcp_release(struct sock *sk)
 	/* during initialization this function is called before
 	 * assigning sock->peer
 	 */
-	if (unlikely(!peer || !ovpn_peer_hold(peer))) {
+	if (unlikely(!peer)) {
 		rcu_read_unlock();
 		return;
 	}
+	ovpn_peer_hold(peer);
 	rcu_read_unlock();
 
 	__skb_queue_head_init(&queue);
@@ -411,13 +410,14 @@ static int ovpn_tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
 	lock_sock(sk);
 	rcu_read_lock();
 	sock = rcu_dereference_sk_user_data(sk);
-	if (unlikely(!sock || !sock->peer || !ovpn_peer_hold(sock->peer))) {
+	if (unlikely(!sock || !sock->peer)) {
 		rcu_read_unlock();
 		release_sock(sk);
 		return -EIO;
 	}
-	rcu_read_unlock();
 	peer = sock->peer;
+	ovpn_peer_hold(peer);
+	rcu_read_unlock();
 
 	if (msg->msg_flags & ~(MSG_DONTWAIT | MSG_NOSIGNAL)) {
 		ret = -EOPNOTSUPP;
@@ -588,10 +588,12 @@ static void ovpn_tcp_close(struct sock *sk, long timeout)
 	}
 
 	peer = sock->peer;
-	if (!peer || !ovpn_peer_hold(peer)) {
+	if (!peer) {
 		rcu_read_unlock();
 		return;
 	}
+	/* socket teardown waits for RCU readers before killing the peer */
+	ovpn_peer_hold(peer);
 	rcu_read_unlock();
 
 	ovpn_peer_del(peer, OVPN_DEL_PEER_REASON_TRANSPORT_DISCONNECT);
@@ -604,7 +606,7 @@ static __poll_t ovpn_tcp_poll(struct file *file, struct socket *sock,
 {
 	struct sk_buff_head *queue = &sock->sk->sk_receive_queue;
 	struct ovpn_socket *ovpn_sock;
-	struct ovpn_peer *peer = NULL;
+	struct ovpn_peer *peer;
 	__poll_t mask;
 
 	rcu_read_lock();
@@ -619,16 +621,13 @@ static __poll_t ovpn_tcp_poll(struct file *file, struct socket *sock,
 		return 0;
 	}
 
-	if (ovpn_peer_hold(ovpn_sock->peer)) {
-		peer = ovpn_sock->peer;
-		queue = &peer->tcp.user_queue;
-	}
+	peer = ovpn_sock->peer;
+	ovpn_peer_hold(peer);
+	queue = &peer->tcp.user_queue;
 	rcu_read_unlock();
 
 	mask = datagram_poll_queue(file, sock, wait, queue);
-
-	if (peer)
-		ovpn_peer_put(peer);
+	ovpn_peer_put(peer);
 
 	return mask;
 }
