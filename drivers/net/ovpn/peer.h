@@ -10,6 +10,7 @@
 #ifndef _NET_OVPN_OVPNPEER_H_
 #define _NET_OVPN_OVPNPEER_H_
 
+#include <linux/percpu-refcount.h>
 #include <net/dst_cache.h>
 #include <net/strparser.h>
 
@@ -110,7 +111,7 @@ struct ovpn_peer {
 	struct ovpn_peer_stats link_stats;
 	enum ovpn_del_peer_reason delete_reason;
 	spinlock_t lock; /* protects bind  and keepalive* */
-	struct kref refcount;
+	struct percpu_ref refcount;
 	struct rcu_head rcu;
 	struct llist_node release_entry;
 	struct work_struct keepalive_work;
@@ -124,10 +125,23 @@ struct ovpn_peer {
  */
 static inline bool ovpn_peer_hold(struct ovpn_peer *peer)
 {
-	return kref_get_unless_zero(&peer->refcount);
+	return percpu_ref_tryget_live(&peer->refcount);
 }
 
-void ovpn_peer_release_kref(struct kref *kref);
+/**
+ * ovpn_peer_hold_rcu - acquire a live peer reference under RCU
+ * @peer: peer to acquire
+ *
+ * The caller must hold rcu_read_lock.
+ *
+ * Return: true if the reference was acquired, false if teardown has started
+ */
+static inline bool ovpn_peer_hold_rcu(struct ovpn_peer *peer)
+{
+	return percpu_ref_tryget_live_rcu(&peer->refcount);
+}
+
+void ovpn_peer_release_ref(struct percpu_ref *ref);
 
 /**
  * ovpn_peer_put - decrease reference counter
@@ -135,7 +149,19 @@ void ovpn_peer_release_kref(struct kref *kref);
  */
 static inline void ovpn_peer_put(struct ovpn_peer *peer)
 {
-	kref_put(&peer->refcount, ovpn_peer_release_kref);
+	percpu_ref_put(&peer->refcount);
+}
+
+/**
+ * ovpn_peer_kill - drop the peer's initial reference
+ * @peer: peer which has been unpublished and is being destroyed
+ *
+ * This must be called exactly once, after the peer is no longer reachable
+ * through its owning ovpn instance.
+ */
+static inline void ovpn_peer_kill(struct ovpn_peer *peer)
+{
+	percpu_ref_kill(&peer->refcount);
 }
 
 struct ovpn_peer *ovpn_peer_new(struct ovpn_priv *ovpn, u32 id);
