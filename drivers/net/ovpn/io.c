@@ -321,11 +321,7 @@ static bool ovpn_encrypt_one(struct ovpn_peer *peer, struct sk_buff *skb)
 	/* take a reference to the peer because the crypto code may run async.
 	 * ovpn_encrypt_post() will release it upon completion
 	 */
-	if (unlikely(!ovpn_peer_hold(peer))) {
-		DEBUG_NET_WARN_ON_ONCE(1);
-		ovpn_crypto_key_slot_put(ks);
-		return false;
-	}
+	ovpn_peer_hold(peer);
 
 	memset(ovpn_skb_cb(skb), 0, sizeof(struct ovpn_cb));
 	ovpn_encrypt_post(skb, ovpn_aead_encrypt(peer, ks, skb));
