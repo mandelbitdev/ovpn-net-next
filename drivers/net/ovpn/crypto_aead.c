@@ -393,6 +393,7 @@ static void ovpn_aead_crypto_key_slot_free_work(struct work_struct *work)
 
 	ks = container_of(to_rcu_work(work), struct ovpn_crypto_key_slot,
 			  free_work);
+	percpu_ref_exit(&ks->refcount);
 	ovpn_aead_crypto_key_slot_free(ks);
 	kfree(ks);
 }
@@ -428,7 +429,6 @@ ovpn_aead_crypto_key_slot_new(const struct ovpn_key_config *kc)
 	ks->encrypt = NULL;
 	ks->decrypt = NULL;
 	INIT_RCU_WORK(&ks->free_work, ovpn_aead_crypto_key_slot_free_work);
-	kref_init(&ks->refcount);
 	ks->key_id = kc->key_id;
 
 	ks->encrypt = ovpn_aead_init("encrypt", alg_name,
@@ -457,6 +457,11 @@ ovpn_aead_crypto_key_slot_new(const struct ovpn_key_config *kc)
 	/* init packet ID generation/validation */
 	ovpn_pktid_xmit_init(&ks->pid_xmit);
 	ovpn_pktid_recv_init(&ks->pid_recv);
+
+	ret = percpu_ref_init(&ks->refcount, ovpn_crypto_key_slot_release, 0,
+			      GFP_KERNEL);
+	if (ret < 0)
+		goto destroy_ks;
 
 	return ks;
 
