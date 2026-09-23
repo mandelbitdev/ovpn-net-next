@@ -409,6 +409,9 @@ ovpn_aead_crypto_key_slot_new(const struct ovpn_key_config *kc)
 	const char *alg_name;
 	int ret;
 
+	DEBUG_NET_WARN_ON_ONCE(offsetofend(struct ovpn_crypto_key_slot, refcount) >
+			       SMP_CACHE_BYTES);
+
 	/* validate crypto alg */
 	switch (kc->cipher_alg) {
 	case OVPN_CIPHER_ALG_AES_GCM:

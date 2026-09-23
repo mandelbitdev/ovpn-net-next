@@ -46,12 +46,18 @@ struct ovpn_crypto_key_slot {
 	struct crypto_aead *decrypt;
 	u8 nonce_tail_xmit[OVPN_NONCE_TAIL_SIZE];
 	u8 nonce_tail_recv[OVPN_NONCE_TAIL_SIZE];
+	struct percpu_ref refcount;
+
+	/* The fields up to refcount are read on every packet but written only when
+	 * the key is installed or torn down, so ideally they fit in one cacheline.
+	 * pid_recv and pid_xmit are written on every packet and get cachelines of
+	 * their own. Keep per-packet writes out of the first block.
+	 */
 
 	struct ovpn_pktid_recv pid_recv ____cacheline_aligned_in_smp;
 	struct ovpn_pktid_xmit pid_xmit ____cacheline_aligned_in_smp;
 	struct work_struct free_work;
 	unsigned long rcu_state;
-	struct percpu_ref refcount;
 };
 
 struct ovpn_crypto_state {
