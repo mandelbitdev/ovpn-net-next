@@ -20,24 +20,29 @@ OVPN_VERBOSE=${OVPN_VERBOSE:-0}
 export OVPN_ID_OFFSET=$(( 9 * (OVPN_SYMMETRIC_ID == 0) ))
 
 # Peer delete notifications include traffic counters whose values depend on
-# timing. zero_attr() sets a counter to zero only when that counter is present,
-# so missing stats still fail the comparison. zero_peer_stats is just the list
-# of counters to normalize. normalize_peer_del_ntf applies that to peer-del-ntf
-# messages and drops transport endpoint details, while leaving other
-# notifications unchanged.
+# timing, so they cannot be compared literally. norm_attr() maps a counter to 1
+# when it is positive and to 0 otherwise, only when that counter is present, so
+# missing stats still fail the comparison. The same filter is applied to both
+# the expected and the received notifications, and the fixtures carry 1 for
+# every counter: a peer that exchanged traffic must therefore report non-zero
+# stats, and an all-zero (or stub) peer object is caught. norm_peer_stats is
+# just the list of counters to normalize. normalize_peer_del_ntf applies that
+# to peer-del-ntf messages and drops transport endpoint details, while leaving
+# other notifications unchanged.
 OVPN_JQ_FILTER='
-	def zero_attr(key):
-		if has(key) then .[key] = 0 else . end;
+	def norm_attr(key):
+		if has(key) then .[key] = (if .[key] > 0 then 1 else 0 end)
+		else . end;
 
-	def zero_peer_stats:
-		zero_attr("vpn-rx-bytes") |
-		zero_attr("vpn-rx-packets") |
-		zero_attr("vpn-tx-bytes") |
-		zero_attr("vpn-tx-packets") |
-		zero_attr("link-rx-bytes") |
-		zero_attr("link-rx-packets") |
-		zero_attr("link-tx-bytes") |
-		zero_attr("link-tx-packets");
+	def norm_peer_stats:
+		norm_attr("vpn-rx-bytes") |
+		norm_attr("vpn-rx-packets") |
+		norm_attr("vpn-tx-bytes") |
+		norm_attr("vpn-tx-packets") |
+		norm_attr("link-rx-bytes") |
+		norm_attr("link-rx-packets") |
+		norm_attr("link-tx-bytes") |
+		norm_attr("link-tx-packets");
 
 	def normalize_peer_del_ntf:
 		if .name == "peer-del-ntf" then
@@ -46,7 +51,7 @@ OVPN_JQ_FILTER='
 				    .["remote-ipv6-scope-id"], .["remote-port"],
 				    .["local-ipv4"], .["local-ipv6"],
 				    .["local-port"]) |
-				zero_peer_stats
+				norm_peer_stats
 			)
 		else . end;
 
