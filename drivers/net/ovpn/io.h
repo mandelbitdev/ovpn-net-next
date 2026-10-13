@@ -23,7 +23,7 @@ extern const unsigned char ovpn_keepalive_message[OVPN_KEEPALIVE_SIZE];
 
 netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev);
 
-void ovpn_recv(struct ovpn_peer *peer, struct sk_buff *skb);
+void ovpn_recv(struct ovpn_peer *peer, struct sk_buff *skb, bool tcp);
 void ovpn_xmit_special(struct ovpn_peer *peer, const void *data,
 		       const unsigned int len);
 
