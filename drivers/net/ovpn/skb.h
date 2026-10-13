@@ -24,15 +24,27 @@
  * @ks: the crypto key slot used to encrypt/decrypt this skb
  * @crypto_tmp: pointer to temporary memory used for crypto operations
  *		containing the IV, the scatter gather list and the aead request
+ * @tcp_packets: packet count for TCP output, one for ordinary TCP, zero for UDP
  * @payload_offset: offset in the skb where the payload starts
  * @nosignal: whether this skb should be sent with the MSG_NOSIGNAL flag (TCP)
+ * @tcp_gso: output skb owned by a single TCP GSO encryption request
  */
 struct ovpn_cb {
 	struct ovpn_peer *peer;
 	struct ovpn_crypto_key_slot *ks;
 	void *crypto_tmp;
-	unsigned int payload_offset;
-	bool nosignal;
+	unsigned int tcp_packets;
+
+	/* Ordinary encryption leaves this union zeroed. A TCP GSO input stores
+	 * its output skb. Decryption and TCP sending use their ordinary fields.
+	 */
+	union {
+		struct {
+			unsigned int payload_offset;
+			bool nosignal;
+		};
+		struct sk_buff *tcp_gso;
+	};
 };
 
 static inline struct ovpn_cb *ovpn_skb_cb(struct sk_buff *skb)
