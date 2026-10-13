@@ -26,6 +26,7 @@
  *		containing the IV, the scatter gather list and the aead request
  * @tcp_packets: packet count for TCP output, one for ordinary TCP, zero for UDP
  * @payload_offset: offset in the skb where the payload starts
+ * @gso_size: received TCP segment payload size, used only after authentication
  * @nosignal: whether this skb should be sent with the MSG_NOSIGNAL flag (TCP)
  * @tcp_gso: output skb owned by a single TCP GSO encryption request
  */
@@ -41,6 +42,7 @@ struct ovpn_cb {
 	union {
 		struct {
 			unsigned int payload_offset;
+			u16 gso_size;
 			bool nosignal;
 		};
 		struct sk_buff *tcp_gso;
