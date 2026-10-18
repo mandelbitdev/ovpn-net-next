@@ -934,6 +934,35 @@ bool ovpn_peer_check_by_src(struct ovpn_priv *ovpn, struct sk_buff *skb,
 		return peer == rcu_access_pointer(ovpn->peer);
 	}
 
+	/* Most packets are sent by the peer itself, using its own VPN address
+	 * as source: skip the routing table lookup below for them and only
+	 * check that the address actually leads to this peer. This is what
+	 * the full check would conclude as well, unless a more specific route
+	 * sends the address of a peer through another one.
+	 */
+	switch (skb->protocol) {
+	case htons(ETH_P_IP):
+		addr4 = ip_hdr(skb)->saddr;
+		if (addr4 != htonl(INADDR_ANY) &&
+		    addr4 == peer->vpn_addrs.ipv4.s_addr) {
+			rcu_read_lock();
+			match = (peer == ovpn_peer_get_by_vpn_addr4(ovpn, addr4));
+			rcu_read_unlock();
+			return match;
+		}
+		break;
+	case htons(ETH_P_IPV6):
+		addr6 = ipv6_hdr(skb)->saddr;
+		if (!ipv6_addr_any(&addr6) &&
+		    ipv6_addr_equal(&addr6, &peer->vpn_addrs.ipv6)) {
+			rcu_read_lock();
+			match = (peer == ovpn_peer_get_by_vpn_addr6(ovpn, &addr6));
+			rcu_read_unlock();
+			return match;
+		}
+		break;
+	}
+
 	/* This function performs a reverse path check, therefore we now
 	 * lookup the nexthop we would use if we wanted to route a packet
 	 * to the source IP. If the nexthop matches the sender we know the
