@@ -289,7 +289,7 @@ err:
  * @skb: the packet to send
  *
  * rcu_read_lock should be held on entry.
- * On return, the skb is consumed.
+ * On success, the skb is consumed.
  *
  * Return: 0 on success or a negative error code otherwise
  */
