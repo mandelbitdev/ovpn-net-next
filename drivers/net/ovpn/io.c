@@ -69,10 +69,13 @@ static void ovpn_netdev_write(struct ovpn_peer *peer, struct sk_buff *skb)
 	 */
 	skb_gso_reset(skb);
 
-	/* we can't guarantee the packet wasn't corrupted before entering the
-	 * VPN, therefore we give other layers a chance to check that
+	/* the packet was authenticated by the AEAD decryption, therefore it
+	 * can't have been corrupted while travelling between the peers: skip
+	 * the software checksum verification of all its layers, like
+	 * wireguard does
 	 */
-	skb->ip_summed = CHECKSUM_NONE;
+	skb->ip_summed = CHECKSUM_UNNECESSARY;
+	skb->csum_level = SKB_MAX_CSUM_LEVEL;
 
 	/* skb hash for transport packet no longer valid after decapsulation */
 	skb_clear_hash(skb);
