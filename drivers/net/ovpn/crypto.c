@@ -54,10 +54,12 @@ bool ovpn_crypto_kill_key(struct ovpn_crypto_state *cs, u8 key_id)
 	int slot = 0;
 
 	spin_lock_bh(&cs->lock);
-	tmp = rcu_access_pointer(cs->slots[slot]);
+	tmp = rcu_dereference_protected(cs->slots[slot],
+					lockdep_is_held(&cs->lock));
 	if (!tmp || tmp->key_id != key_id) {
 		slot = 1;
-		tmp = rcu_access_pointer(cs->slots[slot]);
+		tmp = rcu_dereference_protected(cs->slots[slot],
+						lockdep_is_held(&cs->lock));
 	}
 
 	if (tmp && tmp->key_id == key_id)
