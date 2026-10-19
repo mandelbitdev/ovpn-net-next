@@ -59,15 +59,18 @@ static struct sk_buff *ovpn_udp_gro_receive_fraglist(struct sock *sk,
 	int ret = 0, nhoff;
 	bool flush;
 
+	/* A packet that cannot join an aggregate (not a data record, or an
+	 * existing GSO packet) must not overtake the records of the same
+	 * flow that GRO is still holding: complete those first, as the other
+	 * GRO handlers do.
+	 */
 	if (!ovpn_udp_gro_header(skb, &header) ||
-	    FIELD_GET(OVPN_OPCODE_PKTTYPE_MASK, header) != OVPN_DATA_V2) {
+	    FIELD_GET(OVPN_OPCODE_PKTTYPE_MASK, header) != OVPN_DATA_V2 ||
+	    skb_is_gso(skb)) {
 		NAPI_GRO_CB(skb)->flush = 1;
-		return NULL;
-	}
-
-	/* do not nest an existing GSO packet in the record list */
-	if (skb_is_gso(skb)) {
-		NAPI_GRO_CB(skb)->flush = 1;
+		list_for_each_entry(p, head, list)
+			if (NAPI_GRO_CB(p)->same_flow)
+				return p;
 		return NULL;
 	}
 
@@ -75,11 +78,13 @@ static struct sk_buff *ovpn_udp_gro_receive_fraglist(struct sock *sk,
 		if (!NAPI_GRO_CB(p)->same_flow)
 			continue;
 
-		/* match opcode, key ID and peer ID */
-		if (!ovpn_udp_gro_header(p, &header2) || header != header2) {
-			NAPI_GRO_CB(p)->same_flow = 0;
-			continue;
-		}
+		/* match opcode, key ID and peer ID: a different header on the
+		 * same transport flow (e.g. after a key change) completes the
+		 * held aggregate instead of overtaking it, and the new record
+		 * starts the next one
+		 */
+		if (!ovpn_udp_gro_header(p, &header2) || header != header2)
+			return p;
 
 		/* GRO has already matched the outer addresses and UDP ports;
 		 * check the remaining outer IP fields
