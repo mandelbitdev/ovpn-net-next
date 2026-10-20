@@ -365,10 +365,13 @@ void ovpn_encrypt_post(void *data, int ret)
 		 * pending count and only the final completion continues with
 		 * the aggregate
 		 */
-		if (unlikely(ret < 0))
+		if (unlikely(ret < 0)) {
 			atomic_set(&batch_cb->batch_state.failed, 1);
-
-		kfree_skb(skb);
+			kfree_skb(skb);
+		} else {
+			/* the encrypted data now lives in the aggregate */
+			consume_skb(skb);
+		}
 		if (!atomic_dec_and_test(&batch_cb->batch_state.pending))
 			return;
 
