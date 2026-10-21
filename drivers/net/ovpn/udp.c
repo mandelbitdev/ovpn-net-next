@@ -653,11 +653,33 @@ static int ovpn_udp_output(struct ovpn_peer *peer, struct dst_cache *cache,
 			   struct ovpn_route_key *key)
 {
 	struct ovpn_bind *bind;
+	struct sock *owner;
 	int ret;
 
 	/* set sk to null if skb is already orphaned */
 	if (!skb->destructor)
 		skb->sk = NULL;
+
+	/* A TCP segment encrypted on its own still carries the TCP destructor,
+	 * while segments encrypted into a UDP GSO aggregate are charged with
+	 * sock_wfree (see ovpn_gso_alloc). Charge it the same way, so that a
+	 * receiver can tell they belong to the same flow: e.g. veth orphans
+	 * anything but sock_wfree skbs before GRO, which compares skb->sk.
+	 * The new charge is taken first, as it is what keeps the socket alive
+	 * once the TCP one is released. Like for the segments consumed by an
+	 * aggregate, the TCP charge is completed right away.
+	 * Pure ACKs only differ by their destructor, which releases the same
+	 * charge as sock_wfree does for TCP sockets.
+	 */
+	if (skb->destructor == tcp_wfree) {
+		owner = skb->sk;
+		refcount_add(skb->truesize, &owner->sk_wmem_alloc);
+		skb_orphan(skb);
+		skb->sk = owner;
+		skb->destructor = sock_wfree;
+	} else if (skb->destructor == __sock_wfree) {
+		skb->destructor = sock_wfree;
+	}
 
 	rcu_read_lock();
 	bind = rcu_dereference(peer->bind);
