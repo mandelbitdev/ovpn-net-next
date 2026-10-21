@@ -15,6 +15,7 @@
 #include <linux/workqueue.h>
 #include <net/gro_cells.h>
 #include <net/ip.h>
+#include <net/page_pool/types.h>
 #include <net/rtnetlink.h>
 #include <uapi/linux/if_arp.h>
 
@@ -29,6 +30,59 @@
 
 /* module-owned workqueue on which all ovpn-specific work is queued */
 struct workqueue_struct *ovpn_wq;
+
+/* module-owned per-CPU pools of pages paged records are copied to */
+struct ovpn_rx_pool __percpu *ovpn_rx_pools;
+
+/* number of recycled pages each per-CPU RX pool can hold */
+#define OVPN_RX_POOL_SIZE	256
+
+static void ovpn_rx_pools_free(void)
+{
+	int cpu;
+
+	/* pages still referenced by skbs keep their pool alive until they
+	 * are released, also after the module is gone
+	 */
+	for_each_possible_cpu(cpu)
+		page_pool_destroy(per_cpu_ptr(ovpn_rx_pools, cpu)->pool);
+
+	free_percpu(ovpn_rx_pools);
+	ovpn_rx_pools = NULL;
+}
+
+static int ovpn_rx_pools_alloc(void)
+{
+	struct page_pool_params params = {
+		.pool_size = OVPN_RX_POOL_SIZE,
+	};
+	struct ovpn_rx_pool *rx_pool;
+	struct page_pool *pool;
+	int cpu;
+
+	ovpn_rx_pools = alloc_percpu(struct ovpn_rx_pool);
+	if (!ovpn_rx_pools)
+		return -ENOMEM;
+
+	for_each_possible_cpu(cpu) {
+		rx_pool = per_cpu_ptr(ovpn_rx_pools, cpu);
+		local_lock_init(&rx_pool->bh_lock);
+
+		/* not bound to the CPU: pages are always recycled through
+		 * the pool ring, therefore destroying the pool can't race
+		 * with a direct recycling
+		 */
+		params.nid = cpu_to_mem(cpu);
+		pool = page_pool_create(&params);
+		if (IS_ERR(pool)) {
+			ovpn_rx_pools_free();
+			return PTR_ERR(pool);
+		}
+		rx_pool->pool = pool;
+	}
+
+	return 0;
+}
 
 static void ovpn_priv_free(struct net_device *net)
 {
@@ -275,10 +329,16 @@ static int __init ovpn_init(void)
 		return -ENOMEM;
 	}
 
+	err = ovpn_rx_pools_alloc();
+	if (err) {
+		pr_err("ovpn: cannot allocate RX page pools: %d\n", err);
+		goto destroy_wq;
+	}
+
 	err = rtnl_link_register(&ovpn_link_ops);
 	if (err) {
 		pr_err("ovpn: can't register rtnl link ops: %d\n", err);
-		goto destroy_wq;
+		goto free_pools;
 	}
 
 	err = ovpn_nl_register();
@@ -291,6 +351,8 @@ static int __init ovpn_init(void)
 
 unreg_rtnl:
 	rtnl_link_unregister(&ovpn_link_ops);
+free_pools:
+	ovpn_rx_pools_free();
 destroy_wq:
 	destroy_workqueue(ovpn_wq);
 	ovpn_wq = NULL;
@@ -307,6 +369,9 @@ static __exit void ovpn_cleanup(void)
 
 	destroy_workqueue(ovpn_wq);
 	ovpn_wq = NULL;
+
+	/* all interfaces are gone, so no record can be received anymore */
+	ovpn_rx_pools_free();
 }
 
 module_init(ovpn_init);

@@ -9,9 +9,12 @@
 
 #include <crypto/aead.h>
 #include <linux/skbuff.h>
+#include <linux/skbuff_ref.h>
 #include <linux/workqueue.h>
 #include <net/ip.h>
 #include <net/ipv6.h>
+#include <net/page_pool/helpers.h>
+#include <net/sock.h>
 #include <net/udp.h>
 
 #include "ovpnpriv.h"
@@ -438,6 +441,107 @@ int ovpn_aead_encrypt_tcp_gso(struct ovpn_peer *peer,
 	return crypto_aead_encrypt(req);
 }
 
+/**
+ * ovpn_aead_decrypt_pp_copy - make a paged record private by copying its
+ *			       fragments into pages of the per-CPU RX pool
+ * @skb: the received record
+ *
+ * The received fragments may still be referenced, and even modified, by
+ * others, therefore they are copied once and released: the AEAD only reads
+ * and writes memory owned by ovpn. Unlike skb_cow_data, the copy goes into
+ * recycled order-0 pages instead of a freshly allocated (and possibly high
+ * order) linear head.
+ *
+ * Only records too large for a linear head of one page, whose head is
+ * private and not backed by a page pool page, are handled: smaller ones are
+ * cheaply linearized by skb_cow_data. Any other record is left unchanged.
+ *
+ * Return: the number of scatterlist entries needed by the record if it was
+ * copied, 0 otherwise
+ */
+static int ovpn_aead_decrypt_pp_copy(struct sk_buff *skb)
+{
+	unsigned int len, offset, truesize, remaining = skb->data_len;
+	unsigned int headlen = skb_headlen(skb), new_truesize = 0;
+	skb_frag_t frags[MAX_SKB_FRAGS];
+	struct skb_shared_info *shinfo;
+	struct page_pool *pool;
+	struct page *page;
+	int i, nr_frags = 0;
+
+	if (!skb_is_nonlinear(skb) || skb_cloned(skb) ||
+	    skb_has_frag_list(skb) ||
+	    DIV_ROUND_UP(remaining, PAGE_SIZE) + 1 > MAX_SKB_FRAGS)
+		return 0;
+
+	/* the linear head skb_cow_data would allocate fits in one page */
+	if (SKB_HEAD_ALIGN(skb_headroom(skb) + skb->len) <= PAGE_SIZE)
+		return 0;
+
+	/* switching the skb to page pool semantics must not affect its head */
+	if (skb->head_frag && !skb->pp_recycle &&
+	    page_pool_page_is_pp(virt_to_head_page(skb->head)))
+		return 0;
+
+	/* zerocopy fragments are released (and copied) by skb_cow_data */
+	if (skb_zcopy(skb))
+		return 0;
+
+	/* the per-CPU pool can only be used by one context at a time */
+	local_bh_disable();
+	local_lock_nested_bh(&ovpn_rx_pools->bh_lock);
+	pool = this_cpu_ptr(ovpn_rx_pools)->pool;
+	while (remaining) {
+		len = min_t(unsigned int, remaining, PAGE_SIZE);
+		truesize = len;
+		page = page_pool_dev_alloc(pool, &offset, &truesize);
+		if (unlikely(!page))
+			break;
+
+		skb_frag_fill_page_desc(&frags[nr_frags++], page, offset, len);
+		new_truesize += truesize;
+		remaining -= len;
+	}
+	local_unlock_nested_bh(&ovpn_rx_pools->bh_lock);
+	local_bh_enable();
+
+	if (unlikely(remaining))
+		goto err;
+
+	/* read the received fragments exactly once */
+	offset = headlen;
+	for (i = 0; i < nr_frags; i++) {
+		len = skb_frag_size(&frags[i]);
+		if (unlikely(skb_copy_bits(skb, offset,
+					   skb_frag_address(&frags[i]), len)))
+			goto err;
+		offset += len;
+	}
+
+	shinfo = skb_shinfo(skb);
+	for (i = 0; i < shinfo->nr_frags; i++)
+		__skb_frag_unref(&shinfo->frags[i], skb->pp_recycle);
+	memcpy(shinfo->frags, frags, nr_frags * sizeof(*frags));
+	shinfo->nr_frags = nr_frags;
+	shinfo->flags &= ~SKBFL_SHARED_FRAG;
+
+	/* like pskb_expand_head, don't change the size of a charged skb.
+	 * The received fragments are accounted as their payload size only,
+	 * which overestimates the new size
+	 */
+	if (!skb->sk || skb->destructor == sock_edemux)
+		skb->truesize += new_truesize - skb->data_len;
+	skb_mark_for_recycle(skb);
+
+	/* head and new fragments */
+	return nr_frags + 1;
+err:
+	/* the skb is unchanged: let skb_cow_data try */
+	for (i = 0; i < nr_frags; i++)
+		page_pool_put_full_page(pool, skb_frag_page(&frags[i]), false);
+	return 0;
+}
+
 int ovpn_aead_decrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 		      struct sk_buff *skb, bool tcp)
 {
@@ -469,8 +573,13 @@ int ovpn_aead_decrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 	if (unlikely(!pskb_may_pull(skb, payload_offset)))
 		return -ENODATA;
 
-	/* get number of skb frags and ensure that packet data is writable */
-	nfrags = skb_cow_data(skb, 0, &trailer);
+	/* get number of skb frags and ensure that packet data is writable:
+	 * the data of paged records is copied into private pool pages,
+	 * anything else is copied into a private head when needed
+	 */
+	nfrags = ovpn_aead_decrypt_pp_copy(skb);
+	if (!nfrags)
+		nfrags = skb_cow_data(skb, 0, &trailer);
 	if (unlikely(nfrags < 0))
 		return nfrags;
 
