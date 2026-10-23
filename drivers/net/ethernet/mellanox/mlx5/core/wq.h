@@ -227,12 +227,15 @@ static inline void mlx5_cqwq_update_db_record(struct mlx5_cqwq *wq)
 	*wq->db = cpu_to_be32(wq->cc & 0xffffff);
 }
 
-static inline struct mlx5_cqe64 *mlx5_cqwq_get_cqe(struct mlx5_cqwq *wq)
+/* CQE at counter @ctr, if owned by SW. Without CQE compression it can also
+ * look at CQEs after the consumer counter.
+ */
+static inline struct mlx5_cqe64 *
+mlx5_cqwq_get_cqe_ctr(struct mlx5_cqwq *wq, u32 ctr)
 {
-	u32 ci = mlx5_cqwq_get_ci(wq);
-	struct mlx5_cqe64 *cqe = mlx5_cqwq_get_wqe(wq, ci);
+	struct mlx5_cqe64 *cqe = mlx5_cqwq_get_wqe(wq, mlx5_cqwq_ctr2ix(wq, ctr));
 	u8 cqe_ownership_bit = cqe->op_own & MLX5_CQE_OWNER_MASK;
-	u8 sw_ownership_val = mlx5_cqwq_get_wrap_cnt(wq) & 1;
+	u8 sw_ownership_val = mlx5_cqwq_get_ctr_wrap_cnt(wq, ctr) & 1;
 
 	if (cqe_ownership_bit != sw_ownership_val)
 		return NULL;
@@ -241,6 +244,11 @@ static inline struct mlx5_cqe64 *mlx5_cqwq_get_cqe(struct mlx5_cqwq *wq)
 	dma_rmb();
 
 	return cqe;
+}
+
+static inline struct mlx5_cqe64 *mlx5_cqwq_get_cqe(struct mlx5_cqwq *wq)
+{
+	return mlx5_cqwq_get_cqe_ctr(wq, wq->cc);
 }
 
 static inline

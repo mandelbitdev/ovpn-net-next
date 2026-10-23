@@ -2455,10 +2455,65 @@ static int mlx5e_rx_cq_process_enhanced_cqe_comp(struct mlx5e_rq *rq,
 	return work_done;
 }
 
+/* In the linear striding RQ path the headers of a packet, the line that will
+ * hold its skb_shared_info and its page descriptor are typically not in the
+ * CPU cache, as the device just wrote the packet, and the prefetch done while
+ * building the skb is too late to hide the memory latency. While a CQE is
+ * processed, prefetch them for the packet MLX5E_RX_PREFETCH_DIST CQEs after
+ * it, if the device already completed it. Also prefetch the CQE twice as far
+ * after the one being processed: it is the one looked at to find the packet
+ * MLX5E_RX_PREFETCH_DIST CQEs later, so that looking ahead normally hits the
+ * cache as well. Looking ahead requires plain CQEs: a compressed session
+ * doesn't carry an ownership bit in each slot.
+ */
+#define MLX5E_RX_PREFETCH_DIST	4
+
+/* called after the CQE being processed was popped: wq->cc is the next one */
+static void mlx5e_mpwrq_linear_prefetch(struct mlx5e_rq *rq,
+					struct mlx5_cqwq *cqwq)
+{
+	u32 wqe_offset, head_offset, page_idx;
+	struct mlx5e_frag_page *frag_page;
+	struct mlx5e_mpw_info *wi;
+	struct mlx5_cqe64 *cqe;
+	u16 cqe_bcnt;
+	void *va;
+
+	prefetch(mlx5_cqwq_get_wqe(cqwq,
+				   mlx5_cqwq_ctr2ix(cqwq, cqwq->cc +
+						    2 * MLX5E_RX_PREFETCH_DIST - 1)));
+
+	cqe = mlx5_cqwq_get_cqe_ctr(cqwq, cqwq->cc + MLX5E_RX_PREFETCH_DIST - 1);
+	if (!cqe || MLX5E_RX_ERR_CQE(cqe) || mpwrq_is_filler_cqe(cqe))
+		return;
+
+	/* oversized packets are dropped by the linear path */
+	cqe_bcnt = mpwrq_get_cqe_byte_cnt(cqe);
+	if (unlikely(cqe_bcnt > rq->hw_mtu))
+		return;
+
+	wi = mlx5e_get_mpw_info(rq, be16_to_cpu(cqe->wqe_id));
+	wqe_offset = mpwrq_get_cqe_stride_index(cqe) << rq->mpwqe.log_stride_sz;
+	head_offset = wqe_offset & ((1 << rq->mpwqe.page_shift) - 1);
+	page_idx = wqe_offset >> rq->mpwqe.page_shift;
+	frag_page = &wi->alloc_units.frag_pages[page_idx];
+	va = netmem_address(frag_page->netmem) + head_offset;
+
+	net_prefetch(va + rq->buff.headroom);
+	/* skb_shared_info, as placed by mlx5e_build_linear_skb(): with an XDP
+	 * program the packet may not become an skb, or not there
+	 */
+	if (!rcu_access_pointer(rq->xdp_prog))
+		prefetchw(va + SKB_DATA_ALIGN(rq->buff.headroom + cqe_bcnt));
+	/* page_pool reads its DMA address and refcount */
+	prefetch(netmem_to_page(frag_page->netmem));
+}
+
 static int mlx5e_rx_cq_process_basic_cqe_comp(struct mlx5e_rq *rq,
 					      struct mlx5_cqwq *cqwq,
 					      int budget_rem)
 {
+	bool prefetch_next = test_bit(MLX5E_RQ_STATE_PREFETCH_NEXT, &rq->state);
 	struct mlx5_cqe64 *cqe;
 	int work_done = 0;
 
@@ -2474,6 +2529,8 @@ static int mlx5e_rx_cq_process_basic_cqe_comp(struct mlx5e_rq *rq,
 		}
 
 		mlx5_cqwq_pop(cqwq);
+		if (prefetch_next)
+			mlx5e_mpwrq_linear_prefetch(rq, cqwq);
 		INDIRECT_CALL_3(rq->handle_rx_cqe, mlx5e_handle_rx_cqe_mpwrq,
 				mlx5e_handle_rx_cqe, mlx5e_handle_rx_cqe_mpwrq_shampo,
 				rq, cqe);
@@ -2651,16 +2708,21 @@ int mlx5e_rq_set_handlers(struct mlx5e_rq *rq, struct mlx5e_params *params, bool
 	struct net_device *netdev = rq->netdev;
 	struct mlx5_core_dev *mdev = rq->mdev;
 	struct mlx5e_priv *priv = rq->priv;
+	bool linear;
 
 	switch (rq->wq_type) {
 	case MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ:
+		linear = !xsk && mlx5e_rx_mpwqe_is_linear_skb(mdev, params, NULL);
 		rq->mpwqe.skb_from_cqe_mpwrq = xsk ?
 			mlx5e_xsk_skb_from_cqe_mpwrq_linear :
-			mlx5e_rx_mpwqe_is_linear_skb(mdev, params, NULL) ?
-				mlx5e_skb_from_cqe_mpwrq_linear :
-				mlx5e_skb_from_cqe_mpwrq_nonlinear;
+			linear ? mlx5e_skb_from_cqe_mpwrq_linear :
+				 mlx5e_skb_from_cqe_mpwrq_nonlinear;
 		rq->post_wqes = mlx5e_post_rx_mpwqes;
 		rq->dealloc_wqe = mlx5e_dealloc_rx_mpwqe;
+
+		/* looking at the CQEs ahead requires plain CQEs */
+		if (linear && !MLX5E_GET_PFLAG(params, MLX5E_PFLAG_RX_CQE_COMPRESS))
+			__set_bit(MLX5E_RQ_STATE_PREFETCH_NEXT, &rq->state);
 
 		if (params->packet_merge.type == MLX5E_PACKET_MERGE_SHAMPO) {
 			rq->handle_rx_cqe = priv->profile->rx_handlers->handle_rx_cqe_mpwqe_shampo;
