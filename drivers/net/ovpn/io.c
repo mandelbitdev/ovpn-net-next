@@ -345,12 +345,57 @@ static void ovpn_encrypt_key_exhausted(struct ovpn_peer *peer,
 		ovpn_nl_key_swap_notify(peer, ks->key_id);
 }
 
+/* send an encrypted output, or drop and account it if it can't be sent, then
+ * release the references it owns
+ */
+static void ovpn_encrypt_send(struct ovpn_peer *peer,
+			      struct ovpn_crypto_key_slot *ks,
+			      struct sk_buff *skb, unsigned int packets)
+{
+	struct ovpn_socket *sock;
+	unsigned int orig_len;
+
+	skb_mark_not_on_list(skb);
+	orig_len = skb->len;
+
+	rcu_read_lock();
+	sock = rcu_dereference(peer->sock);
+	if (unlikely(!sock))
+		goto err_unlock;
+
+	switch (sock->sk->sk_protocol) {
+	case IPPROTO_UDP:
+		ovpn_udp_send_skb(peer, sock->sk, skb);
+		break;
+	case IPPROTO_TCP:
+		ovpn_tcp_send_skb(peer, sock->sk, skb);
+		break;
+	default:
+		/* no transport configured yet */
+		goto err_unlock;
+	}
+
+	ovpn_peer_stats_add_tx(&peer->link_stats, orig_len, packets);
+	/* keep track of last sent packet for keepalive */
+	WRITE_ONCE(peer->last_sent, ktime_get_boottime_seconds());
+	/* skb passed down the stack - don't free it */
+	skb = NULL;
+err_unlock:
+	rcu_read_unlock();
+	if (unlikely(skb)) {
+		ovpn_dev_dstats_tx_dropped(peer->ovpn->dev, packets);
+		kfree_skb(skb);
+	}
+	if (likely(ks))
+		ovpn_crypto_key_slot_put(ks);
+	ovpn_peer_put(peer);
+}
+
 void ovpn_encrypt_post(void *data, int ret)
 {
-	unsigned int orig_len, packets = 1;
+	unsigned int packets = 1;
 	struct ovpn_crypto_key_slot *ks;
 	struct sk_buff *skb = data;
-	struct ovpn_socket *sock;
 	struct ovpn_cb *batch_cb;
 	struct ovpn_peer *peer;
 	struct sk_buff *batch;
@@ -409,36 +454,11 @@ void ovpn_encrypt_post(void *data, int ret)
 	if (unlikely(ret < 0))
 		goto err;
 
-	skb_mark_not_on_list(skb);
-	orig_len = skb->len;
+	ovpn_encrypt_send(peer, ks, skb, packets);
+	return;
 
-	rcu_read_lock();
-	sock = rcu_dereference(peer->sock);
-	if (unlikely(!sock))
-		goto err_unlock;
-
-	switch (sock->sk->sk_protocol) {
-	case IPPROTO_UDP:
-		ovpn_udp_send_skb(peer, sock->sk, skb);
-		break;
-	case IPPROTO_TCP:
-		ovpn_tcp_send_skb(peer, sock->sk, skb);
-		break;
-	default:
-		/* no transport configured yet */
-		goto err_unlock;
-	}
-
-	ovpn_peer_stats_add_tx(&peer->link_stats, orig_len, packets);
-	/* keep track of last sent packet for keepalive */
-	WRITE_ONCE(peer->last_sent, ktime_get_boottime_seconds());
-	/* skb passed down the stack - don't free it */
-	skb = NULL;
-err_unlock:
-	rcu_read_unlock();
 err:
-	if (unlikely(skb))
-		ovpn_dev_dstats_tx_dropped(peer->ovpn->dev, packets);
+	ovpn_dev_dstats_tx_dropped(peer->ovpn->dev, packets);
 	kfree_skb(skb);
 	if (likely(ks))
 		ovpn_crypto_key_slot_put(ks);
