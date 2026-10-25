@@ -800,15 +800,8 @@ static bool ovpn_send_tcp_gso(struct ovpn_peer *peer, struct sk_buff *skb)
 netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
 {
 	struct ovpn_priv *ovpn = netdev_priv(dev);
-	struct sk_buff *segments, *curr, *next;
-	const bool gso_in = skb_is_gso(skb);
-	struct sk_buff_head skb_list;
-	netdev_features_t features;
-	unsigned int tx_bytes = 0;
 	struct ovpn_peer *peer;
-	bool gso_out;
 	__be16 proto;
-	int ret;
 
 	/* Make skb metadata private before modifying it or acquiring TX refs.
 	 * Packet data can remain shared for out-of-place encryption.
@@ -818,17 +811,6 @@ netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
 		ovpn_dev_dstats_tx_dropped(dev, 1);
 		return NETDEV_TX_OK;
 	}
-
-	/* A frag-list GSO skb already stores complete segments as child skbs.
-	 * Keep those children on the ordinary in-place encryption path instead
-	 * of copying them into a replacement UDP GSO skb.
-	 *
-	 * GSO_BY_FRAGS input must remain on that path too because its variable
-	 * segment sizes cannot be represented by one UDP GSO output size.
-	 */
-	gso_out = gso_in &&
-		  !(skb_shinfo(skb)->gso_type & SKB_GSO_FRAGLIST) &&
-		  skb_shinfo(skb)->gso_size != GSO_BY_FRAGS;
 
 	/* reset netfilter state */
 	nf_reset_ct(skb);
@@ -858,12 +840,52 @@ netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
 	/* dst was needed for peer selection - it can now be dropped */
 	skb_dst_drop(skb);
 
+	ovpn_xmit_peer(peer, skb);
+	return NETDEV_TX_OK;
+
+drop_no_peer:
+	ovpn_dev_dstats_tx_dropped(ovpn->dev, 1);
+	skb_tx_error(skb);
+	kfree_skb_list(skb);
+	return NETDEV_TX_OK;
+}
+
+/**
+ * ovpn_xmit_peer - encrypt and send a packet to its peer
+ * @peer: the peer to send the packet to, its reference is consumed
+ * @skb: the packet
+ *
+ * Must be called with BHs disabled, as in the device transmit path.
+ */
+void ovpn_xmit_peer(struct ovpn_peer *peer, struct sk_buff *skb)
+{
+	struct ovpn_priv *ovpn = peer->ovpn;
+	struct sk_buff *segments, *curr, *next;
+	const bool gso_in = skb_is_gso(skb);
+	struct net_device *dev = ovpn->dev;
+	struct sk_buff_head skb_list;
+	netdev_features_t features;
+	unsigned int tx_bytes = 0;
+	bool gso_out;
+	int ret;
+
+	/* A frag-list GSO skb already stores complete segments as child skbs.
+	 * Keep those children on the ordinary in-place encryption path instead
+	 * of copying them into a replacement UDP GSO skb.
+	 *
+	 * GSO_BY_FRAGS input must remain on that path too because its variable
+	 * segment sizes cannot be represented by one UDP GSO output size.
+	 */
+	gso_out = gso_in &&
+		  !(skb_shinfo(skb)->gso_type & SKB_GSO_FRAGLIST) &&
+		  skb_shinfo(skb)->gso_size != GSO_BY_FRAGS;
+
 	/* if this is an eligible GSO skb and we're using TCP as transport
 	 * protocol, try to send it without prior segmentation
 	 */
 	if (gso_in && ovpn_send_tcp_gso(peer, skb)) {
 		ovpn_peer_put(peer);
-		return NETDEV_TX_OK;
+		return;
 	}
 
 	if (gso_in) {
@@ -926,7 +948,7 @@ netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
 	 */
 	if (unlikely(skb_queue_empty(&skb_list))) {
 		ovpn_peer_put(peer);
-		return NETDEV_TX_OK;
+		return;
 	}
 
 	ovpn_peer_stats_increment_tx(&peer->vpn_stats, tx_bytes);
@@ -937,16 +959,13 @@ netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
 
 	skb_list.prev->next = NULL;
 	ovpn_send(ovpn, skb_list.next, peer);
-
-	return NETDEV_TX_OK;
+	return;
 
 drop:
 	ovpn_peer_put(peer);
-drop_no_peer:
 	ovpn_dev_dstats_tx_dropped(ovpn->dev, 1);
 	skb_tx_error(skb);
 	kfree_skb_list(skb);
-	return NETDEV_TX_OK;
 }
 
 /**

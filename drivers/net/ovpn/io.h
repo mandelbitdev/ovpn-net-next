@@ -46,6 +46,7 @@ void ovpn_recv(struct ovpn_peer *peer, struct sk_buff *skb, bool tcp);
 void ovpn_xmit_special(struct ovpn_peer *peer, const void *data,
 		       const unsigned int len);
 
+void ovpn_xmit_peer(struct ovpn_peer *peer, struct sk_buff *skb);
 void ovpn_encrypt_post(void *data, int ret);
 void ovpn_encrypt_tcp_gso_post(void *data, int ret);
 void ovpn_decrypt_post(void *data, int ret);
