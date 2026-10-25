@@ -26,6 +26,7 @@
 #include "crypto.h"
 #include "crypto_aead.h"
 #include "netlink.h"
+#include "par.h"
 #include "proto.h"
 #include "tcp.h"
 #include "udp.h"
@@ -391,6 +392,16 @@ err_unlock:
 	ovpn_peer_put(peer);
 }
 
+/**
+ * ovpn_encrypt_send_deferred - send an output collected by a parallel job
+ * @skb: the encrypted output, owning the references stored in its cb
+ */
+void ovpn_encrypt_send_deferred(struct sk_buff *skb)
+{
+	ovpn_encrypt_send(ovpn_skb_cb(skb)->peer, ovpn_skb_cb(skb)->ks, skb,
+			  ovpn_skb_cb(skb)->tcp_packets);
+}
+
 void ovpn_encrypt_post(void *data, int ret)
 {
 	unsigned int packets = 1;
@@ -453,6 +464,10 @@ void ovpn_encrypt_post(void *data, int ret)
 
 	if (unlikely(ret < 0))
 		goto err;
+
+	/* a parallel job sends its outputs later, in submission order */
+	if (ovpn_tx_par_collect(peer, ks, skb, packets))
+		return;
 
 	ovpn_encrypt_send(peer, ks, skb, packets);
 	return;
@@ -581,8 +596,7 @@ static bool ovpn_encrypt_udp_gso_queue(struct sk_buff_head *skbs,
 	/* reserve the complete range before dequeuing any input skb so that a
 	 * failure leaves the ordinary transmit path available as a fallback
 	 */
-	if (unlikely(ovpn_pktid_xmit_range(&ks->pid_xmit, segments,
-					   &first_pktid))) {
+	if (unlikely(ovpn_tx_pktid_range(ks, segments, &first_pktid))) {
 		ovpn_encrypt_key_exhausted(peer, ks);
 		ovpn_crypto_key_slot_put(ks);
 		ovpn_peer_put(peer);
@@ -780,6 +794,31 @@ static bool ovpn_tcp_gso_eligible(const struct sk_buff *skb,
 	return true;
 }
 
+/**
+ * ovpn_xmit_records - estimate the packet IDs ovpn_xmit_peer() consumes
+ * @peer: the peer the packet is sent to
+ * @skb: the packet
+ *
+ * A shortfall is allocated when the packet is encrypted.
+ *
+ * Return: the number of packet IDs the packet is expected to consume
+ */
+unsigned int ovpn_xmit_records(struct ovpn_peer *peer,
+			       const struct sk_buff *skb)
+{
+	unsigned int segments, hdr_len;
+
+	if (!skb_is_gso(skb))
+		return 1;
+
+	/* a TCP transport sends an eligible GSO packet as one record */
+	if (ovpn_peer_uses_tcp(peer) &&
+	    ovpn_tcp_gso_eligible(skb, &segments, &hdr_len))
+		return 1;
+
+	return skb_shinfo(skb)->gso_segs;
+}
+
 /* Returning false leaves the input owned by the segmentation fallback. */
 static bool ovpn_send_tcp_gso(struct ovpn_peer *peer, struct sk_buff *skb)
 {
@@ -859,6 +898,10 @@ netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
 	}
 	/* dst was needed for peer selection - it can now be dropped */
 	skb_dst_drop(skb);
+
+	/* parallel encryption of large packets, and of anything queued behind */
+	if (ovpn_tx_par_dispatch(peer, skb))
+		return NETDEV_TX_OK;
 
 	ovpn_xmit_peer(peer, skb);
 	return NETDEV_TX_OK;

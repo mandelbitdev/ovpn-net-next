@@ -265,7 +265,7 @@ int ovpn_aead_encrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 	}
 
 	/* obtain the packet ID used by both the nonce and associated data */
-	ret = ovpn_pktid_xmit_next(&ks->pid_xmit, &pktid);
+	ret = ovpn_tx_pktid_next(ks, &pktid);
 	if (unlikely(ret < 0))
 		return ret;
 	ovpn_aead_encrypt_header(peer, ks, pktid, iv, skb->data);
@@ -428,7 +428,7 @@ int ovpn_aead_encrypt_tcp_gso(struct ovpn_peer *peer,
 		   OVPN_AUTH_TAG_SIZE);
 	sg_mark_end(dst + mapped + 1);
 
-	ret = ovpn_pktid_xmit_next(&ks->pid_xmit, &pktid);
+	ret = ovpn_tx_pktid_next(ks, &pktid);
 	if (unlikely(ret))
 		return ret;
 	ovpn_aead_encrypt_header(peer, ks, pktid, iv, gso_skb->data);

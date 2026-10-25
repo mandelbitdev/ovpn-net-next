@@ -6,9 +6,10 @@
  *  Author:	Antonio Quartulli <antonio@openvpn.net>
  */
 
-/* Ordered parallel crypto: large received batches of a peer become jobs
- * processed by per-CPU workers. Each peer queue then delivers its jobs in
- * submission order, from a work running on the CPU that submitted them.
+/* Ordered parallel crypto: large received batches and transmitted packets
+ * of a peer become jobs processed by per-CPU workers. Each peer queue then
+ * delivers its jobs in submission order, from a work running on the CPU that
+ * submitted them.
  */
 
 #include <linux/llist.h>
@@ -32,6 +33,10 @@ static unsigned long rx_par_cpus;
 module_param(rx_par_cpus, ulong, 0644);
 MODULE_PARM_DESC(rx_par_cpus, "bitmask of CPUs decrypting received batches");
 
+static unsigned long tx_par_cpus;
+module_param(tx_par_cpus, ulong, 0644);
+MODULE_PARM_DESC(tx_par_cpus, "bitmask of CPUs encrypting transmitted packets");
+
 /* EXPERIMENTAL: smaller work stays in the calling context, unless earlier
  * work of the same peer is still queued
  */
@@ -39,12 +44,22 @@ static unsigned int rx_par_min_bytes = 16384;
 module_param(rx_par_min_bytes, uint, 0644);
 MODULE_PARM_DESC(rx_par_min_bytes, "minimum bytes in a parallel RX batch");
 
+static unsigned int tx_par_min_bytes = 16384;
+module_param(tx_par_min_bytes, uint, 0644);
+MODULE_PARM_DESC(tx_par_min_bytes, "minimum bytes in a parallel TX job");
+
 /**
  * struct ovpn_par_job - work processed by a worker and delivered in order
  * @node: entry in the queue of the worker processing the job
  * @list: entry in the peer queue ordering delivery
  * @q: the peer queue the job belongs to
- * @skbs: records to decrypt, then records to deliver
+ * @skbs: RX: records to decrypt, then records to deliver;
+ *	  TX: packet to encrypt, then encrypted outputs to send
+ * @ks: TX: key slot the packet IDs were reserved from, or NULL
+ * @pktid: TX: first reserved packet ID
+ * @npkt: TX: number of reserved packet IDs
+ * @cpu: TX: the CPU that submitted the job
+ * @tx: whether this is a transmit job
  * @done: whether processing completed, protected by the queue lock
  */
 struct ovpn_par_job {
@@ -52,6 +67,11 @@ struct ovpn_par_job {
 	struct list_head list;
 	struct ovpn_par_queue *q;
 	struct sk_buff *skbs;
+	struct ovpn_crypto_key_slot *ks;
+	u32 pktid;
+	u32 npkt;
+	int cpu;
+	bool tx;
 	bool done;
 };
 
@@ -61,6 +81,7 @@ struct ovpn_par_worker {
 	struct work_struct work;
 };
 
+DEFINE_PER_CPU(struct ovpn_tx_ctx *, ovpn_tx_ctx_cur);
 static DEFINE_PER_CPU(struct ovpn_par_worker, ovpn_par_workers);
 static DEFINE_PER_CPU(unsigned int, ovpn_par_last_cpu);
 static struct workqueue_struct *ovpn_par_wq;
@@ -120,17 +141,80 @@ static void ovpn_rx_job_run(struct ovpn_par_job *job)
 	job->skbs = head;
 }
 
+static void ovpn_tx_job_run(struct ovpn_par_job *job)
+{
+	struct ovpn_tx_ctx ctx = {
+		.peer = job->q->peer,
+		.ks = job->ks,
+		.next = job->pktid,
+		.end = job->pktid + job->npkt,
+		.task = current,
+		.sender_cpu = job->cpu + 1,
+	};
+
+	ctx.tail = &ctx.head;
+
+	/* the transmit path expects BHs disabled, which also keeps anything
+	 * else on this CPU from seeing the context
+	 */
+	local_bh_disable();
+	this_cpu_write(ovpn_tx_ctx_cur, &ctx);
+	ovpn_xmit_peer(job->q->peer, job->skbs);
+	this_cpu_write(ovpn_tx_ctx_cur, NULL);
+	local_bh_enable();
+
+	job->skbs = ctx.head;
+	if (job->ks)
+		ovpn_crypto_key_slot_put(job->ks);
+}
+
+/**
+ * ovpn_tx_par_collect - keep an encrypted output for in-order transmission
+ * @peer: the peer the output is sent to, its reference is passed on success
+ * @ks: the key slot used, its reference is passed on success
+ * @skb: the encrypted output
+ * @packets: number of packets accounted for the output
+ *
+ * Return: true if the output was collected by the running transmit job
+ */
+bool ovpn_tx_par_collect(struct ovpn_peer *peer,
+			 struct ovpn_crypto_key_slot *ks, struct sk_buff *skb,
+			 unsigned int packets)
+{
+	struct ovpn_tx_ctx *ctx = ovpn_tx_ctx_current();
+
+	if (!ctx || ctx->peer != peer)
+		return false;
+
+	skb_mark_not_on_list(skb);
+	ovpn_skb_cb(skb)->peer = peer;
+	ovpn_skb_cb(skb)->ks = ks;
+	ovpn_skb_cb(skb)->tcp_packets = packets;
+#ifdef CONFIG_XPS
+	/* keep the outer flow on the TX queue the inline path would use */
+	skb->sender_cpu = ctx->sender_cpu;
+#endif
+	*ctx->tail = skb;
+	ctx->tail = &skb->next;
+
+	return true;
+}
+
 static void ovpn_par_job_deliver(struct ovpn_par_job *job)
 {
 	struct sk_buff *skb, *next;
 
-	/* gro_cells run when BHs are enabled again, before the next job is
-	 * delivered
+	/* BHs disabled as in the inline paths: TX sends under the socket
+	 * lock, RX gro_cells run when BHs are enabled again, before the next
+	 * job is delivered
 	 */
 	local_bh_disable();
 	skb_list_walk_safe(job->skbs, skb, next) {
 		skb_mark_not_on_list(skb);
-		ovpn_decrypt_post(skb, ovpn_skb_cb(skb)->rx_ret);
+		if (job->tx)
+			ovpn_encrypt_send_deferred(skb);
+		else
+			ovpn_decrypt_post(skb, ovpn_skb_cb(skb)->rx_ret);
 	}
 	local_bh_enable();
 }
@@ -217,7 +301,10 @@ static void ovpn_par_work(struct work_struct *work)
 
 	n = llist_reverse_order(llist_del_all(&w->jobs));
 	llist_for_each_entry_safe(job, tmp, n, node) {
-		ovpn_rx_job_run(job);
+		if (job->tx)
+			ovpn_tx_job_run(job);
+		else
+			ovpn_rx_job_run(job);
 		ovpn_par_job_complete(job);
 		cond_resched();
 	}
@@ -264,6 +351,9 @@ static struct ovpn_par_job *ovpn_par_job_alloc(struct ovpn_par_queue *q,
 	}
 
 	job->q = q;
+	job->ks = NULL;
+	job->pktid = 0;
+	job->npkt = 0;
 	job->done = false;
 
 	return job;
@@ -325,8 +415,72 @@ bool ovpn_rx_par_dispatch(struct ovpn_peer *peer, struct sk_buff *list,
 	}
 
 	job->skbs = list;
+	job->tx = false;
 
 	spin_lock_bh(&q->lock);
+	ovpn_par_job_submit(job, cpu);
+
+	return true;
+}
+
+/**
+ * ovpn_tx_par_dispatch - queue a packet for parallel encryption
+ * @peer: the peer the packet is sent to, its reference is passed on success
+ * @skb: the packet
+ *
+ * Return: true if the packet was consumed, false if the caller still owns it
+ * and the peer reference
+ */
+bool ovpn_tx_par_dispatch(struct ovpn_peer *peer, struct sk_buff *skb)
+{
+	unsigned long mask = READ_ONCE(tx_par_cpus);
+	struct ovpn_par_queue *q = &peer->tx_par;
+	struct ovpn_crypto_key_slot *ks;
+	struct ovpn_par_job *job;
+	unsigned int npkt;
+	int cpu;
+
+	if (!mask)
+		return false;
+
+	if ((!skb_is_gso(skb) || skb->len < READ_ONCE(tx_par_min_bytes)) &&
+	    !atomic_read(&q->inflight))
+		return false;
+
+	job = ovpn_par_job_alloc(q, mask, &cpu);
+	if (unlikely(!job)) {
+		if (!atomic_read(&q->inflight))
+			return false;
+
+		/* sending here would overtake earlier queued packets, whose
+		 * packet IDs could then fall behind the peer's replay window
+		 */
+		ovpn_dev_dstats_tx_dropped(peer->ovpn->dev, 1);
+		skb_tx_error(skb);
+		kfree_skb(skb);
+		ovpn_peer_put(peer);
+		return true;
+	}
+
+	/* the worker consumes the caller's peer reference */
+	job->skbs = skb;
+	job->tx = true;
+	job->cpu = smp_processor_id();
+	npkt = ovpn_xmit_records(peer, skb);
+
+	/* Reserve the packet IDs under the queue lock, so that IDs increase
+	 * in delivery order. Without a reservation, or for a shortfall, the
+	 * worker allocates IDs as usual.
+	 */
+	spin_lock_bh(&q->lock);
+	ks = ovpn_crypto_key_slot_primary(&peer->crypto);
+	if (ks && npkt &&
+	    !ovpn_pktid_xmit_range(&ks->pid_xmit, npkt, &job->pktid)) {
+		job->ks = ks;
+		job->npkt = npkt;
+	} else if (ks) {
+		ovpn_crypto_key_slot_put(ks);
+	}
 	ovpn_par_job_submit(job, cpu);
 
 	return true;

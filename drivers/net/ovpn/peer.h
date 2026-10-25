@@ -69,6 +69,7 @@ struct ovpn_route_key {
  * @vpn_stats: per-peer in-VPN TX/RX stats
  * @link_stats: per-peer link/transport TX/RX stats
  * @rx_par: queue delivering the records decrypted by parallel workers
+ * @tx_par: queue sending the packets encrypted by parallel workers
  * @delete_reason: why peer was deleted (i.e. timeout, transport error, ..)
  * @lock: protects binding to peer (bind), route_key and keepalive* fields
  * @refcount: reference counter
@@ -126,6 +127,7 @@ struct ovpn_peer {
 	struct ovpn_peer_stats vpn_stats;
 	struct ovpn_peer_stats link_stats;
 	struct ovpn_par_queue rx_par;
+	struct ovpn_par_queue tx_par;
 	enum ovpn_del_peer_reason delete_reason;
 	spinlock_t lock; /* protects bind, route_key and keepalive* */
 	struct kref refcount;
