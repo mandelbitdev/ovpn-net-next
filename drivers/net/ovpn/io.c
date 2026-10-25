@@ -290,8 +290,19 @@ drop_nocount:
 	ovpn_peer_put(peer);
 }
 
-/* RX path entry point: decrypt packet and forward it to the device */
-void ovpn_recv(struct ovpn_peer *peer, struct sk_buff *skb, bool tcp)
+/**
+ * ovpn_recv_decrypt - decrypt a received record without delivering it
+ * @peer: the peer the record was received from, a reference to it is passed
+ * @skb: the received record
+ * @tcp: whether the record was received over TCP
+ *
+ * Unless OVPN_RECV_CONSUMED is returned, the caller completes the record with
+ * ovpn_decrypt_post() and the returned value.
+ *
+ * Return: the value to complete the record with, or OVPN_RECV_CONSUMED if
+ * the record was dropped and the peer reference released
+ */
+int ovpn_recv_decrypt(struct ovpn_peer *peer, struct sk_buff *skb, bool tcp)
 {
 	struct ovpn_crypto_key_slot *ks;
 	u8 key_id;
@@ -308,11 +319,20 @@ void ovpn_recv(struct ovpn_peer *peer, struct sk_buff *skb, bool tcp)
 		ovpn_dev_dstats_rx_dropped(peer->ovpn->dev);
 		kfree_skb(skb);
 		ovpn_peer_put(peer);
-		return;
+		return OVPN_RECV_CONSUMED;
 	}
 
 	memset(ovpn_skb_cb(skb), 0, sizeof(struct ovpn_cb));
-	ovpn_decrypt_post(skb, ovpn_aead_decrypt(peer, ks, skb, tcp));
+	return ovpn_aead_decrypt(peer, ks, skb, tcp);
+}
+
+/* RX path entry point: decrypt packet and forward it to the device */
+void ovpn_recv(struct ovpn_peer *peer, struct sk_buff *skb, bool tcp)
+{
+	int ret = ovpn_recv_decrypt(peer, skb, tcp);
+
+	if (ret != OVPN_RECV_CONSUMED)
+		ovpn_decrypt_post(skb, ret);
 }
 
 static void ovpn_encrypt_key_exhausted(struct ovpn_peer *peer,
