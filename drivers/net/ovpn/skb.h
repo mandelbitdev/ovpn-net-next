@@ -29,6 +29,7 @@
  * @payload_offset: offset in the skb where the payload starts
  * @gso_size: received TCP segment payload size, used only after authentication
  * @nosignal: whether this skb should be sent with the MSG_NOSIGNAL flag (TCP)
+ * @rx_ret: decryption result kept until the record is delivered in order
  * @batch: UDP GSO aggregate receiving this input skb's encrypted payload
  * @tcp_gso: output skb owned by a single TCP GSO encryption request
  * @batch_state: completion state owned by a UDP GSO aggregate
@@ -48,6 +49,7 @@ struct ovpn_cb {
 			unsigned int payload_offset;
 			u16 gso_size;
 			bool nosignal;
+			int rx_ret;
 		};
 		struct sk_buff *batch;
 		struct sk_buff *tcp_gso;

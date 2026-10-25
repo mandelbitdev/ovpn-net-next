@@ -23,6 +23,7 @@
 #include "main.h"
 #include "netlink.h"
 #include "io.h"
+#include "par.h"
 #include "peer.h"
 #include "proto.h"
 #include "tcp.h"
@@ -335,10 +336,16 @@ static int __init ovpn_init(void)
 		goto destroy_wq;
 	}
 
+	err = ovpn_par_init();
+	if (err) {
+		pr_err("ovpn: cannot allocate parallel workers: %d\n", err);
+		goto free_pools;
+	}
+
 	err = rtnl_link_register(&ovpn_link_ops);
 	if (err) {
 		pr_err("ovpn: can't register rtnl link ops: %d\n", err);
-		goto free_pools;
+		goto par_exit;
 	}
 
 	err = ovpn_nl_register();
@@ -351,6 +358,8 @@ static int __init ovpn_init(void)
 
 unreg_rtnl:
 	rtnl_link_unregister(&ovpn_link_ops);
+par_exit:
+	ovpn_par_exit();
 free_pools:
 	ovpn_rx_pools_free();
 destroy_wq:
@@ -365,6 +374,7 @@ static __exit void ovpn_cleanup(void)
 	rtnl_link_unregister(&ovpn_link_ops);
 
 	flush_workqueue(ovpn_wq);
+	ovpn_par_exit();
 	rcu_barrier();
 
 	destroy_workqueue(ovpn_wq);

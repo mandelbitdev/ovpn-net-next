@@ -24,6 +24,7 @@
 #include "main.h"
 #include "bind.h"
 #include "io.h"
+#include "par.h"
 #include "peer.h"
 #include "proto.h"
 #include "socket.h"
@@ -195,8 +196,10 @@ static struct sk_buff *ovpn_udp_gro_detach(struct sk_buff *skb)
 
 static void ovpn_udp_recv(struct ovpn_peer *peer, struct sk_buff *skb)
 {
+	struct sk_buff *par = NULL, **par_tail = &par;
 	struct sk_buff *list, *next, *prefetch;
-	unsigned int i;
+	bool par_mode = ovpn_rx_par_enabled();
+	unsigned int i, bytes = 0;
 
 	list = ovpn_udp_gro_detach(skb);
 	if (IS_ERR(list)) {
@@ -209,9 +212,10 @@ static void ovpn_udp_recv(struct ovpn_peer *peer, struct sk_buff *skb)
 
 	/* a fraglist GRO aggregate makes later ciphertext visible before the
 	 * current record is decrypted, so we prime the first two records, then
-	 * keep the cache hints the same distance ahead while draining the list
+	 * keep the cache hints the same distance ahead while draining the list.
+	 * Records decrypted by a worker are not prefetched here.
 	 */
-	prefetch = skb->next ? skb : NULL;
+	prefetch = skb->next && !par_mode ? skb : NULL;
 	for (i = 0; i < OVPN_UDP_GRO_PREFETCH_DISTANCE && prefetch; i++) {
 		ovpn_skb_prefetchw_linear(prefetch);
 		prefetch = prefetch->next;
@@ -252,6 +256,22 @@ static void ovpn_udp_recv(struct ovpn_peer *peer, struct sk_buff *skb)
 			next = NULL;
 		}
 
+		/* collect the records to decrypt them on a worker */
+		if (par_mode) {
+			*par_tail = skb;
+			par_tail = &skb->next;
+			bytes += skb->len;
+			continue;
+		}
+
+		ovpn_recv(peer, skb, false);
+	}
+
+	if (!par || ovpn_rx_par_dispatch(peer, par, bytes))
+		return;
+
+	skb_list_walk_safe(par, skb, next) {
+		skb_mark_not_on_list(skb);
 		ovpn_recv(peer, skb, false);
 	}
 }
