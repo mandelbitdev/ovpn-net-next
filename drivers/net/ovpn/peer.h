@@ -46,6 +46,9 @@ struct ovpn_route_key {
  * @tcp.strp: stream parser context (TCP only)
  * @tcp.user_queue: received packets that have to go to userspace (TCP only)
  * @tcp.out_queue: packets on hold while socket is taken by user (TCP only)
+ * @tcp.tx_queue: packets waiting for socket space behind out_msg (TCP only)
+ * @tcp.tx_queue_bytes: bytes held in tx_queue (TCP only)
+ * @tcp.ctrl_queue: userspace records waiting behind out_msg (TCP only)
  * @tcp.tx_in_progress: true if TX is already ongoing (TCP only)
  * @tcp.out_msg.skb: packet scheduled for sending (TCP only)
  * @tcp.out_msg.offset: offset where next send should start (TCP only)
@@ -93,6 +96,9 @@ struct ovpn_peer {
 		struct strparser strp;
 		struct sk_buff_head user_queue;
 		struct sk_buff_head out_queue;
+		struct sk_buff_head tx_queue;
+		unsigned int tx_queue_bytes;
+		struct sk_buff_head ctrl_queue;
 		bool tx_in_progress;
 
 		struct {
