@@ -6,6 +6,7 @@
  *  Author:	Antonio Quartulli <antonio@openvpn.net>
  */
 
+#include <linux/sizes.h>
 #include <linux/skbuff.h>
 #include <net/hotdata.h>
 #include <net/inet_common.h>
@@ -27,6 +28,11 @@
 #if OVPN_TCP_DEPTH_NESTING == SINGLE_DEPTH_NESTING
 #error "OVPN TCP requires its own lockdep subclass"
 #endif
+
+/* userspace records allowed to wait for a busy socket */
+#define OVPN_TCP_CTRL_QLEN	16
+/* data bytes allowed to wait for a busy socket, at most sk_sndbuf */
+#define OVPN_TCP_TXQ_MAX	SZ_1M
 
 static struct proto ovpn_tcp_prot __ro_after_init;
 static struct proto_ops ovpn_tcp_ops __ro_after_init;
@@ -255,6 +261,8 @@ void ovpn_tcp_socket_wait_finish(struct ovpn_socket *sock)
 	strp_done(&peer->tcp.strp);
 
 	skb_queue_purge(&peer->tcp.out_queue);
+	skb_queue_purge(&peer->tcp.tx_queue);
+	skb_queue_purge(&peer->tcp.ctrl_queue);
 	kfree_skb(peer->tcp.out_msg.skb);
 	peer->tcp.out_msg.skb = NULL;
 }
@@ -272,6 +280,7 @@ static void ovpn_tcp_send_sock(struct ovpn_peer *peer, struct sock *sk)
 
 	peer->tcp.tx_in_progress = true;
 
+next:
 	do {
 		flags = ovpn_skb_cb(skb)->nosignal ? MSG_NOSIGNAL : 0;
 		ret = skb_send_sock_locked_with_flags(sk, skb,
@@ -314,6 +323,19 @@ static void ovpn_tcp_send_sock(struct ovpn_peer *peer, struct sock *sk)
 	peer->tcp.out_msg.len = 0;
 	peer->tcp.out_msg.offset = 0;
 
+	/* userspace records go first: they only wait for the record in flight */
+	skb = __skb_dequeue(&peer->tcp.ctrl_queue);
+	if (!skb) {
+		skb = __skb_dequeue(&peer->tcp.tx_queue);
+		if (skb)
+			peer->tcp.tx_queue_bytes -= skb->len;
+	}
+	if (skb) {
+		peer->tcp.out_msg.skb = skb;
+		peer->tcp.out_msg.len = skb->len;
+		goto next;
+	}
+
 out:
 	peer->tcp.tx_in_progress = false;
 }
@@ -335,6 +357,19 @@ static void ovpn_tcp_send_sock_skb(struct ovpn_peer *peer, struct sock *sk,
 {
 	if (peer->tcp.out_msg.skb)
 		ovpn_tcp_send_sock(peer, sk);
+
+	/* queue behind the blocked record rather than dropping it: a dropped
+	 * GSO record costs the inner TCP many segments and a slow recovery.
+	 * A larger queue only adds latency: on a 50-100ms RTT path 512K
+	 * already absorbs every burst.
+	 */
+	if (peer->tcp.out_msg.skb &&
+	    peer->tcp.tx_queue_bytes + skb->len <=
+	    min_t(unsigned int, READ_ONCE(sk->sk_sndbuf), OVPN_TCP_TXQ_MAX)) {
+		__skb_queue_tail(&peer->tcp.tx_queue, skb);
+		peer->tcp.tx_queue_bytes += skb->len;
+		return;
+	}
 
 	if (peer->tcp.out_msg.skb) {
 		ovpn_dev_dstats_tx_dropped(peer->ovpn->dev,
@@ -435,7 +470,11 @@ static int ovpn_tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
 		goto peer_free;
 	}
 
-	if (peer->tcp.out_msg.skb) {
+	/* make room first: tx_work may not have run yet */
+	if (peer->tcp.out_msg.skb)
+		ovpn_tcp_send_sock(peer, sk);
+
+	if (skb_queue_len(&peer->tcp.ctrl_queue) >= OVPN_TCP_CTRL_QLEN) {
 		ret = -EAGAIN;
 		goto peer_free;
 	}
@@ -488,7 +527,17 @@ static int ovpn_tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
 	memset(ovpn_skb_cb(skb), 0, sizeof(struct ovpn_cb));
 	ovpn_skb_cb(skb)->nosignal = msg->msg_flags & MSG_NOSIGNAL;
 	ovpn_skb_cb(skb)->tcp_packets = 1;
-	ovpn_tcp_send_sock_skb(peer, sk, skb);
+
+	/* uncharge it: a later blocking sendmsg may wait for sk_wmem while
+	 * holding the socket lock, which tx_work needs to send this record.
+	 * OVPN_TCP_CTRL_QLEN bounds the memory instead.
+	 */
+	skb_orphan(skb);
+
+	if (peer->tcp.out_msg.skb)
+		__skb_queue_tail(&peer->tcp.ctrl_queue, skb);
+	else
+		ovpn_tcp_send_sock_skb(peer, sk, skb);
 	ret = size;
 peer_free:
 	release_sock(sk);
@@ -578,6 +627,9 @@ int ovpn_tcp_socket_attach(struct ovpn_socket *ovpn_sock,
 	__sk_dst_reset(ovpn_sock->sk);
 	skb_queue_head_init(&peer->tcp.user_queue);
 	skb_queue_head_init(&peer->tcp.out_queue);
+	skb_queue_head_init(&peer->tcp.tx_queue);
+	peer->tcp.tx_queue_bytes = 0;
+	skb_queue_head_init(&peer->tcp.ctrl_queue);
 
 	/* save current CBs so that they can be restored upon socket release */
 	peer->tcp.sk_cb.sk_data_ready = ovpn_sock->sk->sk_data_ready;
