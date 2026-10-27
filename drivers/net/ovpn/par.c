@@ -48,6 +48,13 @@ static unsigned int tx_par_min_bytes = 16384;
 module_param(tx_par_min_bytes, uint, 0644);
 MODULE_PARM_DESC(tx_par_min_bytes, "minimum bytes in a parallel TX job");
 
+/* EXPERIMENTAL: parallel TX lowers throughput on TCP transport, as the
+ * receiver pays more per record
+ */
+static bool tx_par_tcp;
+module_param(tx_par_tcp, bool, 0644);
+MODULE_PARM_DESC(tx_par_tcp, "encrypt in parallel for TCP transport peers too");
+
 /**
  * struct ovpn_par_job - work processed by a worker and delivered in order
  * @node: entry in the queue of the worker processing the job
@@ -443,7 +450,11 @@ bool ovpn_tx_par_dispatch(struct ovpn_peer *peer, struct sk_buff *skb)
 	if (!mask)
 		return false;
 
-	if ((!skb_is_gso(skb) || skb->len < READ_ONCE(tx_par_min_bytes)) &&
+	/* packets behind queued jobs follow them, whatever their size or
+	 * transport, so that none overtakes, also after tx_par_tcp is cleared
+	 */
+	if ((!skb_is_gso(skb) || skb->len < READ_ONCE(tx_par_min_bytes) ||
+	     (!READ_ONCE(tx_par_tcp) && ovpn_peer_uses_tcp(peer))) &&
 	    !atomic_read(&q->inflight))
 		return false;
 

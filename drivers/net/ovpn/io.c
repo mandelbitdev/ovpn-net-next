@@ -528,7 +528,7 @@ ovpn_encrypt_prepare(struct ovpn_peer *peer, struct sk_buff *skb,
 	return ks;
 }
 
-static bool ovpn_peer_uses_tcp(struct ovpn_peer *peer)
+bool ovpn_peer_uses_tcp(struct ovpn_peer *peer)
 {
 	struct ovpn_socket *sock;
 	bool tcp;

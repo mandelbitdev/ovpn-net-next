@@ -46,6 +46,7 @@ void ovpn_recv(struct ovpn_peer *peer, struct sk_buff *skb, bool tcp);
 void ovpn_xmit_special(struct ovpn_peer *peer, const void *data,
 		       const unsigned int len);
 
+bool ovpn_peer_uses_tcp(struct ovpn_peer *peer);
 void ovpn_xmit_peer(struct ovpn_peer *peer, struct sk_buff *skb);
 unsigned int ovpn_xmit_records(struct ovpn_peer *peer,
 			       const struct sk_buff *skb);
