@@ -21,7 +21,10 @@ export OVPN_ID_OFFSET=$(( 9 * (OVPN_SYMMETRIC_ID == 0) ))
 
 OVPN_JQ_FILTER='map(if type == "array" then .[] else . end) |
 	map(select(.msg.peer | has("remote-ipv6") | not)) |
-	map(del(.msg.ifindex)) | sort_by(.msg.peer.id)[]'
+	map(del(.msg.ifindex)) |
+	map(.msg.peer |= with_entries(select(.key |
+		test("^(vpn|link)-(rx|tx)-") | not))) |
+	sort_by(.msg.peer.id)[]'
 OVPN_LAN_IP="11.11.11.11"
 
 declare -A OVPN_TMP_JSONS=()

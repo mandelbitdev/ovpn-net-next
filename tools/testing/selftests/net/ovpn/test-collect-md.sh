@@ -310,11 +310,34 @@ ovpn_md_tx_invalid() {
 	ovpn_md_tx_drop 10.97.0 encap ip id $(( (1 << 24) + 1 ))
 }
 
+ovpn_md_del_ntf_stats() {
+	local json pkts
+
+	ovpn_setup_listener 0
+	sleep 1
+	ovpn_cmd_ok "delete peer 1" \
+		ovpn_md_ns ovpn_peer0 "${OVPN_CLI}" del_peer tun0 1
+	sleep 1
+	json="${OVPN_TMP_JSONS[0]}"
+	ovpn_stop_listener 0 1
+
+	# the deletion notification carries the final counters of the peer
+	pkts=$(jq -s '[.[] | select(.name == "peer-del-ntf" and
+			.msg.peer.id == 1)][0].msg.peer["vpn-rx-packets"] // 0' \
+		"${json}")
+	rm -f "${json}"
+	if [ "${pkts}" -lt 20 ]; then
+		printf 'peer-del-ntf reported %s VPN RX packets, expected >= 20\n' \
+			"${pkts}"
+		return 1
+	fi
+}
+
 trap ovpn_test_exit EXIT
 trap ovpn_stage_err ERR
 
 ktap_print_header
-ktap_set_plan 6
+ktap_set_plan 7
 
 ovpn_cleanup
 modprobe -q ovpn || true
@@ -328,6 +351,7 @@ ovpn_run_stage "RX packets carry peer ID as tun_id" ovpn_md_rx_metadata
 ovpn_run_stage "no RPF in collect_md mode" ovpn_md_no_rpf
 ovpn_run_stage "drop TX packets without valid peer metadata" \
 	ovpn_md_tx_invalid
+ovpn_run_stage "peer-del-ntf reports final counters" ovpn_md_del_ntf_stats
 
 ovpn_test_finished=1
 ktap_finished
