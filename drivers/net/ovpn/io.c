@@ -284,7 +284,7 @@ void ovpn_encrypt_post(void *data, int ret)
 		ovpn_udp_send_skb(peer, sock->sk, skb);
 		break;
 	case IPPROTO_TCP:
-		ovpn_tcp_send_skb(peer, sock->sk, skb);
+		ovpn_tcp_send_skb(peer, sock, skb);
 		break;
 	default:
 		/* no transport configured yet */

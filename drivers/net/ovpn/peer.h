@@ -45,7 +45,7 @@ struct ovpn_route_key {
  * @tcp: keeps track of TCP specific state
  * @tcp.strp: stream parser context (TCP only)
  * @tcp.user_queue: received packets that have to go to userspace (TCP only)
- * @tcp.out_queue: packets on hold while socket is taken by user (TCP only)
+ * @tcp.out_queue: packets deferred for later transmission (TCP only)
  * @tcp.tx_in_progress: true if TX is already ongoing (TCP only)
  * @tcp.out_msg.skb: packet scheduled for sending (TCP only)
  * @tcp.out_msg.offset: offset where next send should start (TCP only)
