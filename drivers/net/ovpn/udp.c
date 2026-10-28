@@ -259,7 +259,25 @@ static void ovpn_udp_recv(struct ovpn_peer *peer, struct sk_buff *list)
 	const u32 secmark = list->secmark;
 #endif
 	const int skb_iif = list->skb_iif;
+	unsigned int n = 0, len = 0;
 	int i;
+
+	/* account the link stats of the whole list at once, and give each
+	 * further record its own peer reference: the caller's covers the
+	 * first one
+	 */
+	for (skb = list; skb; skb = skb->next) {
+		len += skb->len;
+		n++;
+	}
+	ovpn_peer_stats_add_rx(&peer->link_stats, len, n);
+	if (n > 1)
+		ovpn_peer_hold_many(peer, n - 1);
+
+	/* the records completed here release the peer and update its stats
+	 * once, at the end
+	 */
+	ovpn_rx_batch_begin(peer);
 
 	/* a fraglist GRO aggregate makes later ciphertext visible before the
 	 * current record is decrypted, so we prime the first two records, then
@@ -296,16 +314,10 @@ static void ovpn_udp_recv(struct ovpn_peer *peer, struct sk_buff *list)
 		skb_clear_delivery_time(skb);
 		skb_mark_not_on_list(skb);
 
-		/* keep the current reference alive for the next record before
-		 * handing this one to crypto
-		 */
-		if (next && unlikely(!ovpn_peer_hold(peer))) {
-			DEBUG_NET_WARN_ON_ONCE(1);
-			kfree_skb_list(next);
-			next = NULL;
-		}
-		ovpn_recv(peer, skb, false);
+		ovpn_recv_record(peer, skb, false);
 	}
+
+	ovpn_rx_batch_end();
 }
 
 /* Retrieve the corresponding ovpn object from a UDP socket

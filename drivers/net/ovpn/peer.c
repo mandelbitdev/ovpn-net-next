@@ -193,10 +193,29 @@ int ovpn_peer_reset_sockaddr(struct ovpn_peer *peer,
 static void __ovpn_peer_hash_transp_addr(struct ovpn_peer *peer,
 					 const struct ovpn_bind *bind);
 
+/* whether the packet matches both endpoints of the binding */
+static bool ovpn_bind_skb_endpoints_match(const struct ovpn_bind *bind,
+					  const struct sk_buff *skb)
+{
+	if (!ovpn_bind_skb_src_match(bind, skb))
+		return false;
+
+	switch (skb->protocol) {
+	case htons(ETH_P_IP):
+		return bind->local.ipv4.s_addr == ip_hdr(skb)->daddr;
+	case htons(ETH_P_IPV6):
+		return ipv6_addr_equal(&bind->local.ipv6, &ipv6_hdr(skb)->daddr);
+	default:
+		return false;
+	}
+}
+
 /**
  * ovpn_peer_endpoints_update - update remote or local endpoint for peer
  * @peer: peer to update the remote endpoint for
  * @skb: incoming packet to retrieve the source/destination address from
+ *
+ * Must be called under rcu_read_lock.
  */
 void ovpn_peer_endpoints_update(struct ovpn_peer *peer, struct sk_buff *skb)
 {
@@ -206,6 +225,13 @@ void ovpn_peer_endpoints_update(struct ovpn_peer *peer, struct sk_buff *skb)
 	struct sockaddr_in *sa;
 	struct ovpn_bind *bind;
 	bool floated = false;
+
+	/* a published binding is never modified, so the common case of no
+	 * change can be detected without taking peer->lock for every packet
+	 */
+	bind = rcu_dereference(peer->bind);
+	if (likely(bind && ovpn_bind_skb_endpoints_match(bind, skb)))
+		return;
 
 	spin_lock_bh(&peer->lock);
 	bind = rcu_dereference_protected(peer->bind,

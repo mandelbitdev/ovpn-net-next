@@ -159,6 +159,31 @@ static inline void ovpn_peer_put(struct ovpn_peer *peer)
 	kref_put(&peer->refcount, ovpn_peer_release_kref);
 }
 
+/* kref has no helpers to take or drop several references at once: the two
+ * below use its refcount directly, as the RX path batches them per GRO list
+ */
+
+/**
+ * ovpn_peer_hold_many - take more references on an already held peer
+ * @peer: the peer, the caller must hold a reference to it
+ * @n: number of references to take
+ */
+static inline void ovpn_peer_hold_many(struct ovpn_peer *peer, unsigned int n)
+{
+	refcount_add(n, &peer->refcount.refcount);
+}
+
+/**
+ * ovpn_peer_put_many - release several references at once
+ * @peer: the peer
+ * @n: number of references to release
+ */
+static inline void ovpn_peer_put_many(struct ovpn_peer *peer, unsigned int n)
+{
+	if (refcount_sub_and_test(n, &peer->refcount.refcount))
+		ovpn_peer_release_kref(&peer->refcount);
+}
+
 struct ovpn_peer *ovpn_peer_new(struct ovpn_priv *ovpn, u32 id);
 int ovpn_peer_add(struct ovpn_priv *ovpn, struct ovpn_peer *peer);
 int ovpn_peer_del(struct ovpn_peer *peer, enum ovpn_del_peer_reason reason);
