@@ -156,11 +156,16 @@ static int ovpn_udp_gro_complete(struct sock *sk, struct sk_buff *skb,
  * the head skb's length and memory accounting so the head describes only the
  * first record again.
  */
-static struct sk_buff *ovpn_udp_gro_detach(struct sk_buff *skb)
+static struct sk_buff *ovpn_udp_gro_detach(struct sk_buff *skb,
+					   unsigned int *count,
+					   unsigned int *len)
 {
-	unsigned int data_len = 0, truesize = 0;
+	unsigned int data_len = 0, truesize = 0, n = 0;
 	struct sk_buff *curr, *list;
 	int ret;
+
+	*count = 0;
+	*len = 0;
 
 	/* IP reassembly may also use fraglist, but it is not a record batch */
 	if (!skb_is_gso(skb) ||
@@ -183,6 +188,7 @@ static struct sk_buff *ovpn_udp_gro_detach(struct sk_buff *skb)
 	for (curr = list; curr; curr = curr->next) {
 		data_len += curr->len;
 		truesize += curr->truesize;
+		n++;
 	}
 
 	skb_shinfo(skb)->frag_list = NULL;
@@ -190,15 +196,17 @@ static struct sk_buff *ovpn_udp_gro_detach(struct sk_buff *skb)
 	skb->data_len -= data_len;
 	skb->truesize -= truesize;
 
+	*count = n;
+	*len = data_len;
 	return list;
 }
 
 static void ovpn_udp_recv(struct ovpn_peer *peer, struct sk_buff *skb)
 {
 	struct sk_buff *list, *next, *prefetch;
-	unsigned int i;
+	unsigned int i, n, list_len;
 
-	list = ovpn_udp_gro_detach(skb);
+	list = ovpn_udp_gro_detach(skb, &n, &list_len);
 	if (IS_ERR(list)) {
 		ovpn_dev_dstats_rx_dropped(peer->ovpn->dev);
 		kfree_skb(skb);
@@ -206,6 +214,19 @@ static void ovpn_udp_recv(struct ovpn_peer *peer, struct sk_buff *skb)
 		return;
 	}
 	skb->next = list;
+
+	/* account the link stats of the whole list at once, and give each
+	 * further record its own peer reference: the caller's covers the
+	 * first one
+	 */
+	ovpn_peer_stats_add_rx(&peer->link_stats, skb->len + list_len, n + 1);
+	if (n)
+		ovpn_peer_hold_many(peer, n);
+
+	/* the records completed here release the peer and update its stats
+	 * once, at the end
+	 */
+	ovpn_rx_batch_begin(peer);
 
 	/* a fraglist GRO aggregate makes later ciphertext visible before the
 	 * current record is decrypted, so we prime the first two records, then
@@ -232,28 +253,19 @@ static void ovpn_udp_recv(struct ovpn_peer *peer, struct sk_buff *skb)
 		skb = skb_share_check(skb, GFP_ATOMIC);
 		if (unlikely(!skb)) {
 			ovpn_dev_dstats_rx_dropped(peer->ovpn->dev);
-
-			/* carry the current record's peer reference to the
-			 * next record or release it at the end of the list
+			/* this record's reference; the batched ones keep the
+			 * peer alive
 			 */
-			if (!next)
-				ovpn_peer_put(peer);
+			ovpn_peer_put(peer);
 			continue;
 		}
 
 		skb_mark_not_on_list(skb);
 
-		/* keep the current reference alive for the next record before
-		 * handing this one to crypto
-		 */
-		if (next && unlikely(!ovpn_peer_hold(peer))) {
-			DEBUG_NET_WARN_ON_ONCE(1);
-			kfree_skb_list(next);
-			next = NULL;
-		}
-
-		ovpn_recv(peer, skb, false);
+		ovpn_recv_record(peer, skb, false);
 	}
+
+	ovpn_rx_batch_end();
 }
 
 /* Retrieve the corresponding ovpn object from a UDP socket
