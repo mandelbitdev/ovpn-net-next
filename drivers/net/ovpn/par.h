@@ -30,6 +30,7 @@ struct sk_buff;
  * @jobs: jobs in submission order, until delivered
  * @peer: the peer embedding the queue
  * @inflight: jobs submitted and not delivered yet
+ * @inflight_bytes: bytes of the RX jobs submitted and not delivered yet
  * @kicked: whether the delivery work is queued or running
  * @cpu: CPU that submitted the last job, where the delivery work runs
  * @work: delivery work
@@ -39,6 +40,7 @@ struct ovpn_par_queue {
 	struct list_head jobs;
 	struct ovpn_peer *peer;
 	atomic_t inflight;
+	atomic_t inflight_bytes;
 	bool kicked;
 	int cpu;
 	struct work_struct work;

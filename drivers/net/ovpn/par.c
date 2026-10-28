@@ -15,6 +15,7 @@
 #include <linux/llist.h>
 #include <linux/module.h>
 #include <linux/percpu.h>
+#include <linux/sizes.h>
 #include <linux/skbuff.h>
 #include <linux/slab.h>
 #include <linux/workqueue.h>
@@ -44,6 +45,16 @@ static unsigned int rx_par_min_bytes = 16384;
 module_param(rx_par_min_bytes, uint, 0644);
 MODULE_PARM_DESC(rx_par_min_bytes, "minimum bytes in a parallel RX batch");
 
+/* Received records waiting for decryption or delivery only add latency once
+ * the delivering CPU can't keep up, and get colder in the cache as the backlog
+ * grows: beyond this many bytes per peer, new batches are dropped instead. A
+ * limit below the size of one batch would drop all but the first one queued.
+ */
+static unsigned int rx_par_max_bytes = SZ_2M;
+module_param(rx_par_max_bytes, uint, 0644);
+MODULE_PARM_DESC(rx_par_max_bytes,
+		 "maximum bytes of a peer's received records being processed in parallel (0: no limit)");
+
 static unsigned int tx_par_min_bytes = 16384;
 module_param(tx_par_min_bytes, uint, 0644);
 MODULE_PARM_DESC(tx_par_min_bytes, "minimum bytes in a parallel TX job");
@@ -66,6 +77,7 @@ MODULE_PARM_DESC(tx_par_tcp, "encrypt in parallel for TCP transport peers too");
  * @pktid: TX: first reserved packet ID
  * @npkt: TX: number of reserved packet IDs
  * @cpu: TX: the CPU that submitted the job
+ * @len: RX: bytes submitted, accounted in the queue until delivered
  * @tx: whether this is a transmit job
  * @done: whether processing completed, protected by the queue lock
  */
@@ -78,6 +90,7 @@ struct ovpn_par_job {
 	u32 pktid;
 	u32 npkt;
 	int cpu;
+	unsigned int len;
 	bool tx;
 	bool done;
 };
@@ -107,6 +120,7 @@ void ovpn_par_queue_init(struct ovpn_par_queue *q, struct ovpn_peer *peer)
 	INIT_LIST_HEAD(&q->jobs);
 	q->peer = peer;
 	atomic_set(&q->inflight, 0);
+	atomic_set(&q->inflight_bytes, 0);
 	q->kicked = false;
 	q->cpu = 0;
 	INIT_WORK(&q->work, ovpn_par_deliver_work);
@@ -247,6 +261,8 @@ static unsigned int ovpn_par_deliver_ready(struct ovpn_par_queue *q)
 		spin_unlock_bh(&q->lock);
 
 		ovpn_par_job_deliver(job);
+		if (!job->tx)
+			atomic_sub(job->len, &q->inflight_bytes);
 		atomic_dec(&q->inflight);
 		kmem_cache_free(ovpn_par_job_cache, job);
 		n++;
@@ -377,12 +393,26 @@ static void ovpn_par_job_submit(struct ovpn_par_job *job, int cpu)
 	struct ovpn_par_queue *q = job->q;
 
 	WRITE_ONCE(q->cpu, smp_processor_id());
+	if (!job->tx)
+		atomic_add(job->len, &q->inflight_bytes);
 	atomic_inc(&q->inflight);
 	list_add_tail(&job->list, &q->jobs);
 	spin_unlock_bh(&q->lock);
 
 	if (llist_add(&job->node, &w->jobs))
 		queue_work_on(cpu, ovpn_par_wq, &w->work);
+}
+
+static void ovpn_rx_par_drop(struct ovpn_peer *peer, struct sk_buff *list)
+{
+	struct sk_buff *skb, *next;
+
+	skb_list_walk_safe(list, skb, next) {
+		skb_mark_not_on_list(skb);
+		ovpn_dev_dstats_rx_dropped(peer->ovpn->dev);
+		kfree_skb(skb);
+		ovpn_peer_put(peer);
+	}
 }
 
 /**
@@ -397,6 +427,7 @@ static void ovpn_par_job_submit(struct ovpn_par_job *job, int cpu)
 bool ovpn_rx_par_dispatch(struct ovpn_peer *peer, struct sk_buff *list,
 			  unsigned int bytes)
 {
+	unsigned int limit = READ_ONCE(rx_par_max_bytes);
 	unsigned long mask = READ_ONCE(rx_par_cpus);
 	struct ovpn_par_queue *q = &peer->rx_par;
 	struct ovpn_par_job *job;
@@ -405,28 +436,27 @@ bool ovpn_rx_par_dispatch(struct ovpn_peer *peer, struct sk_buff *list,
 	if (!mask)
 		return false;
 
-	if (bytes < READ_ONCE(rx_par_min_bytes) && !atomic_read(&q->inflight))
-		return false;
+	if (!atomic_read(&q->inflight)) {
+		if (bytes < READ_ONCE(rx_par_min_bytes))
+			return false;
+	} else if (limit && atomic_read(&q->inflight_bytes) + bytes > limit) {
+		/* processing here would overtake earlier queued records */
+		ovpn_rx_par_drop(peer, list);
+		return true;
+	}
 
 	job = ovpn_par_job_alloc(q, mask, &cpu);
 	if (unlikely(!job)) {
-		struct sk_buff *skb, *next;
-
 		if (!atomic_read(&q->inflight))
 			return false;
 
-		/* processing here would overtake earlier queued records */
-		skb_list_walk_safe(list, skb, next) {
-			skb_mark_not_on_list(skb);
-			ovpn_dev_dstats_rx_dropped(peer->ovpn->dev);
-			kfree_skb(skb);
-			ovpn_peer_put(peer);
-		}
+		ovpn_rx_par_drop(peer, list);
 		return true;
 	}
 
 	job->skbs = list;
 	job->tx = false;
+	job->len = bytes;
 
 	spin_lock_bh(&q->lock);
 	ovpn_par_job_submit(job, cpu);
