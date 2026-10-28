@@ -216,6 +216,8 @@ static void ovpn_par_job_deliver(struct ovpn_par_job *job)
 	 * job is delivered
 	 */
 	local_bh_disable();
+	if (!job->tx)
+		ovpn_rx_batch_begin(job->q->peer);
 	skb_list_walk_safe(job->skbs, skb, next) {
 		skb_mark_not_on_list(skb);
 		if (job->tx)
@@ -223,6 +225,8 @@ static void ovpn_par_job_deliver(struct ovpn_par_job *job)
 		else
 			ovpn_decrypt_post(skb, ovpn_skb_cb(skb)->rx_ret);
 	}
+	if (!job->tx)
+		ovpn_rx_batch_end();
 	local_bh_enable();
 }
 
