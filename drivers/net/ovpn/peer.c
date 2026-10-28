@@ -10,6 +10,7 @@
 #include <linux/skbuff.h>
 #include <linux/list.h>
 #include <linux/hashtable.h>
+#include <net/dst_metadata.h>
 #include <net/ip6_route.h>
 
 #include "ovpnpriv.h"
@@ -20,6 +21,7 @@
 #include "main.h"
 #include "netlink.h"
 #include "peer.h"
+#include "proto.h"
 #include "socket.h"
 
 static void unlock_ovpn(struct ovpn_priv *ovpn,
@@ -782,6 +784,36 @@ static void ovpn_peer_remove(struct ovpn_peer *peer,
 }
 
 /**
+ * ovpn_peer_get_by_tun_info - Lookup peer based on the skb tunnel metadata
+ * @ovpn: the private data representing the current VPN session
+ * @skb: the skb carrying the TX tunnel metadata
+ *
+ * Only key.tun_id is honoured and it is interpreted as the peer ID.
+ * Any other field (i.e. remote endpoint, TOS, TTL, options) is ignored,
+ * because the transport parameters are always taken from the peer itself.
+ *
+ * Return: the peer if found or NULL otherwise.
+ */
+static struct ovpn_peer *ovpn_peer_get_by_tun_info(struct ovpn_priv *ovpn,
+						   struct sk_buff *skb)
+{
+	const struct ip_tunnel_info *info = skb_tunnel_info(skb);
+	u64 tun_id;
+
+	if (unlikely(!info || !(info->mode & IP_TUNNEL_INFO_TX)))
+		return NULL;
+
+	/* reject IDs that don't fit a peer ID, rather than truncating them
+	 * and possibly selecting an unrelated peer
+	 */
+	tun_id = be64_to_cpu(info->key.tun_id);
+	if (unlikely(tun_id > OVPN_OPCODE_PEERID_MASK))
+		return NULL;
+
+	return ovpn_peer_get_by_id(ovpn, (u32)tun_id);
+}
+
+/**
  * ovpn_peer_get_by_dst - Lookup peer to send skb to
  * @ovpn: the private data representing the current VPN session
  * @skb: the skb to extract the destination address from
@@ -812,6 +844,10 @@ struct ovpn_peer *ovpn_peer_get_by_dst(struct ovpn_priv *ovpn,
 		rcu_read_unlock();
 		return peer;
 	}
+
+	/* in collect_md mode the peer is selected by the tunnel metadata */
+	if (ovpn->collect_md)
+		return ovpn_peer_get_by_tun_info(ovpn, skb);
 
 	rcu_read_lock();
 	switch (skb->protocol) {
