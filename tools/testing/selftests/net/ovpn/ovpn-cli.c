@@ -125,6 +125,7 @@ struct ovpn_ctx {
 	char ifname[IFNAMSIZ];
 	enum ovpn_mode mode;
 	bool mode_set;
+	bool collect_md;
 
 	int socket;
 	int cli_sockets[MAX_PEERS];
@@ -1455,6 +1456,11 @@ static int ovpn_new_iface(struct ovpn_ctx *ovpn)
 				 &ovpn->mode, sizeof(uint8_t)) < 0)
 			goto err;
 
+		if (ovpn->collect_md &&
+		    ovpn_addattr(&req.n, sizeof(req),
+				 IFLA_OVPN_COLLECT_METADATA, NULL, 0) < 0)
+			goto err;
+
 		ovpn_nest_end(&req.n, data);
 	}
 
@@ -1716,11 +1722,12 @@ static void usage(const char *cmd)
 		cmd);
 	fprintf(stderr, "where <command> can be one of the following\n\n");
 
-	fprintf(stderr, "* new_iface <iface> [mode]: create new ovpn interface\n");
+	fprintf(stderr, "* new_iface <iface> [mode] [external]: create new ovpn interface\n");
 	fprintf(stderr, "\tiface: ovpn interface name\n");
 	fprintf(stderr, "\tmode:\n");
 	fprintf(stderr, "\t\t- P2P for peer-to-peer mode (i.e. client)\n");
 	fprintf(stderr, "\t\t- MP for multi-peer mode (i.e. server)\n");
+	fprintf(stderr, "\texternal: select peers via tunnel metadata (collect_md)\n");
 
 	fprintf(stderr, "* del_iface <iface>: delete ovpn interface\n");
 	fprintf(stderr, "\tiface: ovpn interface name\n");
@@ -1762,7 +1769,7 @@ static void usage(const char *cmd)
 	fprintf(stderr, "\tlport: local UDP port to bind to\n");
 	fprintf(stderr, "\traddr: peer IP address\n");
 	fprintf(stderr, "\trport: peer UDP port\n");
-	fprintf(stderr, "\tvpnaddr: peer VPN IP\n");
+	fprintf(stderr, "\tvpnaddr: peer VPN IP (\"none\" to omit)\n");
 
 	fprintf(stderr,
 		"* new_multi_peer <iface> <lport> <id_type> <peers_file> [mark]: add multiple peers as listed in the file\n");
@@ -1787,7 +1794,7 @@ static void usage(const char *cmd)
 		"\tkeepalive_interval: interval for sending ping messages\n");
 	fprintf(stderr,
 		"\tkeepalive_timeout: time after which a peer is timed out\n");
-	fprintf(stderr, "\tvpnaddr: peer VPN IP\n");
+	fprintf(stderr, "\tvpnaddr: peer VPN IP (\"none\" to omit)\n");
 
 	fprintf(stderr, "* del_peer <iface> <peer_id>: delete peer\n");
 	fprintf(stderr, "\tiface: ovpn interface name\n");
@@ -1864,7 +1871,8 @@ static int ovpn_parse_remote(struct ovpn_ctx *ovpn, const char *host,
 		result = NULL;
 	}
 
-	if (vpnip) {
+	/* "none" allows omitting the VPN IP, i.e. in collect_md mode */
+	if (vpnip && strcmp(vpnip, "none")) {
 		ret = getaddrinfo(vpnip, NULL, &hints, &result);
 		if (ret) {
 			fprintf(stderr, "getaddrinfo on vpnip error: %s\n",
@@ -2259,6 +2267,15 @@ static int ovpn_parse_cmd_args(struct ovpn_ctx *ovpn, int argc, char *argv[])
 			return -1;
 		}
 		ovpn->mode_set = true;
+
+		if (argc > 4) {
+			if (strcmp(argv[4], "external")) {
+				fprintf(stderr, "Cannot parse iface flag: %s\n",
+					argv[4]);
+				return -1;
+			}
+			ovpn->collect_md = true;
+		}
 		break;
 	case CMD_DEL_IFACE:
 		break;
