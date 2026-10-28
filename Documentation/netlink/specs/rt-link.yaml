@@ -2368,6 +2368,9 @@ attribute-sets:
         name: mode
         type: u8
         enum: ovpn-mode
+      -
+        name: collect-metadata
+        type: flag
 
 sub-messages:
   -

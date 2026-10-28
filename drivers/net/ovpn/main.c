@@ -129,6 +129,7 @@ static const struct device_type ovpn_type = {
 static const struct nla_policy ovpn_policy[IFLA_OVPN_MAX + 1] = {
 	[IFLA_OVPN_MODE] = NLA_POLICY_RANGE(NLA_U8, OVPN_MODE_P2P,
 					    OVPN_MODE_MP),
+	[IFLA_OVPN_COLLECT_METADATA] = { .type = NLA_FLAG },
 };
 
 /**
@@ -209,6 +210,16 @@ static int ovpn_newlink(struct net_device *dev,
 		netdev_dbg(dev, "setting device mode: %u\n", mode);
 	}
 
+	if (data && data[IFLA_OVPN_COLLECT_METADATA]) {
+		if (mode != OVPN_MODE_MP) {
+			NL_SET_ERR_MSG_ATTR(extack,
+					    data[IFLA_OVPN_COLLECT_METADATA],
+					    "collect metadata requires MP mode");
+			return -EINVAL;
+		}
+		ovpn->collect_md = true;
+	}
+
 	ovpn->dev = dev;
 	ovpn->mode = mode;
 	spin_lock_init(&ovpn->lock);
@@ -237,7 +248,9 @@ static int ovpn_newlink(struct net_device *dev,
 static size_t ovpn_get_size(const struct net_device *dev)
 {
 	/* IFLA_OVPN_MODE */
-	return nla_total_size(sizeof(u8));
+	return nla_total_size(sizeof(u8)) +
+	       /* IFLA_OVPN_COLLECT_METADATA */
+	       nla_total_size(0);
 }
 
 static int ovpn_fill_info(struct sk_buff *skb, const struct net_device *dev)
@@ -245,6 +258,9 @@ static int ovpn_fill_info(struct sk_buff *skb, const struct net_device *dev)
 	struct ovpn_priv *ovpn = netdev_priv(dev);
 
 	if (nla_put_u8(skb, IFLA_OVPN_MODE, ovpn->mode))
+		return -EMSGSIZE;
+
+	if (ovpn->collect_md && nla_put_flag(skb, IFLA_OVPN_COLLECT_METADATA))
 		return -EMSGSIZE;
 
 	return 0;
