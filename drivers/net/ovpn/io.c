@@ -127,11 +127,88 @@ static int ovpn_tcp_gso_restore(struct sk_buff *skb, u16 gso_size)
 	return 0;
 }
 
+/* RX bookkeeping of the records a CPU delivers from one GRO list or one
+ * parallel job: the peer's stats and references are updated once per batch
+ * instead of with atomics on every record
+ */
+struct ovpn_rx_batch {
+	struct ovpn_peer *peer;
+	unsigned int bytes;
+	unsigned int packets;
+	unsigned int puts;
+};
+
+static DEFINE_PER_CPU(struct ovpn_rx_batch, ovpn_rx_batches);
+
+/**
+ * ovpn_rx_batch_begin - start batching the RX bookkeeping of a peer
+ * @peer: the peer the following records belong to
+ *
+ * Must be called with BHs disabled, which must stay disabled until
+ * ovpn_rx_batch_end().
+ */
+void ovpn_rx_batch_begin(struct ovpn_peer *peer)
+{
+	struct ovpn_rx_batch *b = this_cpu_ptr(&ovpn_rx_batches);
+
+	DEBUG_NET_WARN_ON_ONCE(!in_softirq() || b->peer);
+	b->peer = peer;
+	b->bytes = 0;
+	b->packets = 0;
+	b->puts = 0;
+}
+
+/**
+ * ovpn_rx_batch_end - flush the batched RX bookkeeping
+ *
+ * Must be called with BHs still disabled since ovpn_rx_batch_begin(). The
+ * batched peer references are released last: the peer may be gone once this
+ * returns.
+ */
+void ovpn_rx_batch_end(void)
+{
+	struct ovpn_rx_batch *b = this_cpu_ptr(&ovpn_rx_batches);
+	struct ovpn_peer *peer = b->peer;
+
+	b->peer = NULL;
+	if (b->packets)
+		ovpn_peer_stats_add_rx(&peer->vpn_stats, b->bytes, b->packets);
+	if (b->puts)
+		ovpn_peer_put_many(peer, b->puts);
+}
+
+/* the batch open for @peer on this CPU, if any. A batch is only open while
+ * its owner keeps BHs disabled, so any other context that sees it with BHs
+ * disabled (in_softirq() is also true then) is the owner's own call chain;
+ * a hard IRQ completing crypto must not use it
+ */
+static struct ovpn_rx_batch *ovpn_rx_batch_get(struct ovpn_peer *peer)
+{
+	struct ovpn_rx_batch *b;
+
+	if (!in_softirq() || in_hardirq())
+		return NULL;
+
+	b = this_cpu_ptr(&ovpn_rx_batches);
+	return b->peer == peer ? b : NULL;
+}
+
+static void ovpn_rx_peer_put(struct ovpn_peer *peer)
+{
+	struct ovpn_rx_batch *b = ovpn_rx_batch_get(peer);
+
+	if (b)
+		b->puts++;
+	else
+		ovpn_peer_put(peer);
+}
+
 /* Called after decrypt to write the IP packet to the device.
  * This method is expected to manage/free the skb.
  */
 static void ovpn_netdev_write(struct ovpn_peer *peer, struct sk_buff *skb)
 {
+	struct ovpn_rx_batch *b;
 	unsigned int pkt_len, packets = 1;
 	int ret;
 
@@ -163,7 +240,14 @@ static void ovpn_netdev_write(struct ovpn_peer *peer, struct sk_buff *skb)
 	ret = gro_cells_receive(&peer->ovpn->gro_cells, skb);
 	if (likely(ret == NET_RX_SUCCESS)) {
 		/* update RX stats with the size of decrypted packet */
-		ovpn_peer_stats_add_rx(&peer->vpn_stats, pkt_len, packets);
+		b = ovpn_rx_batch_get(peer);
+		if (b) {
+			b->bytes += pkt_len;
+			b->packets += packets;
+		} else {
+			ovpn_peer_stats_add_rx(&peer->vpn_stats, pkt_len,
+					       packets);
+		}
 		ovpn_dev_dstats_rx_add(peer->ovpn->dev, pkt_len, packets);
 	}
 	local_bh_enable();
@@ -287,16 +371,16 @@ drop:
 drop_nocount:
 	if (likely(ks))
 		ovpn_crypto_key_slot_put(ks);
-	ovpn_peer_put(peer);
+	ovpn_rx_peer_put(peer);
 }
 
-/* RX path entry point: decrypt packet and forward it to the device */
-void ovpn_recv(struct ovpn_peer *peer, struct sk_buff *skb, bool tcp)
+/* decrypt a record and forward it to the device, its link stats already
+ * accounted by the caller
+ */
+void ovpn_recv_record(struct ovpn_peer *peer, struct sk_buff *skb, bool tcp)
 {
 	struct ovpn_crypto_key_slot *ks;
 	u8 key_id;
-
-	ovpn_peer_stats_increment_rx(&peer->link_stats, skb->len);
 
 	/* get the key slot matching the key ID in the received packet */
 	key_id = ovpn_key_id_from_skb(skb);
@@ -313,6 +397,13 @@ void ovpn_recv(struct ovpn_peer *peer, struct sk_buff *skb, bool tcp)
 
 	memset(ovpn_skb_cb(skb), 0, sizeof(struct ovpn_cb));
 	ovpn_decrypt_post(skb, ovpn_aead_decrypt(peer, ks, skb, tcp));
+}
+
+/* RX path entry point: decrypt packet and forward it to the device */
+void ovpn_recv(struct ovpn_peer *peer, struct sk_buff *skb, bool tcp)
+{
+	ovpn_peer_stats_increment_rx(&peer->link_stats, skb->len);
+	ovpn_recv_record(peer, skb, tcp);
 }
 
 static void ovpn_encrypt_key_exhausted(struct ovpn_peer *peer,
