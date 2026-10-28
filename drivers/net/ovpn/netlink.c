@@ -293,6 +293,18 @@ static int ovpn_nl_peer_precheck(struct ovpn_priv *ovpn,
 		return -EINVAL;
 	}
 
+	/* in collect_md mode peers are selected by tunnel ID only, therefore
+	 * VPN IPs would never be used (neither for TX peer selection nor for
+	 * RPF). Reject them so that userspace doesn't assume any address
+	 * based filtering is taking place.
+	 */
+	if (ovpn->collect_md && (attrs[OVPN_A_PEER_VPN_IPV4] ||
+				 attrs[OVPN_A_PEER_VPN_IPV6])) {
+		NL_SET_ERR_MSG_FMT_MOD(info->extack,
+				       "unexpected VPN IP in collect metadata mode");
+		return -EINVAL;
+	}
+
 	if ((attrs[OVPN_A_PEER_KEEPALIVE_INTERVAL] &&
 	     !attrs[OVPN_A_PEER_KEEPALIVE_TIMEOUT]) ||
 	    (!attrs[OVPN_A_PEER_KEEPALIVE_INTERVAL] &&
@@ -411,8 +423,10 @@ int ovpn_nl_peer_new_doit(struct sk_buff *skb, struct genl_info *info)
 			      OVPN_A_PEER_SOCKET))
 		return -EINVAL;
 
-	/* in MP mode VPN IPs are required for selecting the right peer */
-	if (ovpn->mode == OVPN_MODE_MP) {
+	/* in MP mode VPN IPs are required for selecting the right peer,
+	 * unless peers are selected via tunnel metadata
+	 */
+	if (ovpn->mode == OVPN_MODE_MP && !ovpn->collect_md) {
 		if (attrs[OVPN_A_PEER_VPN_IPV4])
 			vpn_addr4.s_addr =
 				nla_get_in_addr(attrs[OVPN_A_PEER_VPN_IPV4]);
@@ -588,8 +602,10 @@ int ovpn_nl_peer_set_doit(struct sk_buff *skb, struct genl_info *info)
 			goto addr_conflict;
 	}
 
-	/* in MP mode VPN IPs are required for selecting the right peer */
-	if (ovpn->mode == OVPN_MODE_MP) {
+	/* in MP mode VPN IPs are required for selecting the right peer,
+	 * unless peers are selected via tunnel metadata
+	 */
+	if (ovpn->mode == OVPN_MODE_MP && !ovpn->collect_md) {
 		ret = ovpn_nl_peer_check_vpn_addrs(&vpn_addr4, &vpn_addr6,
 						   info);
 		if (ret < 0)
