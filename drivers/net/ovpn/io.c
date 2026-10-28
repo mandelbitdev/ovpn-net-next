@@ -10,6 +10,7 @@
 #include <crypto/aead.h>
 #include <linux/netdevice.h>
 #include <linux/skbuff.h>
+#include <net/dst_metadata.h>
 #include <net/gro_cells.h>
 #include <net/gso.h>
 #include <net/ip.h>
@@ -54,11 +55,38 @@ static bool ovpn_is_keepalive(struct sk_buff *skb)
 	return !memcmp(skb->data, ovpn_keepalive_message, OVPN_KEEPALIVE_SIZE);
 }
 
+/**
+ * ovpn_rx_tun_dst - allocate RX tunnel metadata identifying the peer
+ * @peer: the peer the packet was received from
+ *
+ * The peer ID is stored in key.tun_id, so that it can be matched by
+ * fib rules (tun_id), tc (flower enc_key_id, BPF) or nftables (tunnel id)
+ * before the packet is routed.
+ *
+ * Return: the newly allocated metadata dst or NULL on allocation failure
+ */
+static struct metadata_dst *ovpn_rx_tun_dst(const struct ovpn_peer *peer)
+{
+	struct metadata_dst *tun_dst;
+	struct ip_tunnel_info *info;
+
+	tun_dst = metadata_dst_alloc(0, METADATA_IP_TUNNEL, GFP_ATOMIC);
+	if (unlikely(!tun_dst))
+		return NULL;
+
+	info = &tun_dst->u.tun_info;
+	info->key.tun_id = cpu_to_be64(peer->id);
+	__set_bit(IP_TUNNEL_KEY_BIT, info->key.tun_flags);
+
+	return tun_dst;
+}
+
 /* Called after decrypt to write the IP packet to the device.
  * This method is expected to manage/free the skb.
  */
 static void ovpn_netdev_write(struct ovpn_peer *peer, struct sk_buff *skb)
 {
+	struct metadata_dst *tun_dst;
 	unsigned int pkt_len;
 	int ret;
 
@@ -83,6 +111,22 @@ static void ovpn_netdev_write(struct ovpn_peer *peer, struct sk_buff *skb)
 	skb->dev = peer->ovpn->dev;
 	skb_set_queue_mapping(skb, 0);
 	skb_scrub_packet(skb, true);
+
+	/* in collect_md mode, tag the packet with the ID of the sending peer.
+	 * Must happen after the scrub, as that drops any dst attached to skb
+	 */
+	if (peer->ovpn->collect_md) {
+		tun_dst = ovpn_rx_tun_dst(peer);
+		if (unlikely(!tun_dst)) {
+			net_dbg_ratelimited("%s: cannot allocate RX metadata for peer %u\n",
+					    netdev_name(peer->ovpn->dev),
+					    peer->id);
+			ovpn_dev_dstats_rx_dropped(peer->ovpn->dev);
+			kfree_skb(skb);
+			return;
+		}
+		skb_dst_set(skb, &tun_dst->dst);
+	}
 
 	/* network header reset in ovpn_decrypt_post() */
 	skb_reset_mac_header(skb);
@@ -183,8 +227,12 @@ void ovpn_decrypt_post(void *data, int ret)
 	}
 	skb->protocol = proto;
 
-	/* perform Reverse Path Filtering (RPF) */
-	if (unlikely(!ovpn_peer_check_by_src(peer->ovpn, skb, peer))) {
+	/* perform Reverse Path Filtering (RPF), unless in collect_md mode:
+	 * there the packet is tagged with the sender peer ID and source
+	 * validation is delegated to the consumer of the metadata
+	 */
+	if (unlikely(!peer->ovpn->collect_md &&
+		     !ovpn_peer_check_by_src(peer->ovpn, skb, peer))) {
 		if (skb->protocol == htons(ETH_P_IPV6))
 			net_dbg_ratelimited("%s: RPF dropped packet from peer %u, src: %pI6c\n",
 					    netdev_name(peer->ovpn->dev),
