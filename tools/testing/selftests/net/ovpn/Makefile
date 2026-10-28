@@ -24,6 +24,7 @@ LDLIBS += $(NL_LDLIBS)
 
 
 TEST_FILES = \
+	collect_md_peers.txt \
 	common.sh \
 	data64.key \
 	json \
@@ -36,6 +37,7 @@ TEST_PROGS := \
 	test-chachapoly.sh \
 	test-close-socket-tcp.sh \
 	test-close-socket.sh \
+	test-collect-md.sh \
 	test-float.sh \
 	test-large-mtu.sh \
 	test-mark.sh \
