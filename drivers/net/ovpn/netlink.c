@@ -642,6 +642,41 @@ addr_conflict:
 	goto unlock;
 }
 
+/**
+ * ovpn_nl_peer_put_stats - add the peer VPN and link counters to a message
+ * @skb: the message being built
+ * @peer: the peer whose counters should be reported
+ *
+ * Return: 0 on success or -EMSGSIZE if the message is too small
+ */
+static int ovpn_nl_peer_put_stats(struct sk_buff *skb,
+				  const struct ovpn_peer *peer)
+{
+	/* VPN RX stats */
+	if (nla_put_uint(skb, OVPN_A_PEER_VPN_RX_BYTES,
+			 atomic64_read(&peer->vpn_stats.rx.bytes)) ||
+	    nla_put_uint(skb, OVPN_A_PEER_VPN_RX_PACKETS,
+			 atomic64_read(&peer->vpn_stats.rx.packets)) ||
+	    /* VPN TX stats */
+	    nla_put_uint(skb, OVPN_A_PEER_VPN_TX_BYTES,
+			 atomic64_read(&peer->vpn_stats.tx.bytes)) ||
+	    nla_put_uint(skb, OVPN_A_PEER_VPN_TX_PACKETS,
+			 atomic64_read(&peer->vpn_stats.tx.packets)) ||
+	    /* link RX stats */
+	    nla_put_uint(skb, OVPN_A_PEER_LINK_RX_BYTES,
+			 atomic64_read(&peer->link_stats.rx.bytes)) ||
+	    nla_put_uint(skb, OVPN_A_PEER_LINK_RX_PACKETS,
+			 atomic64_read(&peer->link_stats.rx.packets)) ||
+	    /* link TX stats */
+	    nla_put_uint(skb, OVPN_A_PEER_LINK_TX_BYTES,
+			 atomic64_read(&peer->link_stats.tx.bytes)) ||
+	    nla_put_uint(skb, OVPN_A_PEER_LINK_TX_PACKETS,
+			 atomic64_read(&peer->link_stats.tx.packets)))
+		return -EMSGSIZE;
+
+	return 0;
+}
+
 static int ovpn_nl_send_peer(struct sk_buff *skb, const struct genl_info *info,
 			     const struct ovpn_peer *peer, u32 portid, u32 seq,
 			     int flags)
@@ -728,26 +763,7 @@ static int ovpn_nl_send_peer(struct sk_buff *skb, const struct genl_info *info,
 	rcu_read_unlock();
 
 	if (nla_put_net16(skb, OVPN_A_PEER_LOCAL_PORT, local_port) ||
-	    /* VPN RX stats */
-	    nla_put_uint(skb, OVPN_A_PEER_VPN_RX_BYTES,
-			 atomic64_read(&peer->vpn_stats.rx.bytes)) ||
-	    nla_put_uint(skb, OVPN_A_PEER_VPN_RX_PACKETS,
-			 atomic64_read(&peer->vpn_stats.rx.packets)) ||
-	    /* VPN TX stats */
-	    nla_put_uint(skb, OVPN_A_PEER_VPN_TX_BYTES,
-			 atomic64_read(&peer->vpn_stats.tx.bytes)) ||
-	    nla_put_uint(skb, OVPN_A_PEER_VPN_TX_PACKETS,
-			 atomic64_read(&peer->vpn_stats.tx.packets)) ||
-	    /* link RX stats */
-	    nla_put_uint(skb, OVPN_A_PEER_LINK_RX_BYTES,
-			 atomic64_read(&peer->link_stats.rx.bytes)) ||
-	    nla_put_uint(skb, OVPN_A_PEER_LINK_RX_PACKETS,
-			 atomic64_read(&peer->link_stats.rx.packets)) ||
-	    /* link TX stats */
-	    nla_put_uint(skb, OVPN_A_PEER_LINK_TX_BYTES,
-			 atomic64_read(&peer->link_stats.tx.bytes)) ||
-	    nla_put_uint(skb, OVPN_A_PEER_LINK_TX_PACKETS,
-			 atomic64_read(&peer->link_stats.tx.packets)))
+	    ovpn_nl_peer_put_stats(skb, peer))
 		goto err;
 
 	nla_nest_end(skb, attr);
@@ -1290,6 +1306,10 @@ int ovpn_nl_peer_del_notify(struct ovpn_peer *peer)
 		goto err_cancel_msg;
 
 	if (nla_put_u32(msg, OVPN_A_PEER_ID, peer->id))
+		goto err_cancel_msg;
+
+	/* report final counters, as userspace can't query them anymore */
+	if (ovpn_nl_peer_put_stats(msg, peer))
 		goto err_cancel_msg;
 
 	nla_nest_end(msg, attr);
