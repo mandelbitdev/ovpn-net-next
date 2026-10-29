@@ -47,7 +47,7 @@ EXPORT_SYMBOL(tso_build_hdr);
 
 void tso_build_data(const struct sk_buff *skb, struct tso_t *tso, int size)
 {
-	tso->tcp_seq += size; /* not worth avoiding this operation for UDP */
+	tso_advance_hdr(tso, size);
 	tso->size -= size;
 	tso->data += size;
 

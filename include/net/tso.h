@@ -18,6 +18,21 @@ struct tso_t {
 	u32	tcp_seq;
 };
 
+/**
+ * tso_advance_hdr - advance the header state past a segment's payload
+ * @tso: TSO state initialized by tso_start
+ * @size: payload length of the segment just built
+ *
+ * tso_build_data does this while also moving its cursor over the payload's
+ * virtual addresses. Callers which walk the payload in some other way, for
+ * example through tso_dma_map, use this to keep the TCP sequence number of
+ * the following headers correct.
+ */
+static inline void tso_advance_hdr(struct tso_t *tso, int size)
+{
+	tso->tcp_seq += size; /* not worth avoiding this operation for UDP */
+}
+
 /* Calculate the worst case buffer count */
 static inline int tso_count_descs(const struct sk_buff *skb)
 {
