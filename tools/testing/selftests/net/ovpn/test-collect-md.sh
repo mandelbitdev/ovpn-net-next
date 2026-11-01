@@ -210,6 +210,10 @@ ovpn_md_reject_vpn_ip() {
 	ovpn_cmd_fail "VPN IP is rejected in collect_md mode" \
 		ovpn_md_ns ovpn_peer0 "${OVPN_CLI}" new_peer tun0 3 13 1000 \
 			10.10.1.2 1 5.5.5.9
+	# positive control: the very same peer is accepted without VPN IP
+	ovpn_md_ns ovpn_peer0 "${OVPN_CLI}" new_peer tun0 3 13 1000 \
+		10.10.1.2 1
+	ovpn_md_ns ovpn_peer0 "${OVPN_CLI}" del_peer tun0 3
 }
 
 # ping from client <p> to <dst> and check that only lan<p> forwarded it
