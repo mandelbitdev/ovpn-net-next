@@ -71,6 +71,7 @@ enum {
 	 * an aggregate, it must leave it unmodified.
 	 */
 	UDP_FLAGS_ENCAP_ACCEPT_FRAGLIST,
+	UDP_FLAGS_GRO_RCV_DETACHABLE, /* gro_receive may be detached */
 };
 
 /* per NUMA structure for lockless producer usage. */

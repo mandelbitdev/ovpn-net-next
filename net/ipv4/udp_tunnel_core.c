@@ -71,12 +71,28 @@ static bool sk_saddr_any(struct sock *sk)
 void setup_udp_tunnel_sock(struct net *net, struct sock *sk,
 			   struct udp_tunnel_sock_cfg *cfg)
 {
-	const unsigned long allowed = BIT(UDP_FLAGS_ENCAP_ACCEPT_FRAGLIST);
+	const unsigned long allowed = BIT(UDP_FLAGS_GRO_RCV_DETACHABLE) |
+				      BIT(UDP_FLAGS_ENCAP_ACCEPT_FRAGLIST);
 	unsigned long flags = cfg->udp_flags & allowed;
 
 	WARN_ON_ONCE(cfg->udp_flags & ~allowed);
 	/* a socket must stop accepting frag-lists before it is set up again */
 	WARN_ON_ONCE(udp_test_bit(ENCAP_ACCEPT_FRAGLIST, sk));
+	set_mask_bits(&udp_sk(sk)->udp_flags, BIT(UDP_FLAGS_GRO_RCV_DETACHABLE),
+		      flags & BIT(UDP_FLAGS_GRO_RCV_DETACHABLE));
+	if (flags & BIT(UDP_FLAGS_GRO_RCV_DETACHABLE)) {
+		WARN_ON_ONCE(cfg->gro_complete ||
+			     !(flags & BIT(UDP_FLAGS_ENCAP_ACCEPT_FRAGLIST)));
+		/* the registry ignores detachable sockets, so a callback which
+		 * is already registered there would stay pinned
+		 */
+		WARN_ON_ONCE(udp_sk(sk)->gro_receive);
+		/* The socket may already be receiving packets so drain readers
+		 * which could have observed the old dispatch mode before
+		 * publishing the detachable callback.
+		 */
+		synchronize_net();
+	}
 
 	/* Disable multicast loopback */
 	inet_clear_bit(MC_LOOP, sk);
@@ -91,13 +107,18 @@ void setup_udp_tunnel_sock(struct net *net, struct sock *sk,
 	udp_sk(sk)->encap_err_rcv = cfg->encap_err_rcv;
 	udp_sk(sk)->encap_err_lookup = cfg->encap_err_lookup;
 	udp_sk(sk)->encap_destroy = cfg->encap_destroy;
-	udp_sk(sk)->gro_receive = cfg->gro_receive;
-	udp_sk(sk)->gro_complete = cfg->gro_complete;
+	WRITE_ONCE(udp_sk(sk)->gro_complete, cfg->gro_complete);
+	/* Publish receive after the completion callback which its aggregates
+	 * may later require
+	 */
+	WRITE_ONCE(udp_sk(sk)->gro_receive, cfg->gro_receive);
 
 	/* Publish frag-list acceptance only after the callbacks which consume
 	 * that representation
 	 */
-	set_mask_bits(&udp_sk(sk)->udp_flags, allowed, flags);
+	set_mask_bits(&udp_sk(sk)->udp_flags,
+		      BIT(UDP_FLAGS_ENCAP_ACCEPT_FRAGLIST),
+		      flags & BIT(UDP_FLAGS_ENCAP_ACCEPT_FRAGLIST));
 
 	udp_tunnel_encap_enable(sk);
 

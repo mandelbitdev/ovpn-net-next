@@ -82,6 +82,10 @@ void udp_tunnel_update_gro_rcv(struct sock *sk, bool add)
 	struct udp_sock *up = udp_sk(sk);
 	int i, old_gro_type_nr;
 
+	/* Dynamically detached callbacks cannot be static-call targets. */
+	if (udp_test_bit(GRO_RCV_DETACHABLE, sk))
+		return;
+
 	if (!UDP_MAX_TUNNEL_TYPES || !up->gro_receive)
 		return;
 
@@ -144,10 +148,45 @@ out:
 }
 EXPORT_SYMBOL_GPL(udp_tunnel_update_gro_rcv);
 
+/**
+ * udp_tunnel_detach_gro - detach GRO callbacks from a live UDP socket
+ * @sk: UDP tunnel socket
+ *
+ * The caller must hold the socket lock and keep callback state alive until
+ * this function returns.
+ */
+void udp_tunnel_detach_gro(struct sock *sk)
+{
+	sock_owned_by_me(sk);
+
+	if (WARN_ON_ONCE(!udp_test_bit(GRO_RCV_DETACHABLE, sk)))
+		return;
+
+	udp_tunnel_update_gro_lookup(sock_net(sk), sk, false);
+	WRITE_ONCE(udp_sk(sk)->gro_receive, NULL);
+	WRITE_ONCE(udp_sk(sk)->gro_complete, NULL);
+	/* No new frag-list aggregates can be formed after gro_receive is
+	 * cleared. Any aggregate already held by GRO may safely be segmented
+	 * before encap_rcv.
+	 */
+	udp_clear_bit(ENCAP_ACCEPT_FRAGLIST, sk);
+
+	/* Readers which captured a callback before it was cleared must keep
+	 * bypassing the static-call path until they have completed.
+	 */
+	synchronize_net();
+	udp_clear_bit(GRO_RCV_DETACHABLE, sk);
+}
+EXPORT_SYMBOL_GPL(udp_tunnel_detach_gro);
+
 static struct sk_buff *udp_tunnel_gro_rcv(struct sock *sk,
+					  udp_tunnel_gro_receive_t gro_receive,
 					  struct list_head *head,
 					  struct sk_buff *skb)
 {
+	if (unlikely(udp_test_bit(GRO_RCV_DETACHABLE, sk)))
+		return call_gro_receive_sk(gro_receive, sk, head, skb);
+
 	if (static_branch_likely(&udp_tunnel_static_call)) {
 		if (unlikely(gro_recursion_inc_test(skb))) {
 			NAPI_GRO_CB(skb)->flush |= 1;
@@ -155,16 +194,17 @@ static struct sk_buff *udp_tunnel_gro_rcv(struct sock *sk,
 		}
 		return static_call(udp_tunnel_gro_rcv)(sk, head, skb);
 	}
-	return call_gro_receive_sk(udp_sk(sk)->gro_receive, sk, head, skb);
+	return call_gro_receive_sk(gro_receive, sk, head, skb);
 }
 
 #else
 
 static struct sk_buff *udp_tunnel_gro_rcv(struct sock *sk,
+					  udp_tunnel_gro_receive_t gro_receive,
 					  struct list_head *head,
 					  struct sk_buff *skb)
 {
-	return call_gro_receive_sk(udp_sk(sk)->gro_receive, sk, head, skb);
+	return call_gro_receive_sk(gro_receive, sk, head, skb);
 }
 
 #endif
@@ -777,6 +817,7 @@ static struct sk_buff *udp_gro_receive_segment(struct list_head *head,
 struct sk_buff *udp_gro_receive(struct list_head *head, struct sk_buff *skb,
 				struct udphdr *uh, struct sock *sk)
 {
+	udp_tunnel_gro_receive_t gro_receive = NULL;
 	struct sk_buff *pp = NULL;
 	struct sk_buff *p;
 	struct udphdr *uh2;
@@ -795,7 +836,9 @@ struct sk_buff *udp_gro_receive(struct list_head *head, struct sk_buff *skb,
 	 * cases. Such packets should be caught in udp_unexpected_gso later.
 	 */
 	NAPI_GRO_CB(skb)->is_flist = 0;
-	if (!sk || !udp_sk(sk)->gro_receive) {
+	if (sk)
+		gro_receive = READ_ONCE(udp_sk(sk)->gro_receive);
+	if (!gro_receive) {
 		/* If the packet was locally encapsulated in a UDP tunnel that
 		 * wasn't detected above, do not GRO.
 		 */
@@ -842,7 +885,7 @@ struct sk_buff *udp_gro_receive(struct list_head *head, struct sk_buff *skb,
 
 	skb_gro_pull(skb, sizeof(struct udphdr)); /* pull encapsulating udp header */
 	skb_gro_postpull_rcsum(skb, uh, sizeof(struct udphdr));
-	pp = udp_tunnel_gro_rcv(sk, head, skb);
+	pp = udp_tunnel_gro_rcv(sk, gro_receive, head, skb);
 
 out:
 	skb_gro_flush_final(skb, pp, flush);
@@ -921,6 +964,7 @@ int udp_gro_complete(struct sk_buff *skb, int nhoff,
 {
 	struct udphdr *uh = (struct udphdr *)(skb->data + nhoff);
 	unsigned int newlen = skb->len - nhoff;
+	udp_tunnel_gro_complete_t gro_complete = NULL;
 	struct sock *sk;
 	int err;
 
@@ -928,7 +972,9 @@ int udp_gro_complete(struct sk_buff *skb, int nhoff,
 
 	sk = INDIRECT_CALL_INET(lookup, udp6_lib_lookup_skb,
 				udp4_lib_lookup_skb, skb, uh->source, uh->dest);
-	if (sk && udp_sk(sk)->gro_complete) {
+	if (sk)
+		gro_complete = READ_ONCE(udp_sk(sk)->gro_complete);
+	if (gro_complete) {
 		skb_shinfo(skb)->gso_type = uh->check ? SKB_GSO_UDP_TUNNEL_CSUM
 					: SKB_GSO_UDP_TUNNEL;
 
@@ -941,8 +987,7 @@ int udp_gro_complete(struct sk_buff *skb, int nhoff,
 		 * functions to make them set up the inner offsets.
 		 */
 		skb->encapsulation = 1;
-		err = udp_sk(sk)->gro_complete(sk, skb,
-				nhoff + sizeof(struct udphdr));
+		err = gro_complete(sk, skb, nhoff + sizeof(struct udphdr));
 	} else {
 		err = udp_gro_complete_segment(skb);
 	}
