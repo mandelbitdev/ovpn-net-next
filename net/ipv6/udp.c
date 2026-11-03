@@ -810,17 +810,35 @@ static int __udpv6_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
 	return 0;
 }
 
-static int udpv6_queue_rcv_one_skb(struct sock *sk, struct sk_buff *skb)
+/* Check the inbound policy and reset conntrack state, dropping the skb on
+ * failure. An accepted frag-list aggregate is checked once: its datagrams
+ * share the verdict, and a check after a fallback would lack the state which
+ * the first one consumed.
+ */
+static bool udpv6_queue_rcv_policy(struct sock *sk, struct sk_buff *skb,
+				   bool encap_fraglist)
+{
+	if (!xfrm6_policy_check(sk, XFRM_POLICY_IN, skb)) {
+		unsigned int segs = encap_fraglist ?
+				    skb_shinfo(skb)->gso_segs : 1;
+
+		__SNMP_ADD_STATS(sock_net(sk)->mib.udp_stats_in6,
+				 UDP_MIB_INERRORS, segs);
+		numa_drop_add(&udp_sk(sk)->drop_counters, segs);
+		sk_skb_reason_drop(sk, skb, SKB_DROP_REASON_XFRM_POLICY);
+		return false;
+	}
+	nf_reset_ct(skb);
+
+	return true;
+}
+
+static int udpv6_queue_rcv_one_skb(struct sock *sk, struct sk_buff *skb,
+				   bool encap_fraglist)
 {
 	enum skb_drop_reason drop_reason = SKB_DROP_REASON_NOT_SPECIFIED;
 	struct udp_sock *up = udp_sk(sk);
 	struct net *net = sock_net(sk);
-
-	if (!xfrm6_policy_check(sk, XFRM_POLICY_IN, skb)) {
-		drop_reason = SKB_DROP_REASON_XFRM_POLICY;
-		goto drop;
-	}
-	nf_reset_ct(skb);
 
 	if (static_branch_unlikely(&udpv6_encap_needed_key) &&
 	    READ_ONCE(up->encap_type)) {
@@ -840,14 +858,25 @@ static int udpv6_queue_rcv_one_skb(struct sock *sk, struct sk_buff *skb)
 		/* if we're overly short, let UDP handle it */
 		encap_rcv = READ_ONCE(up->encap_rcv);
 		if (encap_rcv) {
+			unsigned int segs = encap_fraglist ?
+					    skb_shinfo(skb)->gso_segs : 1;
 			int ret;
 
-			/* Verify checksum before giving to encap */
-			if (udp_lib_checksum_complete(skb))
+			/* Verify checksum before giving to encap. The header
+			 * checksum of an accepted frag-list covers only its
+			 * first datagram, so trust the GRO verdict instead, as
+			 * udp_post_segment_fix_csum does after segmentation.
+			 */
+			if (!encap_fraglist && udp_lib_checksum_complete(skb))
 				goto csum_error;
 
 			ret = encap_rcv(sk, skb);
-			if (ret <= 0) {
+			if (!ret) {
+				__SNMP_ADD_STATS(net->mib.udp_stats_in6,
+						 UDP_MIB_INDATAGRAMS, segs);
+				return 0;
+			}
+			if (ret < 0 && !encap_fraglist) {
 				__UDP6_INC_STATS(net, UDP_MIB_INDATAGRAMS);
 				return -ret;
 			}
@@ -855,6 +884,13 @@ static int udpv6_queue_rcv_one_skb(struct sock *sk, struct sk_buff *skb)
 
 		/* FALLTHROUGH -- it's a UDP Packet */
 	}
+
+	/* The encapsulator did not consume an aggregate it had opted into so
+	 * we ask udpv6_queue_rcv_skb to retry after segmentation rather than
+	 * exposing multiple datagrams to the socket as one.
+	 */
+	if (encap_fraglist)
+		return -EAGAIN;
 
 	prefetch(&sk->sk_rmem_alloc);
 	if (rcu_access_pointer(sk->sk_filter) &&
@@ -883,11 +919,18 @@ drop:
 
 static int udpv6_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
 {
+	bool encap_fraglist = udp_encap_accepts_fraglist(sk, skb);
 	struct sk_buff *next, *segs;
 	int ret;
 
-	if (likely(!udp_unexpected_gso(sk, skb)))
-		return udpv6_queue_rcv_one_skb(sk, skb);
+	if (likely(encap_fraglist || !udp_unexpected_gso(sk, skb))) {
+		if (!udpv6_queue_rcv_policy(sk, skb, encap_fraglist))
+			return -1;
+
+		ret = udpv6_queue_rcv_one_skb(sk, skb, encap_fraglist);
+		if (likely(ret != -EAGAIN))
+			return ret;
+	}
 
 	__skb_push(skb, -skb_mac_offset(skb));
 	segs = udp_rcv_segment(sk, skb, false);
@@ -895,7 +938,11 @@ static int udpv6_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
 		__skb_pull(skb, skb_transport_offset(skb));
 
 		udp_post_segment_fix_csum(skb);
-		ret = udpv6_queue_rcv_one_skb(sk, skb);
+		/* datagrams of a declined aggregate share its verdict */
+		if (!encap_fraglist && !udpv6_queue_rcv_policy(sk, skb, false))
+			continue;
+
+		ret = udpv6_queue_rcv_one_skb(sk, skb, false);
 		if (ret > 0)
 			ip6_protocol_deliver_rcu(dev_net(skb->dev), skb, ret,
 						 true);

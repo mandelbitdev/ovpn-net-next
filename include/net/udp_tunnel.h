@@ -85,6 +85,7 @@ struct udp_tunnel_sock_cfg {
 	void *sk_user_data;     /* user data used by encap_rcv call back */
 	/* Used for setting up udp_sock fields, see udp.h for details */
 	__u8  encap_type;
+	unsigned long udp_flags;
 	udp_tunnel_encap_rcv_t encap_rcv;
 	udp_tunnel_encap_err_lookup_t encap_err_lookup;
 	udp_tunnel_encap_err_rcv_t encap_err_rcv;
