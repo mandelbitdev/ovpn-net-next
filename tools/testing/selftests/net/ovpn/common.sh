@@ -561,7 +561,8 @@ ovpn_peer0_wait_del_ntf() {
 	OVPN_DEL_NTF="${ntf}"
 
 	if [ -z "${ntf}" ] || [ "${ntf}" == "null" ]; then
-		printf 'no peer-del-ntf for peer %s\n' "${id}"
+		printf 'no peer-del-ntf for peer %s in:\n' "${id}"
+		cat "${json}"
 		return 1
 	fi
 	if [ "$(jq -r '.["del-reason"]' <<<"${ntf}")" != "${reason}" ]; then
