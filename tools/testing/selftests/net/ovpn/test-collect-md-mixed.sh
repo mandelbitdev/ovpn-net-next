@@ -250,7 +250,15 @@ ovpn_mix_teardown() {
 	ovpn_peer0_wait_del_ntf 4 teardown
 
 	ovpn_tcp_peer_expect s4 closed close
-	ovpn_tcp_peer_expect c4 eof eof 3000
+	# the client may have sent something (i.e. IPv6 ND through tun4) to
+	# the detached socket, which then resets the connection on close
+	ovpn_tcp_peer_cmd c4 5 eof 3000
+	if [[ "${OVPN_TP_REPLY}" != "eof" && \
+	      "${OVPN_TP_REPLY}" != "error 104" ]]; then
+		printf 'client 4: connection not closed: %s\n' \
+			"${OVPN_TP_REPLY}"
+		return 1
+	fi
 	ovpn_tcp_peer_stop s4
 	ovpn_tcp_peer_stop c4
 }
