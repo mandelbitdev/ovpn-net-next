@@ -401,8 +401,118 @@ ovpn_cleanup_peer_ns() {
 	ip netns del "${peer}" 2>/dev/null || true
 }
 
+# TCP peers driven through "ovpn-cli tcp_peer": the process keeps the peer
+# socket and executes the commands written to its stdin (a FIFO), answering
+# each one with a line on stdout (a file).
+declare -A OVPN_TP_PID=()
+declare -A OVPN_TP_FD=()
+declare -A OVPN_TP_DIR=()
+declare -A OVPN_TP_LINES=()
+OVPN_TP_REPLY=""
+
+# ovpn_tcp_peer_start <name> <netns> <iface> <peer_id> <tx_id>
+#		      <listen|connect> <addr> <port> [sndbuf]
+ovpn_tcp_peer_start() {
+	local name="$1"
+	local ns="$2"
+	local dir fd
+
+	shift 2
+	dir=$(mktemp -d)
+	mkfifo "${dir}/in"
+	ip netns exec "${ns}" "${OVPN_CLI}" tcp_peer "$@" <"${dir}/in" \
+		>"${dir}/out" 2>"${dir}/err" &
+	OVPN_TP_PID["${name}"]=$!
+	exec {fd}>"${dir}/in"
+	OVPN_TP_FD["${name}"]=${fd}
+	OVPN_TP_DIR["${name}"]=${dir}
+	OVPN_TP_LINES["${name}"]=0
+}
+
+# wait for the next reply line of <name> (stored in OVPN_TP_REPLY)
+ovpn_tcp_peer_reply() {
+	local name="$1"
+	local timeout="${2:-10}"
+	local out="${OVPN_TP_DIR[${name}]}/out"
+	local n=$((OVPN_TP_LINES[${name}] + 1))
+	local deadline=$((SECONDS + timeout))
+
+	OVPN_TP_REPLY=""
+	while [ "$(wc -l <"${out}")" -lt "${n}" ]; do
+		if ! kill -0 "${OVPN_TP_PID[${name}]}" 2>/dev/null; then
+			printf 'tcp peer %s exited: %s\n' "${name}" \
+				"$(cat "${OVPN_TP_DIR[${name}]}/err")"
+			return 1
+		fi
+		if [ "${SECONDS}" -ge "${deadline}" ]; then
+			printf 'tcp peer %s: no reply\n' "${name}"
+			return 1
+		fi
+		sleep 0.05
+	done
+
+	OVPN_TP_LINES["${name}"]=${n}
+	OVPN_TP_REPLY=$(sed -n "${n}p" "${out}")
+	ovpn_log "${name}: ${OVPN_TP_REPLY}"
+}
+
+# write a command without waiting for its reply
+ovpn_tcp_peer_send_cmd() {
+	local name="$1"
+
+	shift
+	echo "$*" >&"${OVPN_TP_FD[${name}]}"
+}
+
+# ovpn_tcp_peer_cmd <name> <timeout_s> <command...>: run a command and
+# store its reply in OVPN_TP_REPLY
+ovpn_tcp_peer_cmd() {
+	local name="$1"
+	local timeout="$2"
+
+	shift 2
+	ovpn_tcp_peer_send_cmd "${name}" "$@"
+	ovpn_tcp_peer_reply "${name}" "${timeout}"
+}
+
+# like ovpn_tcp_peer_cmd, but fail unless the reply starts with <expected>
+ovpn_tcp_peer_expect() {
+	local name="$1"
+	local expected="$2"
+
+	shift 2
+	ovpn_tcp_peer_cmd "${name}" 10 "$@" || return 1
+	if [[ "${OVPN_TP_REPLY}" != "${expected}"* ]]; then
+		printf 'tcp peer %s: "%s" replied "%s", expected "%s"\n' \
+			"${name}" "$*" "${OVPN_TP_REPLY}" "${expected}"
+		return 1
+	fi
+}
+
+# close the command stream: the process closes its socket (if still open)
+# and exits
+ovpn_tcp_peer_stop() {
+	local name="$1"
+	local fd="${OVPN_TP_FD[${name}]:-}"
+	local pid="${OVPN_TP_PID[${name}]:-}"
+
+	[ -n "${fd}" ] && exec {fd}>&-
+	if [ -n "${pid}" ]; then
+		timeout 5 tail --pid="${pid}" -f /dev/null 2>/dev/null || \
+			kill -9 "${pid}" 2>/dev/null || true
+		wait "${pid}" 2>/dev/null || true
+	fi
+	rm -rf "${OVPN_TP_DIR[${name}]:-/nonexistent}"
+	unset "OVPN_TP_PID[${name}]" "OVPN_TP_FD[${name}]" \
+		"OVPN_TP_DIR[${name}]" "OVPN_TP_LINES[${name}]"
+}
+
 ovpn_cleanup() {
 	local peer
+
+	for peer in "${!OVPN_TP_PID[@]}"; do
+		ovpn_tcp_peer_stop "${peer}"
+	done
 
 	# some ovpn-cli processes sleep in background so they need manual poking
 	killall "$(basename "${OVPN_CLI}")" 2>/dev/null || true

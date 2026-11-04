@@ -18,6 +18,8 @@
 #include <net/if.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <netdb.h>
+#include <poll.h>
 #include <time.h>
 
 #include <linux/ovpn.h>
@@ -33,6 +35,7 @@
 #include <mbedtls/base64.h>
 #include <mbedtls/error.h>
 
+#include <sys/epoll.h>
 #include <sys/socket.h>
 
 #include "kselftest.h"
@@ -93,6 +96,7 @@ enum ovpn_cmd {
 	CMD_GET_KEY,
 	CMD_SWAP_KEYS,
 	CMD_LISTEN_MCAST,
+	CMD_TCP_PEER,
 };
 
 struct ovpn_ctx {
@@ -141,6 +145,11 @@ struct ovpn_ctx {
 	bool asymm_id;
 
 	const char *peers_file;
+
+	bool tcp_listen;
+	const char *tcp_addr;
+	const char *tcp_port;
+	int tcp_sndbuf;
 };
 
 static int ovpn_nl_recvmsgs(struct nl_ctx *ctx)
@@ -1837,6 +1846,19 @@ static void usage(const char *cmd)
 
 	fprintf(stderr,
 		"* listen_mcast: listen to ovpn netlink multicast messages\n");
+
+	fprintf(stderr,
+		"* tcp_peer <iface> <peer_id> <tx_id> <listen|connect> <addr> <port> [sndbuf]: add one TCP peer and drive its socket with commands read from stdin\n");
+	fprintf(stderr, "\tiface: ovpn interface name\n");
+	fprintf(stderr,
+		"\tpeer_id: peer ID found in data packets received from this peer\n");
+	fprintf(stderr,
+		"\ttx_id: peer ID to be used when sending to this peer, 'none' for symmetric peer ID\n");
+	fprintf(stderr,
+		"\tlisten|connect: accept one connection on <addr> <port>, or connect to it\n");
+	fprintf(stderr, "\tsndbuf: SO_SNDBUF of the TCP socket\n");
+	fprintf(stderr,
+		"\tcommands: send <seq> <len> <timeout_ms>, recv <seq> <timeout_ms>, eof <timeout_ms>, close\n");
 }
 
 static int ovpn_parse_remote(struct ovpn_ctx *ovpn, const char *host,
@@ -2024,6 +2046,9 @@ static enum ovpn_cmd ovpn_parse_cmd(const char *cmd)
 	if (!strcmp(cmd, "listen_mcast"))
 		return CMD_LISTEN_MCAST;
 
+	if (!strcmp(cmd, "tcp_peer"))
+		return CMD_TCP_PEER;
+
 	return CMD_INVALID;
 }
 
@@ -2040,6 +2065,271 @@ static void ovpn_waitbg(void)
 {
 	daemon(1, 1);
 	pause();
+}
+
+/* tcp_peer: a single TCP peer whose socket stays in this process, driven by
+ * commands read from stdin, one per line, each answered by one line on
+ * stdout:
+ *
+ *  send <seq> <len> <timeout_ms>: send a <len> bytes control packet (framed,
+ *	carrying <seq> and the send time) the way an event loop does it:
+ *	non-blocking sendmsg(), waiting for EPOLLOUT with edge-triggered epoll
+ *	after -EAGAIN. Answers "sent <seq> <usec> <eagain>" or, when no EPOLLOUT
+ *	edge came within <timeout_ms>, "stall <seq> <writable>", where
+ *	<writable> tells whether a sendmsg() issued right after the timeout
+ *	succeeded (i.e. a lost wakeup)
+ *  recv <seq> <timeout_ms>: wait for the control packet <seq> (skipping any
+ *	other packet). Answers "recv <seq> <usec since it was sent>", "eof",
+ *	"timeout" or "error <errno>"
+ *  eof <timeout_ms>: wait for the end of the stream (skipping packets).
+ *	Answers "eof", "timeout" or "error <errno>"
+ *  close: close the socket. Answers "closed"
+ *
+ * Control packets use the P_CONTROL_V1 opcode, hence ovpn queues them to
+ * userspace.
+ */
+#define OVPN_TCP_PEER_CTRL_OP	(4 << 3)
+#define OVPN_TCP_PEER_HDR	(2 + 1 + 4 + 8)
+
+static uint64_t ovpn_now_ns(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+static int ovpn_tcp_peer_open(struct ovpn_ctx *ovpn)
+{
+	struct addrinfo hints = {
+		.ai_socktype = SOCK_STREAM,
+		.ai_flags = AI_NUMERICHOST,
+	};
+	struct addrinfo *ai = NULL;
+	socklen_t len;
+	int s, c, opt = 1, ret;
+
+	ret = getaddrinfo(ovpn->tcp_addr, ovpn->tcp_port, &hints, &ai);
+	if (ret) {
+		fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(ret));
+		return -1;
+	}
+
+	s = socket(ai->ai_family, SOCK_STREAM, 0);
+	if (s < 0) {
+		perror("socket");
+		goto err;
+	}
+
+	if (!ovpn->tcp_listen) {
+		if (connect(s, ai->ai_addr, ai->ai_addrlen) < 0) {
+			perror("connect");
+			close(s);
+			goto err;
+		}
+		c = s;
+		goto out;
+	}
+
+	setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+	if (ai->ai_family == AF_INET6) {
+		opt = 0;
+		setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt));
+	}
+	if (bind(s, ai->ai_addr, ai->ai_addrlen) < 0 || listen(s, 1) < 0) {
+		perror("bind/listen");
+		close(s);
+		goto err;
+	}
+	/* tell the caller it can connect */
+	printf("listening\n");
+	fflush(stdout);
+
+	c = accept(s, NULL, NULL);
+	close(s);
+	if (c < 0) {
+		perror("accept");
+		goto err;
+	}
+out:
+	freeaddrinfo(ai);
+	ovpn_tcp_nodelay(c);
+	if (ovpn->tcp_sndbuf) {
+		opt = ovpn->tcp_sndbuf;
+		setsockopt(c, SOL_SOCKET, SO_SNDBUF, &opt, sizeof(opt));
+	}
+	len = sizeof(ovpn->remote);
+	getpeername(c, (struct sockaddr *)&ovpn->remote, &len);
+	return c;
+err:
+	freeaddrinfo(ai);
+	return -1;
+}
+
+static void ovpn_tcp_peer_send(int fd, int ep, uint32_t seq, size_t len,
+			       int timeout_ms)
+{
+	uint64_t start = ovpn_now_ns(), now;
+	struct epoll_event ev[4];
+	uint8_t buf[4096];
+	unsigned int eagain = 0;
+	int n, left;
+	ssize_t ret;
+
+	if (len < OVPN_TCP_PEER_HDR)
+		len = OVPN_TCP_PEER_HDR;
+	if (len > sizeof(buf))
+		len = sizeof(buf);
+
+	memset(buf, 0x5a, len);
+	*(uint16_t *)buf = htons(len - 2);
+	buf[2] = OVPN_TCP_PEER_CTRL_OP;
+	*(uint32_t *)(buf + 3) = htonl(seq);
+	memcpy(buf + 7, &start, sizeof(start));
+
+	for (;;) {
+		ret = send(fd, buf, len, MSG_DONTWAIT | MSG_NOSIGNAL);
+		if (ret == (ssize_t)len)
+			break;
+		if (ret >= 0) {
+			/* ovpn takes whole messages only */
+			printf("error %u short %zd\n", seq, ret);
+			return;
+		}
+		if (errno != EAGAIN) {
+			printf("error %u %d\n", seq, errno);
+			return;
+		}
+		eagain++;
+
+		now = ovpn_now_ns();
+		left = timeout_ms - (int)((now - start) / 1000000);
+		n = left > 0 ? epoll_wait(ep, ev, 4, left) : 0;
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0) {
+			ret = send(fd, buf, len, MSG_DONTWAIT | MSG_NOSIGNAL);
+			printf("stall %u %d\n", seq, ret == (ssize_t)len);
+			return;
+		}
+	}
+
+	printf("sent %u %" PRIu64 " %u\n", seq,
+	       (ovpn_now_ns() - start) / 1000, eagain);
+}
+
+/* wait for packet <seq>, or for EOF with seq < 0 */
+static void ovpn_tcp_peer_recv(int fd, long seq, int timeout_ms)
+{
+	uint64_t deadline = ovpn_now_ns() + timeout_ms * 1000000ULL, sent;
+	struct pollfd pfd = { .fd = fd, .events = POLLIN };
+	uint8_t buf[4096];
+	uint64_t now;
+	uint32_t rseq;
+	ssize_t ret;
+	int n;
+
+	for (;;) {
+		now = ovpn_now_ns();
+		if (now >= deadline) {
+			printf("timeout\n");
+			return;
+		}
+		n = poll(&pfd, 1, (deadline - now) / 1000000 + 1);
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0) {
+			printf("timeout\n");
+			return;
+		}
+
+		ret = recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
+		if (ret < 0 && errno == EAGAIN)
+			continue;
+		if (ret < 0) {
+			printf("error %d\n", errno);
+			return;
+		}
+		if (ret == 0) {
+			printf("eof\n");
+			return;
+		}
+		if (seq < 0 || ret < OVPN_TCP_PEER_HDR ||
+		    buf[2] != OVPN_TCP_PEER_CTRL_OP)
+			continue;
+
+		memcpy(&rseq, buf + 3, sizeof(rseq));
+		if (ntohl(rseq) != seq)
+			continue;
+
+		memcpy(&sent, buf + 7, sizeof(sent));
+		printf("recv %ld %" PRIu64 "\n", seq,
+		       (ovpn_now_ns() - sent) / 1000);
+		return;
+	}
+}
+
+static int ovpn_tcp_peer(struct ovpn_ctx *ovpn)
+{
+	struct epoll_event ev = {
+		.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET,
+	};
+	char line[256], cmd[16];
+	unsigned long a, b, c;
+	int fd, ep, ret;
+
+	fd = ovpn_tcp_peer_open(ovpn);
+	if (fd < 0)
+		return -1;
+
+	ovpn->socket = fd;
+	ret = ovpn_new_peer(ovpn, true);
+	if (ret < 0) {
+		fprintf(stderr, "cannot add TCP peer\n");
+		close(fd);
+		return ret;
+	}
+
+	/* register like an event loop does (i.e. asio): edge-triggered, for
+	 * both directions, once
+	 */
+	ep = epoll_create1(0);
+	ev.data.fd = fd;
+	if (ep < 0 || epoll_ctl(ep, EPOLL_CTL_ADD, fd, &ev) < 0) {
+		perror("epoll");
+		close(fd);
+		return -1;
+	}
+
+	printf("ready\n");
+	fflush(stdout);
+
+	while (fgets(line, sizeof(line), stdin)) {
+		a = b = c = 0;
+		if (sscanf(line, "%15s %lu %lu %lu", cmd, &a, &b, &c) < 1)
+			continue;
+
+		if (!strcmp(cmd, "send")) {
+			ovpn_tcp_peer_send(fd, ep, a, b, c);
+		} else if (!strcmp(cmd, "recv")) {
+			ovpn_tcp_peer_recv(fd, a, b);
+		} else if (!strcmp(cmd, "eof")) {
+			ovpn_tcp_peer_recv(fd, -1, a);
+		} else if (!strcmp(cmd, "close")) {
+			if (fd >= 0)
+				close(fd);
+			fd = -1;
+			printf("closed\n");
+		} else {
+			printf("unknown\n");
+		}
+		fflush(stdout);
+	}
+
+	if (fd >= 0)
+		close(fd);
+	close(ep);
+	return 0;
 }
 
 static int ovpn_run_cmd(struct ovpn_ctx *ovpn)
@@ -2218,6 +2508,9 @@ static int ovpn_run_cmd(struct ovpn_ctx *ovpn)
 		break;
 	case CMD_LISTEN_MCAST:
 		ret = ovpn_listen_mcast();
+		break;
+	case CMD_TCP_PEER:
+		ret = ovpn_tcp_peer(ovpn);
 		break;
 	case CMD_INVALID:
 		ret = -EINVAL;
@@ -2499,6 +2792,28 @@ static int ovpn_parse_cmd_args(struct ovpn_ctx *ovpn, int argc, char *argv[])
 		}
 		break;
 	case CMD_LISTEN_MCAST:
+		break;
+	case CMD_TCP_PEER:
+		if (argc < 8)
+			return -EINVAL;
+
+		ovpn->asymm_id = strcmp(argv[4], "none");
+		ret = ovpn_parse_new_peer(ovpn, argv[3], argv[4], NULL, NULL,
+					  NULL);
+		if (ret < 0)
+			return -1;
+
+		if (!strcmp(argv[5], "listen")) {
+			ovpn->tcp_listen = true;
+		} else if (strcmp(argv[5], "connect")) {
+			fprintf(stderr, "Cannot parse TCP mode: %s\n",
+				argv[5]);
+			return -1;
+		}
+		ovpn->tcp_addr = argv[6];
+		ovpn->tcp_port = argv[7];
+		if (argc > 8)
+			ovpn->tcp_sndbuf = strtoul(argv[8], NULL, 10);
 		break;
 	case CMD_INVALID:
 		break;
