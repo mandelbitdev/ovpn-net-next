@@ -1044,6 +1044,9 @@ int ovpn_nl_key_new_doit(struct sk_buff *skb, struct genl_info *info)
 	pkr.slot = nla_get_u32(attrs[OVPN_A_KEYCONF_SLOT]);
 	pkr.key.key_id = nla_get_u32(attrs[OVPN_A_KEYCONF_KEY_ID]);
 	pkr.key.cipher_alg = nla_get_u32(attrs[OVPN_A_KEYCONF_CIPHER_ALG]);
+	if (attrs[OVPN_A_KEYCONF_DECRYPT_FAIL_LIMIT])
+		pkr.key.decrypt_fail_limit =
+			nla_get_uint(attrs[OVPN_A_KEYCONF_DECRYPT_FAIL_LIMIT]);
 
 	ret = ovpn_nl_get_key_dir(info, attrs[OVPN_A_KEYCONF_ENCRYPT_DIR],
 				  pkr.key.cipher_alg, &pkr.key.encrypt);

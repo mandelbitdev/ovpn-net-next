@@ -27,6 +27,7 @@ struct ovpn_key_direction {
 struct ovpn_key_config {
 	enum ovpn_cipher_alg cipher_alg;
 	u8 key_id;
+	u64 decrypt_fail_limit;
 	struct ovpn_key_direction encrypt;
 	struct ovpn_key_direction decrypt;
 };
@@ -47,6 +48,11 @@ struct ovpn_crypto_key_slot {
 
 	struct ovpn_pktid_recv pid_recv ____cacheline_aligned_in_smp;
 	struct ovpn_pktid_xmit pid_xmit ____cacheline_aligned_in_smp;
+	/* packets which failed to decrypt with this key, and how many are
+	 * tolerated (0 for no limit)
+	 */
+	atomic64_t decrypt_fails;
+	u64 decrypt_fail_limit;
 	struct rcu_work free_work;
 	struct kref refcount;
 };

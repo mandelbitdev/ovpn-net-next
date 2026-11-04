@@ -430,6 +430,8 @@ ovpn_aead_crypto_key_slot_new(const struct ovpn_key_config *kc)
 	INIT_RCU_WORK(&ks->free_work, ovpn_aead_crypto_key_slot_free_work);
 	kref_init(&ks->refcount);
 	ks->key_id = kc->key_id;
+	atomic64_set(&ks->decrypt_fails, 0);
+	ks->decrypt_fail_limit = kc->decrypt_fail_limit;
 
 	ks->encrypt = ovpn_aead_init("encrypt", alg_name,
 				     kc->encrypt.cipher_key,
