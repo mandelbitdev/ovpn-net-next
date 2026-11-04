@@ -2075,9 +2075,11 @@ static void ovpn_waitbg(void)
  *	carrying <seq> and the send time) the way an event loop does it:
  *	non-blocking sendmsg(), waiting for EPOLLOUT with edge-triggered epoll
  *	after -EAGAIN. Answers "sent <seq> <usec> <eagain>" or, when no EPOLLOUT
- *	edge came within <timeout_ms>, "stall <seq> <writable>", where
- *	<writable> tells whether a sendmsg() issued right after the timeout
- *	succeeded (i.e. a lost wakeup)
+ *	edge came within <timeout_ms>, "stall <seq> <writable> <wakeups>
+ *	<usec>", where <writable> tells whether a sendmsg() issued right after
+ *	the timeout succeeded, <wakeups> how many times epoll reported an event
+ *	meanwhile and <usec> the time since the last one (a writable socket
+ *	after a long time without events is a lost wakeup)
  *  recv <seq> <timeout_ms>: wait for the control packet <seq> (skipping any
  *	other packet). Answers "recv <seq> <usec since it was sent>", "eof",
  *	"timeout" or "error <errno>"
@@ -2169,10 +2171,10 @@ err:
 static void ovpn_tcp_peer_send(int fd, int ep, uint32_t seq, size_t len,
 			       int timeout_ms)
 {
-	uint64_t start = ovpn_now_ns(), now;
+	uint64_t start = ovpn_now_ns(), now, last_wakeup;
+	unsigned int eagain = 0, wakeups = 0;
 	struct epoll_event ev[4];
 	uint8_t buf[4096];
-	unsigned int eagain = 0;
 	int n, left;
 	ssize_t ret;
 
@@ -2186,6 +2188,7 @@ static void ovpn_tcp_peer_send(int fd, int ep, uint32_t seq, size_t len,
 	buf[2] = OVPN_TCP_PEER_CTRL_OP;
 	*(uint32_t *)(buf + 3) = htonl(seq);
 	memcpy(buf + 7, &start, sizeof(start));
+	last_wakeup = start;
 
 	for (;;) {
 		ret = send(fd, buf, len, MSG_DONTWAIT | MSG_NOSIGNAL);
@@ -2209,9 +2212,13 @@ static void ovpn_tcp_peer_send(int fd, int ep, uint32_t seq, size_t len,
 			continue;
 		if (n <= 0) {
 			ret = send(fd, buf, len, MSG_DONTWAIT | MSG_NOSIGNAL);
-			printf("stall %u %d\n", seq, ret == (ssize_t)len);
+			printf("stall %u %d %u %" PRIu64 "\n", seq,
+			       ret == (ssize_t)len, wakeups,
+			       (ovpn_now_ns() - last_wakeup) / 1000);
 			return;
 		}
+		wakeups++;
+		last_wakeup = ovpn_now_ns();
 	}
 
 	printf("sent %u %" PRIu64 " %u\n", seq,
