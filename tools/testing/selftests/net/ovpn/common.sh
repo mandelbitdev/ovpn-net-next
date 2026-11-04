@@ -507,6 +507,75 @@ ovpn_tcp_peer_stop() {
 		"OVPN_TP_DIR[${name}]" "OVPN_TP_LINES[${name}]"
 }
 
+# print a counter from the "ip -s -j link" output of <ns> <dev> <jq path>
+ovpn_link_stat() {
+	ip -n "${1}" -s -j link show dev "${2}" | jq -r ".[0].stats64.${3}"
+}
+
+# print the packet counter of the tc ingress filter of tun0 in ovpn_peer0
+# with the given pref
+ovpn_peer0_tc_pkts() {
+	local filter="[.[] | select(.pref == ${1}) |
+		       .options.actions[0].stats.packets // empty] | max // 0"
+
+	ip netns exec ovpn_peer0 tc -s -j filter show dev tun0 ingress | \
+		jq -r "${filter}"
+}
+
+# print the PEER_GET reply of tun0 in ovpn_peer0 for [peer_id], or all its
+# peers (one JSON object per peer)
+ovpn_peer0_get() {
+	local ifindex json
+
+	ifindex=$(ip -n ovpn_peer0 -j link show dev tun0 | jq '.[0].ifindex')
+	if [ -n "${1:-}" ]; then
+		json="{\"ifindex\": ${ifindex}, \"peer\": {\"id\": ${1}}}"
+		json=$(ip netns exec ovpn_peer0 "${OVPN_YNL}" --family ovpn \
+			--do peer-get --json "${json}" --output-json) || \
+			return 1
+		jq -c '.peer' <<<"${json}"
+	else
+		json="{\"ifindex\": ${ifindex}}"
+		ip netns exec ovpn_peer0 "${OVPN_YNL}" --family ovpn \
+			--dump peer-get --json "${json}" --output-json | \
+			jq -c '.[].peer'
+	fi
+}
+
+# wait for the peer-del-ntf of <id> received by the ovpn_peer0 listener
+# (ovpn_setup_listener 0) and check its reason; the notification is stored
+# in OVPN_DEL_NTF
+ovpn_peer0_wait_del_ntf() {
+	local id="$1"
+	local reason="$2"
+	local json="${OVPN_TMP_JSONS[0]}"
+	local filter="[.[] | select(.name == \"peer-del-ntf\" and
+			.msg.peer.id == ${id})][0].msg.peer"
+	local i ntf
+
+	for i in $(seq 50); do
+		ntf=$(jq -s -c "${filter}" "${json}" 2>/dev/null || true)
+		[ -n "${ntf}" ] && [ "${ntf}" != "null" ] && break
+		sleep 0.1
+	done
+	OVPN_DEL_NTF="${ntf}"
+
+	if [ -z "${ntf}" ] || [ "${ntf}" == "null" ]; then
+		printf 'no peer-del-ntf for peer %s\n' "${id}"
+		return 1
+	fi
+	if [ "$(jq -r '.["del-reason"]' <<<"${ntf}")" != "${reason}" ]; then
+		printf 'peer %s deleted with reason %s, expected %s\n' "${id}" \
+			"$(jq -r '.["del-reason"]' <<<"${ntf}")" "${reason}"
+		return 1
+	fi
+}
+
+ovpn_peer0_count_del_ntf() {
+	jq -s "[.[] | select(.name == \"peer-del-ntf\" and
+		.msg.peer.id == ${1})] | length" "${OVPN_TMP_JSONS[0]}"
+}
+
 ovpn_cleanup() {
 	local peer
 
