@@ -172,8 +172,14 @@ void ovpn_decrypt_post(void *data, int ret)
 	/* crypto is done, cleanup skb CB and its members */
 	kfree(ovpn_skb_cb(skb)->crypto_tmp);
 
-	if (unlikely(ret < 0))
+	if (unlikely(ret < 0)) {
+		/* not resource errors (i.e. -ENODATA, from pulling the
+		 * header): the packet is truncated or forged
+		 */
+		if (ret == -EBADMSG || ret == -EINVAL)
+			atomic64_inc(&peer->rx_decrypt_errors);
 		goto drop;
+	}
 
 	/* PID sits after the op */
 	pid = (__force __be32 *)(skb->data + OVPN_OPCODE_SIZE);
@@ -182,6 +188,7 @@ void ovpn_decrypt_post(void *data, int ret)
 		net_err_ratelimited("%s: PKT ID RX error for peer %u: %d\n",
 				    netdev_name(peer->ovpn->dev), peer->id,
 				    ret);
+		atomic64_inc(&peer->rx_replay_errors);
 		goto drop;
 	}
 

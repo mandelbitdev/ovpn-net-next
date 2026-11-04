@@ -121,6 +121,8 @@ struct ovpn_peer {
 	time64_t last_recv;
 	struct ovpn_peer_stats vpn_stats;
 	struct ovpn_peer_stats link_stats;
+	atomic64_t rx_decrypt_errors;
+	atomic64_t rx_replay_errors;
 	enum ovpn_del_peer_reason delete_reason;
 	atomic_t deferred_del_reason;
 	struct work_struct deferred_del_work;

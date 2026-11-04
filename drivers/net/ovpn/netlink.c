@@ -671,7 +671,12 @@ static int ovpn_nl_peer_put_stats(struct sk_buff *skb,
 	    nla_put_uint(skb, OVPN_A_PEER_LINK_TX_BYTES,
 			 atomic64_read(&peer->link_stats.tx.bytes)) ||
 	    nla_put_uint(skb, OVPN_A_PEER_LINK_TX_PACKETS,
-			 atomic64_read(&peer->link_stats.tx.packets)))
+			 atomic64_read(&peer->link_stats.tx.packets)) ||
+	    /* link RX errors */
+	    nla_put_uint(skb, OVPN_A_PEER_LINK_RX_DECRYPT_ERRORS,
+			 atomic64_read(&peer->rx_decrypt_errors)) ||
+	    nla_put_uint(skb, OVPN_A_PEER_LINK_RX_REPLAY_ERRORS,
+			 atomic64_read(&peer->rx_replay_errors)))
 		return -EMSGSIZE;
 
 	return 0;

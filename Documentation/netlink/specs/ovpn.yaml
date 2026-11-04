@@ -175,6 +175,18 @@ attribute-sets:
           will advertise the tx-id to be used on the link.
         checks:
           max: 0xFFFFFF
+      -
+        name: link-rx-decrypt-errors
+        type: uint
+        doc: >-
+          Number of packets received at the transport level which failed
+          to decrypt or to authenticate
+      -
+        name: link-rx-replay-errors
+        type: uint
+        doc: >-
+          Number of authenticated packets received at the transport level
+          and dropped as replayed or out of the packet ID window
   -
     name: peer-new-input
     subset-of: peer

@@ -128,6 +128,8 @@ struct ovpn_peer *ovpn_peer_new(struct ovpn_priv *ovpn, u32 id)
 	kref_init(&peer->refcount);
 	ovpn_peer_stats_init(&peer->vpn_stats);
 	ovpn_peer_stats_init(&peer->link_stats);
+	atomic64_set(&peer->rx_decrypt_errors, 0);
+	atomic64_set(&peer->rx_replay_errors, 0);
 	INIT_WORK(&peer->keepalive_work, ovpn_peer_keepalive_send);
 	atomic_set(&peer->deferred_del_reason, -1);
 	INIT_WORK(&peer->deferred_del_work, ovpn_peer_deferred_del_work);
