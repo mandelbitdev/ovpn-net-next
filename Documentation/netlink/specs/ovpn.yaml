@@ -291,6 +291,15 @@ attribute-sets:
         type: nest
         doc: Key material for decrypt direction
         nested-attributes: keydir
+      -
+        name: decrypt-fail-limit
+        type: uint
+        doc: >-
+          Number of packets failing to decrypt or to authenticate with this
+          key after which the key is no longer used to decrypt, as the
+          integrity guarantees of AEAD ciphers weaken with the number of
+          forgery attempts. A key swap notification is sent when the limit
+          is reached, so that a new key is negotiated. 0 means no limit
   -
     name: keydir
     attributes:
@@ -518,8 +527,8 @@ operations:
       name: key-swap-ntf
       notify: key-get
       doc: >-
-        Notification about key having exhausted its IV space and requiring
-        renegotiation
+        Notification about key having exhausted its IV space, or having
+        reached its decryption failure limit, and requiring renegotiation
       mcgrp: peers
     -
       name: key-del

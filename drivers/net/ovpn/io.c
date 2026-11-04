@@ -152,11 +152,23 @@ static void ovpn_netdev_write(struct ovpn_peer *peer, struct sk_buff *skb)
 /* A TCP stream can't recover from a packet failing to decrypt: unlike a
  * datagram dropped by a lossy network, it is either corrupted or forged.
  * Abort the connection, as OpenVPN does in userspace.
+ *
+ * Over UDP, a key stops decrypting once its failures reached the limit
+ * configured for it (see ovpn_recv()): ask userspace for a new one.
  */
-static void ovpn_decrypt_error(struct ovpn_peer *peer)
+static void ovpn_decrypt_error(struct ovpn_peer *peer,
+			       struct ovpn_crypto_key_slot *ks)
 {
 	struct ovpn_socket *sock;
 	bool tcp;
+
+	if (ks && ks->decrypt_fail_limit &&
+	    atomic64_inc_return(&ks->decrypt_fails) == ks->decrypt_fail_limit) {
+		net_warn_ratelimited("%s: key %u of peer %u reached its decryption failure limit\n",
+				     netdev_name(peer->ovpn->dev), ks->key_id,
+				     peer->id);
+		ovpn_nl_key_swap_notify(peer, ks->key_id);
+	}
 
 	rcu_read_lock();
 	sock = rcu_dereference(peer->sock);
@@ -196,7 +208,7 @@ void ovpn_decrypt_post(void *data, int ret)
 		 */
 		if (ret == -EBADMSG || ret == -EINVAL) {
 			atomic64_inc(&peer->rx_decrypt_errors);
-			ovpn_decrypt_error(peer);
+			ovpn_decrypt_error(peer, ks);
 		}
 		goto drop;
 	}
@@ -300,6 +312,19 @@ void ovpn_recv(struct ovpn_peer *peer, struct sk_buff *skb)
 				     netdev_name(peer->ovpn->dev), peer->id,
 				     key_id);
 		ovpn_dev_dstats_rx_dropped(peer->ovpn->dev);
+		kfree_skb(skb);
+		ovpn_peer_put(peer);
+		return;
+	}
+
+	/* a key which reached its decryption failure limit is no longer
+	 * trusted to authenticate packets
+	 */
+	if (unlikely(ks->decrypt_fail_limit &&
+		     atomic64_read(&ks->decrypt_fails) >=
+		     ks->decrypt_fail_limit)) {
+		ovpn_dev_dstats_rx_dropped(peer->ovpn->dev);
+		ovpn_crypto_key_slot_put(ks);
 		kfree_skb(skb);
 		ovpn_peer_put(peer);
 		return;
