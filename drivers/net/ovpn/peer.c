@@ -85,6 +85,15 @@ static void ovpn_peer_keepalive_send(struct work_struct *work)
 	local_bh_enable();
 }
 
+static void ovpn_peer_deferred_del_work(struct work_struct *work)
+{
+	struct ovpn_peer *peer = container_of(work, struct ovpn_peer,
+					      deferred_del_work);
+
+	ovpn_peer_del(peer, atomic_read(&peer->deferred_del_reason));
+	ovpn_peer_put(peer);
+}
+
 /**
  * ovpn_peer_new - allocate and initialize a new peer object
  * @ovpn: the openvpn instance inside which the peer should be created
@@ -120,6 +129,8 @@ struct ovpn_peer *ovpn_peer_new(struct ovpn_priv *ovpn, u32 id)
 	ovpn_peer_stats_init(&peer->vpn_stats);
 	ovpn_peer_stats_init(&peer->link_stats);
 	INIT_WORK(&peer->keepalive_work, ovpn_peer_keepalive_send);
+	atomic_set(&peer->deferred_del_reason, -1);
+	INIT_WORK(&peer->deferred_del_work, ovpn_peer_deferred_del_work);
 
 	ret = dst_cache_init(&peer->dst_cache, GFP_KERNEL);
 	if (ret < 0) {
@@ -1300,6 +1311,27 @@ static int ovpn_peer_del_p2p(struct ovpn_peer *peer,
 	ovpn_peer_remove(peer, reason, release_list);
 
 	return 0;
+}
+
+/**
+ * ovpn_peer_del_deferred - delete peer from process context
+ * @peer: the peer to delete, the caller holds a reference
+ * @reason: why the peer is being deleted
+ *
+ * For contexts that can't sleep (i.e. the data path): the deletion runs in
+ * a worker. Only the first reason requested is used.
+ */
+void ovpn_peer_del_deferred(struct ovpn_peer *peer,
+			    enum ovpn_del_peer_reason reason)
+{
+	if (atomic_cmpxchg(&peer->deferred_del_reason, -1, reason) != -1)
+		return;
+
+	/* the worker releases this reference */
+	if (WARN_ON(!ovpn_peer_hold(peer)))
+		return;
+	if (!queue_work(ovpn_wq, &peer->deferred_del_work))
+		ovpn_peer_put(peer);
 }
 
 /**
