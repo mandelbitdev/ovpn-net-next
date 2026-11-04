@@ -250,12 +250,13 @@ void ovpn_tcp_socket_wait_finish(struct ovpn_socket *sock)
 
 	skb_queue_purge(&peer->tcp.out_queue);
 	kfree_skb(peer->tcp.out_msg.skb);
-	peer->tcp.out_msg.skb = NULL;
+	WRITE_ONCE(peer->tcp.out_msg.skb, NULL);
 }
 
 static void ovpn_tcp_send_sock(struct ovpn_peer *peer, struct sock *sk)
 {
 	struct sk_buff *skb = peer->tcp.out_msg.skb;
+	struct socket *sock;
 	int ret, flags;
 
 	if (!skb)
@@ -305,9 +306,19 @@ static void ovpn_tcp_send_sock(struct ovpn_peer *peer, struct sock *sk)
 	}
 
 	kfree_skb(peer->tcp.out_msg.skb);
-	peer->tcp.out_msg.skb = NULL;
+	WRITE_ONCE(peer->tcp.out_msg.skb, NULL);
 	peer->tcp.out_msg.len = 0;
 	peer->tcp.out_msg.offset = 0;
+
+	/* a userspace writer may be waiting for out_msg to be free (see
+	 * ovpn_tcp_poll()): the TCP write space callback won't fire again
+	 * if the socket was writable all along. Pairs with the barrier in
+	 * ovpn_tcp_poll().
+	 */
+	smp_mb();
+	sock = sk->sk_socket;
+	if (sock && test_bit(SOCK_NOSPACE, &sock->flags))
+		peer->tcp.sk_cb.sk_write_space(sk);
 
 out:
 	peer->tcp.tx_in_progress = false;
@@ -337,7 +348,7 @@ static void ovpn_tcp_send_sock_skb(struct ovpn_peer *peer, struct sock *sk,
 		return;
 	}
 
-	peer->tcp.out_msg.skb = skb;
+	WRITE_ONCE(peer->tcp.out_msg.skb, skb);
 	peer->tcp.out_msg.len = skb->len;
 	peer->tcp.out_msg.offset = 0;
 	ovpn_tcp_send_sock(peer, sk);
@@ -425,6 +436,8 @@ static int ovpn_tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
 	}
 
 	if (peer->tcp.out_msg.skb) {
+		/* woken up by ovpn_tcp_send_sock() once out_msg is sent */
+		set_bit(SOCK_NOSPACE, &sk->sk_socket->flags);
 		ret = -EAGAIN;
 		goto peer_free;
 	}
@@ -627,8 +640,27 @@ static __poll_t ovpn_tcp_poll(struct file *file, struct socket *sock,
 
 	mask = datagram_poll_queue(file, sock, wait, queue);
 
-	if (peer)
+	if (peer) {
+		/* sendmsg() can't queue a new message until the pending one
+		 * is sent: don't report the socket as writable meanwhile.
+		 * Whenever the socket isn't writable, flag it so that its
+		 * writers are woken up: TCP only calls the write space
+		 * callback for flagged sockets, and so does
+		 * ovpn_tcp_send_sock() once out_msg is sent. The flag is set
+		 * before checking again, so that either we see the space or
+		 * the sender sees the flag. Pairs with ovpn_tcp_send_sock().
+		 */
+		if (!(mask & EPOLLOUT) || READ_ONCE(peer->tcp.out_msg.skb)) {
+			set_bit(SOCK_NOSPACE, &sock->flags);
+			smp_mb__after_atomic();
+			if (sock_writeable(sock->sk) &&
+			    !READ_ONCE(peer->tcp.out_msg.skb))
+				mask |= EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND;
+			else
+				mask &= ~(EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND);
+		}
 		ovpn_peer_put(peer);
+	}
 
 	return mask;
 }
