@@ -42,69 +42,6 @@ ovpn_mdt_server_addr() {
 	fi
 }
 
-ovpn_mdt_link_stat() {
-	ip -n "${1}" -s -j link show dev "${2}" | jq -r ".[0].stats64.${3}"
-}
-
-ovpn_mdt_tc_pkts() {
-	local filter="[.[] | select(.pref == ${1}) |
-		       .options.actions[0].stats.packets // empty] | max // 0"
-
-	ip netns exec ovpn_peer0 tc -s -j filter show dev tun0 ingress | \
-		jq -r "${filter}"
-}
-
-# print the PEER_GET reply (one JSON object per peer) of the server
-ovpn_mdt_peer_get() {
-	local ifindex json
-
-	ifindex=$(ip -n ovpn_peer0 -j link show dev tun0 | jq '.[0].ifindex')
-	if [ -n "${1:-}" ]; then
-		json="{\"ifindex\": ${ifindex}, \"peer\": {\"id\": ${1}}}"
-		json=$(ip netns exec ovpn_peer0 "${OVPN_YNL}" --family ovpn \
-			--do peer-get --json "${json}" --output-json) || \
-			return 1
-		jq -c '.peer' <<<"${json}"
-	else
-		json="{\"ifindex\": ${ifindex}}"
-		ip netns exec ovpn_peer0 "${OVPN_YNL}" --family ovpn \
-			--dump peer-get --json "${json}" --output-json | \
-			jq -c '.[].peer'
-	fi
-}
-
-# wait for the peer-del-ntf of <id> on the server and check its reason
-ovpn_mdt_wait_del_ntf() {
-	local id="$1"
-	local reason="$2"
-	local json="${OVPN_TMP_JSONS[0]}"
-	local filter="[.[] | select(.name == \"peer-del-ntf\" and
-			.msg.peer.id == ${id})][0].msg.peer"
-	local i ntf
-
-	for i in $(seq 50); do
-		ntf=$(jq -s -c "${filter}" "${json}" 2>/dev/null || true)
-		[ -n "${ntf}" ] && [ "${ntf}" != "null" ] && break
-		sleep 0.1
-	done
-	OVPN_MDT_NTF="${ntf}"
-
-	if [ -z "${ntf}" ] || [ "${ntf}" == "null" ]; then
-		printf 'no peer-del-ntf for peer %s\n' "${id}"
-		return 1
-	fi
-	if [ "$(jq -r '.["del-reason"]' <<<"${ntf}")" != "${reason}" ]; then
-		printf 'peer %s deleted with reason %s, expected %s\n' "${id}" \
-			"$(jq -r '.["del-reason"]' <<<"${ntf}")" "${reason}"
-		return 1
-	fi
-}
-
-ovpn_mdt_count_del_ntf() {
-	jq -s "[.[] | select(.name == \"peer-del-ntf\" and
-		.msg.peer.id == ${1})] | length" "${OVPN_TMP_JSONS[0]}"
-}
-
 ovpn_mdt_setup() {
 	local p saddr
 
@@ -181,7 +118,7 @@ ovpn_mdt_setup() {
 ovpn_mdt_peer_get_all() {
 	local peers ids
 
-	peers=$(ovpn_mdt_peer_get)
+	peers=$(ovpn_peer0_get)
 	ovpn_log "${peers}"
 
 	ids=$(jq -s -c '[.[].id] | sort' <<<"${peers}")
@@ -198,7 +135,7 @@ ovpn_mdt_peer_get_all() {
 		return 1
 	fi
 
-	ovpn_mdt_peer_get 3 | jq -e '.id == 3' >/dev/null
+	ovpn_peer0_get 3 | jq -e '.id == 3' >/dev/null
 }
 
 ovpn_mdt_traffic() {
@@ -220,7 +157,7 @@ ovpn_mdt_traffic() {
 
 	# every packet from client p was tagged with tun_id p
 	for p in $(seq 1 ${OVPN_NUM_PEERS}); do
-		pkts=$(ovpn_mdt_tc_pkts ${p})
+		pkts=$(ovpn_peer0_tc_pkts ${p})
 		if [ "${pkts}" -lt 25 ]; then
 			printf 'enc_key_id %s matched %s packets, expected >= 25\n' \
 				"${p}" "${pkts}"
@@ -267,22 +204,22 @@ ovpn_mdt_client_close() {
 	ovpn_tcp_peer_expect c1 closed close
 	ovpn_tcp_peer_expect s1 eof eof 3000
 
-	ovpn_mdt_peer_get 1 | jq -e '.id == 1' >/dev/null
-	if [ "$(ovpn_mdt_count_del_ntf 1)" -ne 0 ]; then
+	ovpn_peer0_get 1 | jq -e '.id == 1' >/dev/null
+	if [ "$(ovpn_peer0_count_del_ntf 1)" -ne 0 ]; then
 		echo "peer 1 deleted by the FIN of the client"
 		return 1
 	fi
 
 	ovpn_tcp_peer_expect s1 closed close
-	ovpn_mdt_wait_del_ntf 1 transport-disconnect
-	pkts=$(jq -r '.["vpn-rx-packets"] // 0' <<<"${OVPN_MDT_NTF}")
+	ovpn_peer0_wait_del_ntf 1 transport-disconnect
+	pkts=$(jq -r '.["vpn-rx-packets"] // 0' <<<"${OVPN_DEL_NTF}")
 	if [ "${pkts}" -lt 25 ]; then
 		printf 'peer-del-ntf reported %s VPN RX packets, expected >= 25\n' \
 			"${pkts}"
 		return 1
 	fi
 
-	ovpn_cmd_fail "peer 1 is gone" ovpn_mdt_peer_get 1
+	ovpn_cmd_fail "peer 1 is gone" ovpn_peer0_get 1
 	ovpn_tcp_peer_stop c1
 	ovpn_tcp_peer_stop s1
 }
@@ -292,7 +229,7 @@ ovpn_mdt_client_close() {
 ovpn_mdt_peer_del() {
 	ovpn_cmd_ok "delete peer 2" \
 		ip netns exec ovpn_peer0 "${OVPN_CLI}" del_peer tun0 2
-	ovpn_mdt_wait_del_ntf 2 userspace
+	ovpn_peer0_wait_del_ntf 2 userspace
 
 	# the client still frames its packets, the server reads the raw
 	# stream now: one packet sent alone is read back as is
@@ -302,7 +239,7 @@ ovpn_mdt_peer_del() {
 	ovpn_tcp_peer_expect s2 closed close
 	ovpn_tcp_peer_expect c2 eof eof 3000
 	sleep 0.5
-	if [ "$(ovpn_mdt_count_del_ntf 2)" -ne 1 ]; then
+	if [ "$(ovpn_peer0_count_del_ntf 2)" -ne 1 ]; then
 		echo "closing a detached socket notified a deletion again"
 		return 1
 	fi
@@ -314,7 +251,7 @@ ovpn_mdt_peer_del() {
 ovpn_mdt_expire() {
 	ovpn_cmd_ok "set peer 3 keepalive" \
 		ip netns exec ovpn_peer0 "${OVPN_CLI}" set_peer tun0 3 1 2
-	ovpn_mdt_wait_del_ntf 3 expired
+	ovpn_peer0_wait_del_ntf 3 expired
 	ovpn_tcp_peer_stop s3
 	ovpn_tcp_peer_stop c3
 }
@@ -322,20 +259,20 @@ ovpn_mdt_expire() {
 ovpn_mdt_survivor() {
 	local before after
 
-	ovpn_mdt_peer_get_ids=$(ovpn_mdt_peer_get | jq -s -c '[.[].id]')
-	if [ "${ovpn_mdt_peer_get_ids}" != "[4]" ]; then
+	ovpn_mdt_ids=$(ovpn_peer0_get | jq -s -c '[.[].id]')
+	if [ "${ovpn_mdt_ids}" != "[4]" ]; then
 		printf 'peers left: %s, expected [4]\n' \
-			"${ovpn_mdt_peer_get_ids}"
+			"${ovpn_mdt_ids}"
 		return 1
 	fi
 
-	before=$(ovpn_mdt_link_stat ovpn_peer0 tun0 tx.dropped)
+	before=$(ovpn_link_stat ovpn_peer0 tun0 tx.dropped)
 	ip netns exec ovpn_peer4 ping -qc 5 -i 0.1 -w 5 5.5.5.1
 	ip netns exec ovpn_peer0 ping -qc 5 -i 0.1 -w 5 fd55::5
 	# routes to deleted peers drop
 	ip netns exec ovpn_peer0 ping -qc 3 -i 0.1 -W 1 5.5.5.2 \
 		>/dev/null 2>&1 && return 1
-	after=$(ovpn_mdt_link_stat ovpn_peer0 tun0 tx.dropped)
+	after=$(ovpn_link_stat ovpn_peer0 tun0 tx.dropped)
 	if [ $((after - before)) -lt 3 ]; then
 		printf 'expected >= 3 TX drops to a deleted peer, got %s\n' \
 			$((after - before))
