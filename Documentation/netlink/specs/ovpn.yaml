@@ -29,6 +29,7 @@ definitions:
       - expired
       - transport-error
       - transport-disconnect
+      - decrypt-error
   -
     type: enum
     name: key-slot

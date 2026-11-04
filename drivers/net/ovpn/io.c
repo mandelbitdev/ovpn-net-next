@@ -149,6 +149,24 @@ static void ovpn_netdev_write(struct ovpn_peer *peer, struct sk_buff *skb)
 	local_bh_enable();
 }
 
+/* A TCP stream can't recover from a packet failing to decrypt: unlike a
+ * datagram dropped by a lossy network, it is either corrupted or forged.
+ * Abort the connection, as OpenVPN does in userspace.
+ */
+static void ovpn_decrypt_error(struct ovpn_peer *peer)
+{
+	struct ovpn_socket *sock;
+	bool tcp;
+
+	rcu_read_lock();
+	sock = rcu_dereference(peer->sock);
+	tcp = sock && sock->sk->sk_protocol == IPPROTO_TCP;
+	rcu_read_unlock();
+
+	if (tcp)
+		ovpn_peer_del_deferred(peer, OVPN_DEL_PEER_REASON_DECRYPT_ERROR);
+}
+
 void ovpn_decrypt_post(void *data, int ret)
 {
 	struct ovpn_crypto_key_slot *ks;
@@ -176,8 +194,10 @@ void ovpn_decrypt_post(void *data, int ret)
 		/* not resource errors (i.e. -ENODATA, from pulling the
 		 * header): the packet is truncated or forged
 		 */
-		if (ret == -EBADMSG || ret == -EINVAL)
+		if (ret == -EBADMSG || ret == -EINVAL) {
 			atomic64_inc(&peer->rx_decrypt_errors);
+			ovpn_decrypt_error(peer);
+		}
 		goto drop;
 	}
 
