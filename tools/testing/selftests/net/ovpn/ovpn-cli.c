@@ -34,6 +34,7 @@
 
 #include <mbedtls/base64.h>
 #include <mbedtls/error.h>
+#include <mbedtls/gcm.h>
 
 #include <sys/epoll.h>
 #include <sys/socket.h>
@@ -69,6 +70,9 @@ enum ovpn_key_direction {
 #define KEY_LEN (256 / 8)
 #define NONCE_LEN 8
 
+#define OVPN_DATA_V2_OP 9
+#define OVPN_TAG_LEN 16
+
 #define PEER_ID_UNDEF 0x00FFFFFF
 #define MAX_PEERS 10
 
@@ -97,6 +101,7 @@ enum ovpn_cmd {
 	CMD_SWAP_KEYS,
 	CMD_LISTEN_MCAST,
 	CMD_TCP_PEER,
+	CMD_INJECT,
 };
 
 struct ovpn_ctx {
@@ -150,6 +155,17 @@ struct ovpn_ctx {
 	const char *tcp_addr;
 	const char *tcp_port;
 	int tcp_sndbuf;
+
+	__u32 decrypt_fail_limit;
+
+	/* inject */
+	enum {
+		INJECT_GARBAGE,
+		INJECT_KEEPALIVE,
+		INJECT_EXIT,
+	} inject_payload;
+	__u32 inject_pktid;
+	unsigned int inject_count;
 };
 
 static int ovpn_nl_recvmsgs(struct nl_ctx *ctx)
@@ -996,6 +1012,9 @@ static int ovpn_new_key(struct ovpn_ctx *ovpn)
 	NLA_PUT_U32(ctx->nl_msg, OVPN_A_KEYCONF_SLOT, ovpn->key_slot);
 	NLA_PUT_U32(ctx->nl_msg, OVPN_A_KEYCONF_KEY_ID, ovpn->key_id);
 	NLA_PUT_U32(ctx->nl_msg, OVPN_A_KEYCONF_CIPHER_ALG, ovpn->cipher);
+	if (ovpn->decrypt_fail_limit)
+		NLA_PUT_U32(ctx->nl_msg, OVPN_A_KEYCONF_DECRYPT_FAIL_LIMIT,
+			    ovpn->decrypt_fail_limit);
 
 	key_dir = nla_nest_start(ctx->nl_msg, OVPN_A_KEYCONF_ENCRYPT_DIR);
 	NLA_PUT(ctx->nl_msg, OVPN_A_KEYDIR_CIPHER_KEY, KEY_LEN, ovpn->key_enc);
@@ -1815,7 +1834,7 @@ static void usage(const char *cmd)
 		"\tpeer_id: peer ID of the peer to query. All peers are returned if omitted\n");
 
 	fprintf(stderr,
-		"* new_key <iface> <peer_id> <slot> <key_id> <cipher> <key_dir> <key_file>: set data channel key\n");
+		"* new_key <iface> <peer_id> <slot> <key_id> <cipher> <key_dir> <key_file> [fail_limit]: set data channel key\n");
 	fprintf(stderr, "\tiface: ovpn interface name\n");
 	fprintf(stderr,
 		"\tpeer_id: peer ID of the peer to configure the key for\n");
@@ -1826,6 +1845,8 @@ static void usage(const char *cmd)
 	fprintf(stderr,
 		"\tkey_dir: key direction, must 0 on one host and 1 on the other\n");
 	fprintf(stderr, "\tkey_file: file containing the pre-shared key\n");
+	fprintf(stderr,
+		"\tfail_limit: number of decryption failures after which the key is not used anymore\n");
 
 	fprintf(stderr,
 		"* del_key <iface> <peer_id> [slot]: erase existing data channel key\n");
@@ -1858,7 +1879,23 @@ static void usage(const char *cmd)
 		"\tlisten|connect: accept one connection on <addr> <port>, or connect to it\n");
 	fprintf(stderr, "\tsndbuf: SO_SNDBUF of the TCP socket\n");
 	fprintf(stderr,
-		"\tcommands: send <seq> <len> <timeout_ms>, recv <seq> <timeout_ms>, eof <timeout_ms>, close\n");
+		"\tcommands: send <seq> <len> <timeout_ms>, recv <seq> <timeout_ms>, eof <timeout_ms>, data <key_id> <peer_id> <len>, close\n");
+
+	fprintf(stderr,
+		"* inject <iface> <key_file> <key_dir> <key_id> <peer_id> <pkt_id> <garbage|keepalive|exit> <raddr> <rport> [lport] [count]: send DATA_V2 packets over UDP\n");
+	fprintf(stderr,
+		"\tiface: ovpn interface name (unused, must exist)\n");
+	fprintf(stderr,
+		"\tkey_file, key_dir: AES-GCM key used to encrypt the packets\n");
+	fprintf(stderr, "\tkey_id, peer_id: DATA_V2 header fields\n");
+	fprintf(stderr,
+		"\tpkt_id: packet ID of the first packet, incremented for each packet\n");
+	fprintf(stderr,
+		"\tgarbage|keepalive|exit: random bytes failing authentication, an encrypted keepalive or an encrypted OCC EXIT message\n");
+	fprintf(stderr,
+		"\tlport: UDP source port (SO_REUSEPORT), random if omitted\n");
+	fprintf(stderr,
+		"\tcount: number of packets, 1 if omitted. With pkt_id 0 every packet reuses the same ID (replay)\n");
 }
 
 static int ovpn_parse_remote(struct ovpn_ctx *ovpn, const char *host,
@@ -2048,6 +2085,9 @@ static enum ovpn_cmd ovpn_parse_cmd(const char *cmd)
 
 	if (!strcmp(cmd, "tcp_peer"))
 		return CMD_TCP_PEER;
+
+	if (!strcmp(cmd, "inject"))
+		return CMD_INJECT;
 
 	return CMD_INVALID;
 }
@@ -2276,6 +2316,35 @@ static void ovpn_tcp_peer_recv(int fd, long seq, int timeout_ms)
 	}
 }
 
+/* send a framed DATA_V2 packet carrying garbage, i.e. failing to decrypt
+ * with key <key_id> of peer <peer_id>
+ */
+static void ovpn_tcp_peer_data(int fd, unsigned int key_id,
+			       unsigned int peer_id, size_t len)
+{
+	uint8_t buf[2048];
+	ssize_t ret;
+
+	if (len < 8)
+		len = 8;
+	if (len > sizeof(buf) - 2)
+		len = sizeof(buf) - 2;
+
+	memset(buf, 0xa5, sizeof(buf));
+	*(uint16_t *)buf = htons(len);
+	*(uint32_t *)(buf + 2) = htonl((OVPN_DATA_V2_OP << 27) |
+				       ((key_id & 7) << 24) |
+				       (peer_id & 0xffffff));
+	/* packet ID */
+	*(uint32_t *)(buf + 6) = htonl(1);
+
+	ret = send(fd, buf, len + 2, MSG_NOSIGNAL);
+	if (ret == (ssize_t)len + 2)
+		printf("data sent\n");
+	else
+		printf("error %d\n", ret < 0 ? errno : 0);
+}
+
 static int ovpn_tcp_peer(struct ovpn_ctx *ovpn)
 {
 	struct epoll_event ev = {
@@ -2322,6 +2391,8 @@ static int ovpn_tcp_peer(struct ovpn_ctx *ovpn)
 			ovpn_tcp_peer_recv(fd, a, b);
 		} else if (!strcmp(cmd, "eof")) {
 			ovpn_tcp_peer_recv(fd, -1, a);
+		} else if (!strcmp(cmd, "data")) {
+			ovpn_tcp_peer_data(fd, a, b, c);
 		} else if (!strcmp(cmd, "close")) {
 			if (fd >= 0)
 				close(fd);
@@ -2336,6 +2407,143 @@ static int ovpn_tcp_peer(struct ovpn_ctx *ovpn)
 	if (fd >= 0)
 		close(fd);
 	close(ep);
+	return 0;
+}
+
+static const uint8_t ovpn_keepalive_msg[] = {
+	0x2a, 0x18, 0x7b, 0xf3, 0x64, 0x1e, 0xb4, 0xcb,
+	0x07, 0xed, 0x2d, 0x0a, 0x98, 0x1f, 0xc7, 0x48,
+};
+
+/* OCC magic followed by the OCC_EXIT opcode */
+static const uint8_t ovpn_occ_exit_msg[] = {
+	0x28, 0x7f, 0x34, 0x6b, 0xd4, 0xef, 0x7a, 0x81,
+	0x2d, 0x56, 0xb8, 0xd3, 0xaf, 0xc5, 0x45, 0x9c,
+	0x06,
+};
+
+/* build a DATA_V2 packet as ovpn does (AES-GCM):
+ * [op+key_id+peer_id][pkt_id][tag][ciphertext], where op..pkt_id are the
+ * AD and the nonce is pkt_id followed by the nonce tail of the key
+ */
+static int ovpn_build_data(struct ovpn_ctx *ovpn, uint32_t pktid,
+			   uint8_t *buf, size_t size)
+{
+	const uint8_t *payload = NULL;
+	mbedtls_gcm_context gcm;
+	size_t plen = 0, i;
+	uint8_t iv[12];
+	uint32_t op;
+	int ret;
+
+	switch (ovpn->inject_payload) {
+	case INJECT_KEEPALIVE:
+		payload = ovpn_keepalive_msg;
+		plen = sizeof(ovpn_keepalive_msg);
+		break;
+	case INJECT_EXIT:
+		payload = ovpn_occ_exit_msg;
+		plen = sizeof(ovpn_occ_exit_msg);
+		break;
+	case INJECT_GARBAGE:
+		plen = 64;
+		break;
+	}
+
+	if (8 + OVPN_TAG_LEN + plen > size)
+		return -1;
+
+	op = (OVPN_DATA_V2_OP << 27) | ((ovpn->key_id & 7) << 24) |
+	     (ovpn->peer_id & 0xffffff);
+	*(uint32_t *)buf = htonl(op);
+	*(uint32_t *)(buf + 4) = htonl(pktid);
+
+	if (ovpn->inject_payload == INJECT_GARBAGE) {
+		for (i = 8; i < 8 + OVPN_TAG_LEN + plen; i++)
+			buf[i] = rand();
+		return 8 + OVPN_TAG_LEN + plen;
+	}
+
+	memcpy(iv, buf + 4, 4);
+	memcpy(iv + 4, ovpn->nonce, NONCE_LEN);
+
+	mbedtls_gcm_init(&gcm);
+	ret = mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, ovpn->key_enc,
+				 KEY_LEN * 8);
+	if (!ret)
+		ret = mbedtls_gcm_crypt_and_tag(&gcm, MBEDTLS_GCM_ENCRYPT,
+						plen, iv, sizeof(iv), buf, 8,
+						payload,
+						buf + 8 + OVPN_TAG_LEN,
+						OVPN_TAG_LEN, buf + 8);
+	mbedtls_gcm_free(&gcm);
+	if (ret) {
+		fprintf(stderr, "AES-GCM encryption failed: %d\n", ret);
+		return -1;
+	}
+
+	return 8 + OVPN_TAG_LEN + plen;
+}
+
+static int ovpn_inject(struct ovpn_ctx *ovpn)
+{
+	struct sockaddr_in6 local = {
+		.sin6_family = AF_INET6,
+		.sin6_addr = IN6ADDR_ANY_INIT,
+		.sin6_port = htons(ovpn->lport),
+	};
+	struct sockaddr_storage remote;
+	socklen_t rlen;
+	uint8_t buf[256];
+	unsigned int i;
+	int s, len, opt;
+
+	/* talk IPv6 only, mapping IPv4 remotes */
+	memset(&remote, 0, sizeof(remote));
+	if (ovpn->remote.in4.sin_family == AF_INET) {
+		struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)&remote;
+
+		in6->sin6_family = AF_INET6;
+		in6->sin6_port = ovpn->remote.in4.sin_port;
+		in6->sin6_addr.s6_addr[10] = 0xff;
+		in6->sin6_addr.s6_addr[11] = 0xff;
+		memcpy(&in6->sin6_addr.s6_addr[12],
+		       &ovpn->remote.in4.sin_addr, 4);
+	} else {
+		memcpy(&remote, &ovpn->remote.in6, sizeof(ovpn->remote.in6));
+	}
+	rlen = sizeof(struct sockaddr_in6);
+
+	s = socket(AF_INET6, SOCK_DGRAM, 0);
+	if (s < 0) {
+		perror("socket");
+		return -1;
+	}
+	opt = 1;
+	setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+	setsockopt(s, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+	opt = 0;
+	setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt));
+	if (bind(s, (struct sockaddr *)&local, sizeof(local)) < 0) {
+		perror("bind");
+		close(s);
+		return -1;
+	}
+
+	for (i = 0; i < ovpn->inject_count; i++) {
+		len = ovpn_build_data(ovpn, ovpn->inject_pktid ?
+				      ovpn->inject_pktid + i : 1, buf,
+				      sizeof(buf));
+		if (len < 0 ||
+		    sendto(s, buf, len, 0, (struct sockaddr *)&remote,
+			   rlen) != len) {
+			perror("sendto");
+			close(s);
+			return -1;
+		}
+	}
+
+	close(s);
 	return 0;
 }
 
@@ -2518,6 +2726,9 @@ static int ovpn_run_cmd(struct ovpn_ctx *ovpn)
 		break;
 	case CMD_TCP_PEER:
 		ret = ovpn_tcp_peer(ovpn);
+		break;
+	case CMD_INJECT:
+		ret = ovpn_inject(ovpn);
 		break;
 	case CMD_INVALID:
 		ret = -EINVAL;
@@ -2759,6 +2970,9 @@ static int ovpn_parse_cmd_args(struct ovpn_ctx *ovpn, int argc, char *argv[])
 		ret = ovpn_parse_key(argv[8], ovpn);
 		if (ret)
 			return -1;
+
+		if (argc > 9)
+			ovpn->decrypt_fail_limit = strtoul(argv[9], NULL, 10);
 		break;
 	case CMD_DEL_KEY:
 		if (argc < 4)
@@ -2821,6 +3035,42 @@ static int ovpn_parse_cmd_args(struct ovpn_ctx *ovpn, int argc, char *argv[])
 		ovpn->tcp_port = argv[7];
 		if (argc > 8)
 			ovpn->tcp_sndbuf = strtoul(argv[8], NULL, 10);
+		break;
+	case CMD_INJECT:
+		if (argc < 11)
+			return -EINVAL;
+
+		ret = ovpn_parse_key_direction(argv[4], ovpn);
+		if (ret < 0)
+			return -1;
+		ret = ovpn_parse_key(argv[3], ovpn);
+		if (ret)
+			return -1;
+
+		ovpn->key_id = strtoul(argv[5], NULL, 10);
+		ovpn->peer_id = strtoul(argv[6], NULL, 10);
+		ovpn->inject_pktid = strtoul(argv[7], NULL, 10);
+
+		if (!strcmp(argv[8], "garbage")) {
+			ovpn->inject_payload = INJECT_GARBAGE;
+		} else if (!strcmp(argv[8], "keepalive")) {
+			ovpn->inject_payload = INJECT_KEEPALIVE;
+		} else if (!strcmp(argv[8], "exit")) {
+			ovpn->inject_payload = INJECT_EXIT;
+		} else {
+			fprintf(stderr, "Cannot parse payload: %s\n", argv[8]);
+			return -1;
+		}
+
+		ret = ovpn_parse_remote(ovpn, argv[9], argv[10], NULL);
+		if (ret < 0)
+			return -1;
+
+		if (argc > 11)
+			ovpn->lport = strtoul(argv[11], NULL, 10);
+		ovpn->inject_count = 1;
+		if (argc > 12)
+			ovpn->inject_count = strtoul(argv[12], NULL, 10);
 		break;
 	case CMD_INVALID:
 		break;
