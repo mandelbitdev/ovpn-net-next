@@ -79,7 +79,7 @@ const struct nla_policy ovpn_peer_nl_policy[OVPN_A_PEER_LINK_RX_REPLAY_ERRORS + 
 	[OVPN_A_PEER_LOCAL_PORT] = NLA_POLICY_MIN(NLA_BE16, 1),
 	[OVPN_A_PEER_KEEPALIVE_INTERVAL] = NLA_POLICY_FULL_RANGE(NLA_U32, &ovpn_a_peer_keepalive_interval_range),
 	[OVPN_A_PEER_KEEPALIVE_TIMEOUT] = NLA_POLICY_FULL_RANGE(NLA_U32, &ovpn_a_peer_keepalive_timeout_range),
-	[OVPN_A_PEER_DEL_REASON] = NLA_POLICY_MAX(NLA_U32, 5),
+	[OVPN_A_PEER_DEL_REASON] = NLA_POLICY_MAX(NLA_U32, 6),
 	[OVPN_A_PEER_VPN_RX_BYTES] = { .type = NLA_UINT, },
 	[OVPN_A_PEER_VPN_TX_BYTES] = { .type = NLA_UINT, },
 	[OVPN_A_PEER_VPN_RX_PACKETS] = { .type = NLA_UINT, },

@@ -55,6 +55,35 @@ static bool ovpn_is_keepalive(struct sk_buff *skb)
 	return !memcmp(skb->data, ovpn_keepalive_message, OVPN_KEEPALIVE_SIZE);
 }
 
+/* the OCC (options consistency check) message a peer sends over the data
+ * channel when it exits (explicit-exit-notify)
+ */
+static const unsigned char ovpn_occ_exit_message[] = {
+	0x28, 0x7f, 0x34, 0x6b, 0xd4, 0xef, 0x7a, 0x81,
+	0x2d, 0x56, 0xb8, 0xd3, 0xaf, 0xc5, 0x45, 0x9c,
+	6 /* OCC_EXIT */
+};
+
+/**
+ * ovpn_is_occ_exit - check if skb contains an OCC exit message
+ * @skb: packet to check
+ *
+ * Assumes that the first byte of skb->data is defined.
+ *
+ * Return: true if skb starts with an OCC exit message or false otherwise
+ */
+static bool ovpn_is_occ_exit(struct sk_buff *skb)
+{
+	if (*skb->data != ovpn_occ_exit_message[0])
+		return false;
+
+	if (!pskb_may_pull(skb, sizeof(ovpn_occ_exit_message)))
+		return false;
+
+	return !memcmp(skb->data, ovpn_occ_exit_message,
+		       sizeof(ovpn_occ_exit_message));
+}
+
 /**
  * ovpn_rx_tun_dst - allocate RX tunnel metadata identifying the peer
  * @peer: the peer the packet was received from
@@ -256,6 +285,18 @@ void ovpn_decrypt_post(void *data, int ret)
 					    netdev_name(peer->ovpn->dev),
 					    peer->id);
 			/* we drop the packet, but this is not a failure */
+			consume_skb(skb);
+			goto drop_nocount;
+		}
+
+		/* the peer is going away: delete it now rather than when
+		 * its keepalive expires
+		 */
+		if (ovpn_is_occ_exit(skb)) {
+			net_dbg_ratelimited("%s: exit notification received from peer %u\n",
+					    netdev_name(peer->ovpn->dev),
+					    peer->id);
+			ovpn_peer_del_deferred(peer, OVPN_DEL_PEER_REASON_EXIT);
 			consume_skb(skb);
 			goto drop_nocount;
 		}

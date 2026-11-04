@@ -30,6 +30,7 @@ definitions:
       - transport-error
       - transport-disconnect
       - decrypt-error
+      - exit
   -
     type: enum
     name: key-slot
