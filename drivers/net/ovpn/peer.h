@@ -94,6 +94,10 @@ struct ovpn_peer {
 		struct sk_buff_head user_queue;
 		struct sk_buff_head out_queue;
 		bool tx_in_progress;
+		/* jiffies when a userspace message found out_msg busy, 0 if
+		 * none is waiting
+		 */
+		unsigned long user_wait;
 
 		struct {
 			struct sk_buff *skb;

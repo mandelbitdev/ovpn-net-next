@@ -348,10 +348,34 @@ static void ovpn_tcp_send_sock_skb(struct ovpn_peer *peer, struct sock *sk,
 	ovpn_tcp_send_sock(peer, sk);
 }
 
+/* Control messages from userspace (i.e. renegotiations) must not starve
+ * behind a stream of data packets, which would grab out_msg as soon as it
+ * is free: while a userspace message waits, data packets are dropped, for
+ * a second at most, should the writer give up.
+ */
+static bool ovpn_tcp_user_waits(struct ovpn_peer *peer)
+{
+	unsigned long since = READ_ONCE(peer->tcp.user_wait);
+
+	if (!since)
+		return false;
+	if (time_before(jiffies, since + HZ))
+		return true;
+	/* unless a new wait started meanwhile */
+	cmpxchg(&peer->tcp.user_wait, since, 0);
+	return false;
+}
+
 void ovpn_tcp_send_skb(struct ovpn_peer *peer, struct sock *sk,
 		       struct sk_buff *skb)
 {
 	u16 len = skb->len;
+
+	if (unlikely(ovpn_tcp_user_waits(peer))) {
+		ovpn_dev_dstats_tx_dropped(peer->ovpn->dev);
+		kfree_skb(skb);
+		return;
+	}
 
 	*(__be16 *)__skb_push(skb, sizeof(u16)) = htons(len);
 
@@ -399,8 +423,15 @@ static void ovpn_tcp_release(struct sock *sk)
 	__skb_queue_head_init(&queue);
 	skb_queue_splice_init(&peer->tcp.out_queue, &queue);
 
-	while ((skb = __skb_dequeue(&queue)))
+	while ((skb = __skb_dequeue(&queue))) {
+		/* data packets queued while the socket was owned */
+		if (unlikely(ovpn_tcp_user_waits(peer))) {
+			ovpn_dev_dstats_tx_dropped(peer->ovpn->dev);
+			kfree_skb(skb);
+			continue;
+		}
 		ovpn_tcp_send_sock_skb(peer, sk, skb);
+	}
 
 	peer->tcp.sk_cb.prot->release_cb(sk);
 	ovpn_peer_put(peer);
@@ -430,11 +461,16 @@ static int ovpn_tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
 	}
 
 	if (peer->tcp.out_msg.skb) {
-		/* woken up by ovpn_tcp_send_sock() once out_msg is sent */
+		/* woken up by ovpn_tcp_send_sock() once out_msg is sent; the
+		 * data path leaves out_msg to us meanwhile
+		 */
+		if (!READ_ONCE(peer->tcp.user_wait))
+			WRITE_ONCE(peer->tcp.user_wait, jiffies | 1);
 		set_bit(SOCK_NOSPACE, &sk->sk_socket->flags);
 		ret = -EAGAIN;
 		goto peer_free;
 	}
+	WRITE_ONCE(peer->tcp.user_wait, 0);
 
 	if (size < linear)
 		linear = size;
