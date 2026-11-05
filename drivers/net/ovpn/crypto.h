@@ -41,6 +41,7 @@ struct ovpn_crypto_key_slot {
 	u8 key_id;
 	/* whether the encrypt transform is asynchronous */
 	bool async;
+	bool decrypt_sync;
 
 	struct crypto_aead *encrypt;
 	struct crypto_aead *decrypt;
