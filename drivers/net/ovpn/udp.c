@@ -35,9 +35,6 @@
 /* like UDP and TCP frag-list GRO */
 #define OVPN_UDP_GRO_CNT_MAX 64
 
-/* leave enough work between a cache hint and the record which consumes it */
-#define OVPN_UDP_GRO_PREFETCH_DISTANCE 2
-
 static void ovpn_udp_prefetchw_linear(const struct sk_buff *skb)
 {
 	unsigned long addr = (unsigned long)skb->data;
@@ -93,6 +90,11 @@ static struct sk_buff *ovpn_udp_gro_receive_fraglist(struct sock *sk,
 	 */
 	NAPI_GRO_CB(skb)->encap_mark = 0;
 	NAPI_GRO_CB(skb)->is_flist = 1;
+
+	/* the record is decrypted only after its aggregate is delivered: start
+	 * fetching its linear data now, one record at a time
+	 */
+	ovpn_udp_prefetchw_linear(skb);
 
 	list_for_each_entry(p, head, list) {
 		if (!NAPI_GRO_CB(p)->same_flow)
@@ -249,7 +251,7 @@ out:
 
 static void ovpn_udp_recv(struct ovpn_peer *peer, struct sk_buff *list)
 {
-	struct sk_buff *skb, *next, *prefetch;
+	struct sk_buff *skb, *next;
 	const __be16 proto = list->protocol;
 	const u32 priority = list->priority;
 #ifdef CONFIG_NET_SCHED
@@ -260,7 +262,6 @@ static void ovpn_udp_recv(struct ovpn_peer *peer, struct sk_buff *list)
 #endif
 	const int skb_iif = list->skb_iif;
 	unsigned int n = 0, len = 0;
-	int i;
 
 	/* account the link stats of the whole list at once, and give each
 	 * further record its own peer reference: the caller's covers the
@@ -279,21 +280,7 @@ static void ovpn_udp_recv(struct ovpn_peer *peer, struct sk_buff *list)
 	 */
 	ovpn_rx_batch_begin(peer);
 
-	/* a fraglist GRO aggregate makes later ciphertext visible before the
-	 * current record is decrypted, so we prime the first two records, then
-	 * keep the cache hints the same distance ahead while draining the list
-	 */
-	prefetch = list->next ? list : NULL;
-	for (i = 0; i < OVPN_UDP_GRO_PREFETCH_DISTANCE && prefetch; i++) {
-		ovpn_udp_prefetchw_linear(prefetch);
-		prefetch = prefetch->next;
-	}
-
 	skb_list_walk_safe(list, skb, next) {
-		if (prefetch) {
-			ovpn_udp_prefetchw_linear(prefetch);
-			prefetch = prefetch->next;
-		}
 		/* propagate post-GRO metadata from the list head, and clear
 		 * the state which the receive stack consumed on the head only
 		 */
