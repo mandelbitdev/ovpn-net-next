@@ -136,17 +136,13 @@ static struct scatterlist *ovpn_aead_crypto_req_sg(struct crypto_aead *aead,
 
 static struct aead_request *ovpn_aead_request_alloc(struct crypto_aead *aead,
 						    struct sk_buff *skb,
-						    unsigned int nents,
-						    unsigned int extra, u8 **iv)
+						    unsigned int nents, u8 **iv)
 {
 	struct aead_request *req;
 	void *tmp;
 
-	/* allocate IV, request, scatterlist entries and caller scratch space
-	 * in one block
-	 */
-	tmp = kmalloc(ovpn_aead_crypto_tmp_size(aead, nents) + extra,
-		      GFP_ATOMIC);
+	/* allocate IV, request and scatterlist entries in one block */
+	tmp = kmalloc(ovpn_aead_crypto_tmp_size(aead, nents), GFP_ATOMIC);
 	if (unlikely(!tmp))
 		return ERR_PTR(-ENOMEM);
 
@@ -198,86 +194,108 @@ static bool ovpn_aead_encrypt_header_direct(struct ovpn_peer *peer,
 	return true;
 }
 
-int ovpn_aead_encrypt_gso(struct ovpn_peer *peer,
+int ovpn_aead_gso_ctx_init(struct ovpn_aead_gso_ctx *ctx,
+			   struct ovpn_crypto_key_slot *ks,
+			   struct sk_buff *gso_skb)
+{
+	const unsigned int dst_nents = skb_shinfo(gso_skb)->nr_frags + 4;
+	const unsigned int src_nents = MAX_SKB_FRAGS + 2;
+	unsigned int tmp_size;
+
+	tmp_size = ovpn_aead_crypto_tmp_size(ks->encrypt,
+					     src_nents + dst_nents);
+	tmp_size += OVPN_AAD_SIZE;
+	ctx->tmp = kmalloc(tmp_size, GFP_ATOMIC);
+	if (unlikely(!ctx->tmp))
+		return -ENOMEM;
+
+	ctx->dst_nents = dst_nents;
+	ctx->iv = ovpn_aead_crypto_tmp_iv(ks->encrypt, ctx->tmp);
+	ctx->req = ovpn_aead_crypto_tmp_req(ks->encrypt, ctx->iv);
+	ctx->src = ovpn_aead_crypto_req_sg(ks->encrypt, ctx->req);
+	ctx->dst = ctx->src + src_nents;
+	ctx->aad = (u8 *)(ctx->dst + dst_nents);
+	aead_request_set_tfm(ctx->req, ks->encrypt);
+	aead_request_set_callback(ctx->req, 0, NULL, NULL);
+	aead_request_set_ad(ctx->req, OVPN_AAD_SIZE);
+
+	return 0;
+}
+
+void ovpn_aead_gso_ctx_free(struct ovpn_aead_gso_ctx *ctx)
+{
+	kfree(ctx->tmp);
+}
+
+int ovpn_aead_encrypt_gso(struct ovpn_aead_gso_ctx *ctx, struct ovpn_peer *peer,
 			  struct ovpn_crypto_key_slot *ks, struct sk_buff *skb,
 			  struct sk_buff *gso_skb, unsigned int offset,
 			  u32 pktid)
 {
-	const unsigned int dst_nents = skb_shinfo(gso_skb)->nr_frags + 4;
-	const unsigned int src_nents = skb_shinfo(skb)->nr_frags + 2;
-	struct scatterlist *src, *dst;
-	struct aead_request *req;
 	unsigned int payload_off;
 	int dst_idx, mapped, ret;
 	bool direct_aad;
-	u8 *aad, *iv;
-
-	req = ovpn_aead_request_alloc(ks->encrypt, skb, src_nents + dst_nents,
-				      OVPN_AAD_SIZE, &iv);
-	if (IS_ERR(req))
-		return PTR_ERR(req);
-	src = ovpn_aead_crypto_req_sg(ks->encrypt, req);
-	dst = src + src_nents;
-	aad = (u8 *)(dst + dst_nents);
 
 	/* encrypt out of place from the original segmented skb directly into
 	 * its final range in the UDP GSO skb
 	 */
-	sg_init_table(src, src_nents);
+	sg_init_table(ctx->src, skb_shinfo(skb)->nr_frags + 2);
 	/* use the final output bytes as source AAD too when they can be safely
 	 * written through one base-page mapping
 	 */
-	mapped = skb_to_sgvec_nomark(gso_skb, src, offset, OVPN_AAD_SIZE);
+	mapped = skb_to_sgvec_nomark(gso_skb, ctx->src, offset,
+				     OVPN_AAD_SIZE);
 	if (unlikely(mapped < 0))
 		return mapped;
 	direct_aad = mapped == 1 &&
-		     ovpn_aead_encrypt_header_direct(peer, ks, pktid, iv, src);
+		     ovpn_aead_encrypt_header_direct(peer, ks, pktid, ctx->iv,
+						     ctx->src);
 	if (unlikely(!direct_aad)) {
-		ovpn_aead_encrypt_header(peer, ks, pktid, iv, aad);
-		ret = skb_store_bits(gso_skb, offset, aad, OVPN_AAD_SIZE);
+		ovpn_aead_encrypt_header(peer, ks, pktid, ctx->iv, ctx->aad);
+		ret = skb_store_bits(gso_skb, offset, ctx->aad,
+				     OVPN_AAD_SIZE);
 		if (unlikely(ret < 0))
 			return ret;
-		sg_set_buf(src, aad, OVPN_AAD_SIZE);
+		sg_set_buf(ctx->src, ctx->aad, OVPN_AAD_SIZE);
 	}
 
-	mapped = skb_to_sgvec_nomark(skb, src + 1, 0, skb->len);
+	mapped = skb_to_sgvec_nomark(skb, ctx->src + 1, 0, skb->len);
 	if (unlikely(mapped < 0))
 		return mapped;
-	sg_mark_end(&src[mapped]);
+	sg_mark_end(&ctx->src[mapped]);
 
-	sg_init_table(dst, dst_nents);
+	sg_init_table(ctx->dst, ctx->dst_nents);
 	if (likely(direct_aad)) {
 		/* destination AAD is not written and may alias source AAD */
-		sg_set_page(dst, sg_page(src), src->length, src->offset);
+		sg_set_page(ctx->dst, sg_page(ctx->src), ctx->src->length,
+			    ctx->src->offset);
 		dst_idx = 1;
 	} else {
-		dst_idx = skb_to_sgvec_nomark(gso_skb, dst, offset,
+		dst_idx = skb_to_sgvec_nomark(gso_skb, ctx->dst, offset,
 					      OVPN_AAD_SIZE);
 		if (unlikely(dst_idx < 0))
 			return dst_idx;
 	}
 
 	payload_off = offset + OVPN_AAD_SIZE + OVPN_AUTH_TAG_SIZE;
-	mapped = skb_to_sgvec_nomark(gso_skb, dst + dst_idx, payload_off,
-				     skb->len);
+	mapped = skb_to_sgvec_nomark(gso_skb, ctx->dst + dst_idx,
+				     payload_off, skb->len);
 	if (unlikely(mapped < 0))
 		return mapped;
 	dst_idx += mapped;
 
-	mapped = skb_to_sgvec_nomark(gso_skb, dst + dst_idx,
+	mapped = skb_to_sgvec_nomark(gso_skb, ctx->dst + dst_idx,
 				     offset + OVPN_AAD_SIZE,
 				     OVPN_AUTH_TAG_SIZE);
 	if (unlikely(mapped < 0))
 		return mapped;
 	dst_idx += mapped;
-	sg_mark_end(&dst[dst_idx - 1]);
+	sg_mark_end(&ctx->dst[dst_idx - 1]);
 
-	aead_request_set_tfm(req, ks->encrypt);
-	aead_request_set_callback(req, 0, NULL, NULL);
-	aead_request_set_crypt(req, src, dst, skb->len, iv);
-	aead_request_set_ad(req, OVPN_AAD_SIZE);
+	aead_request_set_crypt(ctx->req, ctx->src, ctx->dst, skb->len,
+			       ctx->iv);
 
-	return crypto_aead_encrypt(req);
+	return crypto_aead_encrypt(ctx->req);
 }
 
 int ovpn_aead_encrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
@@ -319,7 +337,7 @@ int ovpn_aead_encrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 		nfrags = 1;
 	}
 
-	req = ovpn_aead_request_alloc(ks->encrypt, skb, nfrags + 2, 0, &iv);
+	req = ovpn_aead_request_alloc(ks->encrypt, skb, nfrags + 2, &iv);
 	if (IS_ERR(req))
 		return PTR_ERR(req);
 	sg = ovpn_aead_crypto_req_sg(ks->encrypt, req);

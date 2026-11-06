@@ -376,9 +376,13 @@ static bool ovpn_encrypt_gso_queue(struct sk_buff_head *skbs,
 				   unsigned int segments)
 {
 	unsigned int offset = 0, moved = 0, i, len;
+	struct ovpn_aead_gso_ctx ctx = { };
 	struct sk_buff *skb;
 	u32 first_pktid;
 	int ret;
+
+	if (unlikely(ovpn_aead_gso_ctx_init(&ctx, ks, batch)))
+		goto err;
 
 	/* reserve the complete range before dequeuing any input skb so that a
 	 * failure leaves the ordinary transmit path available as a fallback
@@ -386,19 +390,15 @@ static bool ovpn_encrypt_gso_queue(struct sk_buff_head *skbs,
 	if (unlikely(ovpn_pktid_xmit_range(&ks->pid_xmit, segments,
 					   &first_pktid))) {
 		ovpn_encrypt_key_exhausted(peer, ks);
-		ovpn_crypto_key_slot_put(ks);
-		ovpn_peer_put(peer);
-		return false;
+		goto err;
 	}
 
 	for (i = 0; i < segments; i++) {
 		skb = __skb_dequeue(skbs);
 		len = skb->len + OVPN_DATA_V2_OVERHEAD;
 
-		memset(ovpn_skb_cb(skb), 0, sizeof(struct ovpn_cb));
-		ret = ovpn_aead_encrypt_gso(peer, ks, skb, batch, offset,
+		ret = ovpn_aead_encrypt_gso(&ctx, peer, ks, skb, batch, offset,
 					    first_pktid + i);
-		kfree(ovpn_skb_cb(skb)->crypto_tmp);
 		if (unlikely(ret < 0)) {
 			DEBUG_NET_WARN_ON_ONCE(ret == -EINPROGRESS ||
 					       ret == -EBUSY);
@@ -437,9 +437,11 @@ static bool ovpn_encrypt_gso_queue(struct sk_buff_head *skbs,
 	if (unlikely(i < segments))
 		goto err;
 
+	ovpn_aead_gso_ctx_free(&ctx);
 	ovpn_encrypt_send(peer, ks, batch, segments);
 	return true;
 err:
+	ovpn_aead_gso_ctx_free(&ctx);
 	ovpn_crypto_key_slot_put(ks);
 	ovpn_peer_put(peer);
 	return false;

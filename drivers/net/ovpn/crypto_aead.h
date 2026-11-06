@@ -15,12 +15,29 @@
 #include <asm/types.h>
 #include <linux/skbuff.h>
 
+struct aead_request;
+struct scatterlist;
+
+struct ovpn_aead_gso_ctx {
+	struct aead_request *req;
+	struct scatterlist *src;
+	struct scatterlist *dst;
+	void *tmp;
+	u8 *iv;
+	u8 *aad;
+	unsigned int dst_nents;
+};
+
 int ovpn_aead_encrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 		      struct sk_buff *skb);
-int ovpn_aead_encrypt_gso(struct ovpn_peer *peer,
-			  struct ovpn_crypto_key_slot *ks,
-			  struct sk_buff *skb, struct sk_buff *gso_skb,
-			  unsigned int offset, u32 pktid);
+int ovpn_aead_gso_ctx_init(struct ovpn_aead_gso_ctx *ctx,
+			   struct ovpn_crypto_key_slot *ks,
+			   struct sk_buff *gso_skb);
+void ovpn_aead_gso_ctx_free(struct ovpn_aead_gso_ctx *ctx);
+int ovpn_aead_encrypt_gso(struct ovpn_aead_gso_ctx *ctx, struct ovpn_peer *peer,
+			  struct ovpn_crypto_key_slot *ks, struct sk_buff *skb,
+			  struct sk_buff *gso_skb, unsigned int offset,
+			  u32 pktid);
 int ovpn_aead_decrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 		      struct sk_buff *skb);
 
