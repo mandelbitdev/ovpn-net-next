@@ -462,6 +462,7 @@ ovpn_aead_crypto_key_slot_new(const struct ovpn_key_config *kc)
 		ks->encrypt = NULL;
 		goto destroy_ks;
 	}
+	ks->async = crypto_tfm_is_async(crypto_aead_tfm(ks->encrypt));
 
 	ks->decrypt = ovpn_aead_init("decrypt", alg_name,
 				     kc->decrypt.cipher_key,
