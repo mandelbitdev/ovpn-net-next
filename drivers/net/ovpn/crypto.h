@@ -45,6 +45,7 @@ struct ovpn_crypto_key_slot {
 	bool async;
 	bool decrypt_sync;
 	struct ovpn_gcm_key *gcm_dec;	/* TEST */
+	struct ovpn_gcm_key *gcm_enc;	/* TEST */
 
 	struct crypto_aead *encrypt;
 	struct crypto_aead *decrypt;
