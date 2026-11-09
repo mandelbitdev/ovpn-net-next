@@ -481,6 +481,7 @@ static struct sk_buff *__udp_gso_segment_list(struct sk_buff *skb,
 struct sk_buff *__udp_gso_segment(struct sk_buff *gso_skb,
 				  netdev_features_t features, bool is_ipv6)
 {
+	void (*destructor)(struct sk_buff *skb) = gso_skb->destructor;
 	struct sock *sk = gso_skb->sk;
 	unsigned int sum_truesize = 0;
 	struct sk_buff *segs, *seg;
@@ -542,7 +543,7 @@ struct sk_buff *__udp_gso_segment(struct sk_buff *gso_skb,
 	skb_pull(gso_skb, sizeof(*uh));
 
 	/* clear destructor to avoid skb_segment assigning it to tail */
-	copy_dtor = gso_skb->destructor == sock_wfree;
+	copy_dtor = is_skb_wmem(gso_skb);
 	if (copy_dtor) {
 		gso_skb->destructor = NULL;
 		gso_skb->sk = NULL;
@@ -551,7 +552,7 @@ struct sk_buff *__udp_gso_segment(struct sk_buff *gso_skb,
 	segs = skb_segment(gso_skb, features);
 	if (IS_ERR_OR_NULL(segs)) {
 		if (copy_dtor) {
-			gso_skb->destructor = sock_wfree;
+			gso_skb->destructor = destructor;
 			gso_skb->sk = sk;
 		}
 		return segs;
@@ -571,7 +572,7 @@ struct sk_buff *__udp_gso_segment(struct sk_buff *gso_skb,
 
 	for (;;) {
 		if (copy_dtor) {
-			seg->destructor = sock_wfree;
+			seg->destructor = destructor;
 			seg->sk = sk;
 			sum_truesize += seg->truesize;
 		}
