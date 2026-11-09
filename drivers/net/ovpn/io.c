@@ -377,20 +377,31 @@ static bool ovpn_encrypt_gso_queue(struct sk_buff_head *skbs,
 {
 	unsigned int offset = 0, moved = 0, i, len;
 	struct sk_buff *skb;
+	u32 first_pktid;
 	int ret;
+
+	/* reserve the complete range before dequeuing any input skb so that a
+	 * failure leaves the ordinary transmit path available as a fallback
+	 */
+	if (unlikely(ovpn_pktid_xmit_range(&ks->pid_xmit, segments,
+					   &first_pktid))) {
+		ovpn_encrypt_key_exhausted(peer, ks);
+		ovpn_crypto_key_slot_put(ks);
+		ovpn_peer_put(peer);
+		return false;
+	}
 
 	for (i = 0; i < segments; i++) {
 		skb = __skb_dequeue(skbs);
 		len = skb->len + OVPN_DATA_V2_OVERHEAD;
 
 		memset(ovpn_skb_cb(skb), 0, sizeof(struct ovpn_cb));
-		ret = ovpn_aead_encrypt_gso(peer, ks, skb, batch, offset);
+		ret = ovpn_aead_encrypt_gso(peer, ks, skb, batch, offset,
+					    first_pktid + i);
 		kfree(ovpn_skb_cb(skb)->crypto_tmp);
 		if (unlikely(ret < 0)) {
 			DEBUG_NET_WARN_ON_ONCE(ret == -EINPROGRESS ||
 					       ret == -EBUSY);
-			if (ret == -ERANGE)
-				ovpn_encrypt_key_exhausted(peer, ks);
 			ovpn_dev_dstats_tx_dropped(peer->ovpn->dev, i + 1);
 			kfree_skb(skb);
 			break;
