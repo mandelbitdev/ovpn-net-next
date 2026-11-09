@@ -8,7 +8,9 @@
  */
 
 #include <crypto/aead.h>
+#include <linux/highmem.h>
 #include <linux/skbuff.h>
+#include <linux/unaligned.h>
 #include <linux/workqueue.h>
 #include <net/ip.h>
 #include <net/ipv6.h>
@@ -169,8 +171,31 @@ static void ovpn_aead_encrypt_header(struct ovpn_peer *peer,
 	/* add the packet opcode and wire nonce as associated data */
 	op = ovpn_opcode_compose(OVPN_DATA_V2, ks->key_id, peer->tx_id);
 	BUILD_BUG_ON(sizeof(op) != OVPN_OPCODE_SIZE);
-	*(__force __be32 *)data = htonl(op);
+	put_unaligned_be32(op, data);
 	memcpy(data + OVPN_OPCODE_SIZE, iv, OVPN_NONCE_WIRE_SIZE);
+}
+
+static bool ovpn_aead_encrypt_header_direct(struct ovpn_peer *peer,
+					    struct ovpn_crypto_key_slot *ks,
+					    u32 pktid, u8 *iv,
+					    struct scatterlist *sg)
+{
+	unsigned int offset, page_offset;
+	struct page *page;
+	void *addr;
+
+	offset = sg->offset;
+	page_offset = offset_in_page(offset);
+	if (page_offset + OVPN_AAD_SIZE > PAGE_SIZE)
+		return false;
+
+	/* an SG offset can address a later base page in a compound page */
+	page = sg_page(sg) + (offset >> PAGE_SHIFT);
+	addr = kmap_local_page(page);
+	ovpn_aead_encrypt_header(peer, ks, pktid, iv, addr + page_offset);
+	kunmap_local(addr);
+
+	return true;
 }
 
 int ovpn_aead_encrypt_gso(struct ovpn_peer *peer,
@@ -184,6 +209,7 @@ int ovpn_aead_encrypt_gso(struct ovpn_peer *peer,
 	struct aead_request *req;
 	unsigned int payload_off;
 	int dst_idx, mapped, ret;
+	bool direct_aad;
 	u8 *aad, *iv;
 
 	req = ovpn_aead_request_alloc(ks->encrypt, skb, src_nents + dst_nents,
@@ -194,26 +220,42 @@ int ovpn_aead_encrypt_gso(struct ovpn_peer *peer,
 	dst = src + src_nents;
 	aad = (u8 *)(dst + dst_nents);
 
-	ovpn_aead_encrypt_header(peer, ks, pktid, iv, aad);
-
-	ret = skb_store_bits(gso_skb, offset, aad, OVPN_AAD_SIZE);
-	if (unlikely(ret < 0))
-		return ret;
-
 	/* encrypt out of place from the original segmented skb directly into
 	 * its final range in the UDP GSO skb
 	 */
 	sg_init_table(src, src_nents);
-	sg_set_buf(src, aad, OVPN_AAD_SIZE);
+	/* use the final output bytes as source AAD too when they can be safely
+	 * written through one base-page mapping
+	 */
+	mapped = skb_to_sgvec_nomark(gso_skb, src, offset, OVPN_AAD_SIZE);
+	if (unlikely(mapped < 0))
+		return mapped;
+	direct_aad = mapped == 1 &&
+		     ovpn_aead_encrypt_header_direct(peer, ks, pktid, iv, src);
+	if (unlikely(!direct_aad)) {
+		ovpn_aead_encrypt_header(peer, ks, pktid, iv, aad);
+		ret = skb_store_bits(gso_skb, offset, aad, OVPN_AAD_SIZE);
+		if (unlikely(ret < 0))
+			return ret;
+		sg_set_buf(src, aad, OVPN_AAD_SIZE);
+	}
+
 	mapped = skb_to_sgvec_nomark(skb, src + 1, 0, skb->len);
 	if (unlikely(mapped < 0))
 		return mapped;
 	sg_mark_end(&src[mapped]);
 
 	sg_init_table(dst, dst_nents);
-	dst_idx = skb_to_sgvec_nomark(gso_skb, dst, offset, OVPN_AAD_SIZE);
-	if (unlikely(dst_idx < 0))
-		return dst_idx;
+	if (likely(direct_aad)) {
+		/* destination AAD is not written and may alias source AAD */
+		sg_set_page(dst, sg_page(src), src->length, src->offset);
+		dst_idx = 1;
+	} else {
+		dst_idx = skb_to_sgvec_nomark(gso_skb, dst, offset,
+					      OVPN_AAD_SIZE);
+		if (unlikely(dst_idx < 0))
+			return dst_idx;
+	}
 
 	payload_off = offset + OVPN_AAD_SIZE + OVPN_AUTH_TAG_SIZE;
 	mapped = skb_to_sgvec_nomark(gso_skb, dst + dst_idx, payload_off,
