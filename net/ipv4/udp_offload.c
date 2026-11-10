@@ -966,6 +966,14 @@ INDIRECT_CALLABLE_SCOPE int udp4_gro_complete(struct sk_buff *skb, int nhoff)
 		skb_shinfo(skb)->gso_type |= (SKB_GSO_FRAGLIST|SKB_GSO_UDP_L4);
 		skb_shinfo(skb)->gso_segs = NAPI_GRO_CB(skb)->count;
 
+		/* GRO validated every datagram, but a CHECKSUM_COMPLETE value
+		 * covers only the first one: keep the verdict instead, as for
+		 * a device which validated the checksums itself
+		 */
+		if (skb->ip_summed == CHECKSUM_COMPLETE) {
+			skb->ip_summed = CHECKSUM_UNNECESSARY;
+			skb->csum_level = 0;
+		}
 		__skb_incr_checksum_unnecessary(skb);
 
 		return 0;
