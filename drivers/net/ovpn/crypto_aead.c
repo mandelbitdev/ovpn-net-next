@@ -167,11 +167,14 @@ static void ovpn_aead_encrypt_header(struct ovpn_peer *peer,
 	 */
 	ovpn_pktid_aead_write(pktid, ks->nonce_tail_xmit, iv);
 
-	/* add the packet opcode and wire nonce as associated data */
+	/* add the packet opcode and wire nonce (the packet ID) as associated
+	 * data, with one store so that the 8-byte loads that follow (the copy
+	 * into the UDP GSO aggregate, the AEAD) can be forwarded from it
+	 */
 	op = ovpn_opcode_compose(OVPN_DATA_V2, ks->key_id, peer->tx_id);
 	BUILD_BUG_ON(sizeof(op) != OVPN_OPCODE_SIZE);
-	put_unaligned_be32(op, data);
-	memcpy(data + OVPN_OPCODE_SIZE, iv, OVPN_NONCE_WIRE_SIZE);
+	BUILD_BUG_ON(OVPN_OPCODE_SIZE + OVPN_NONCE_WIRE_SIZE != sizeof(u64));
+	put_unaligned_be64((u64)op << 32 | pktid, data);
 }
 
 static bool ovpn_aead_encrypt_header_direct(struct ovpn_peer *peer,
