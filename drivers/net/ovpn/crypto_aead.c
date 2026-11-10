@@ -292,19 +292,24 @@ void ovpn_aead_gso_ctx_free(struct ovpn_aead_gso_ctx *ctx)
 	kfree(ctx->tmp);
 }
 
-int ovpn_aead_encrypt_gso(struct ovpn_aead_gso_ctx *ctx, struct ovpn_peer *peer,
-			  struct ovpn_crypto_key_slot *ks, struct sk_buff *skb,
-			  struct sk_buff *gso_skb, unsigned int offset,
-			  u32 pktid)
+/* encrypt the @len bytes of a segment, from @skb or else from @buf, to
+ * @offset of @gso_skb
+ */
+static int __ovpn_aead_encrypt_gso(struct ovpn_aead_gso_ctx *ctx,
+				   struct ovpn_peer *peer,
+				   struct ovpn_crypto_key_slot *ks,
+				   struct sk_buff *skb, const u8 *buf,
+				   unsigned int len, struct sk_buff *gso_skb,
+				   unsigned int offset, u32 pktid)
 {
 	unsigned int payload_off;
 	int dst_idx, mapped, ret;
 	bool direct_aad;
 
-	/* encrypt out of place from the original segmented skb directly into
-	 * its final range in the UDP GSO skb
+	/* encrypt out of place from the original segment directly into its
+	 * final range in the UDP GSO skb
 	 */
-	sg_init_table(ctx->src, skb_shinfo(skb)->nr_frags + 2);
+	sg_init_table(ctx->src, (skb ? skb_shinfo(skb)->nr_frags : 0) + 2);
 	/* use the final output bytes as source AAD too when they can be safely
 	 * written through one base-page mapping
 	 */
@@ -324,9 +329,14 @@ int ovpn_aead_encrypt_gso(struct ovpn_aead_gso_ctx *ctx, struct ovpn_peer *peer,
 		sg_set_buf(ctx->src, ctx->aad, OVPN_AAD_SIZE);
 	}
 
-	mapped = skb_to_sgvec_nomark(skb, ctx->src + 1, 0, skb->len);
-	if (unlikely(mapped < 0))
-		return mapped;
+	if (skb) {
+		mapped = skb_to_sgvec_nomark(skb, ctx->src + 1, 0, len);
+		if (unlikely(mapped < 0))
+			return mapped;
+	} else {
+		sg_set_buf(ctx->src + 1, buf, len);
+		mapped = 1;
+	}
 	sg_mark_end(&ctx->src[mapped]);
 
 	sg_init_table(ctx->dst, ctx->dst_nents);
@@ -344,7 +354,7 @@ int ovpn_aead_encrypt_gso(struct ovpn_aead_gso_ctx *ctx, struct ovpn_peer *peer,
 
 	payload_off = offset + OVPN_AAD_SIZE + OVPN_AUTH_TAG_SIZE;
 	mapped = skb_to_sgvec_nomark(gso_skb, ctx->dst + dst_idx,
-				     payload_off, skb->len);
+				     payload_off, len);
 	if (unlikely(mapped < 0))
 		return mapped;
 	dst_idx += mapped;
@@ -357,10 +367,29 @@ int ovpn_aead_encrypt_gso(struct ovpn_aead_gso_ctx *ctx, struct ovpn_peer *peer,
 	dst_idx += mapped;
 	sg_mark_end(&ctx->dst[dst_idx - 1]);
 
-	aead_request_set_crypt(ctx->req, ctx->src, ctx->dst, skb->len,
-			       ctx->iv);
+	aead_request_set_crypt(ctx->req, ctx->src, ctx->dst, len, ctx->iv);
 
 	return crypto_aead_encrypt(ctx->req);
+}
+
+int ovpn_aead_encrypt_gso(struct ovpn_aead_gso_ctx *ctx, struct ovpn_peer *peer,
+			  struct ovpn_crypto_key_slot *ks, struct sk_buff *skb,
+			  struct sk_buff *gso_skb, unsigned int offset,
+			  u32 pktid)
+{
+	return __ovpn_aead_encrypt_gso(ctx, peer, ks, skb, NULL, skb->len,
+				       gso_skb, offset, pktid);
+}
+
+/* as ovpn_aead_encrypt_gso(), from @len bytes at @buf in the linear map */
+int ovpn_aead_encrypt_gso_buf(struct ovpn_aead_gso_ctx *ctx,
+			      struct ovpn_peer *peer,
+			      struct ovpn_crypto_key_slot *ks, const u8 *buf,
+			      unsigned int len, struct sk_buff *gso_skb,
+			      unsigned int offset, u32 pktid)
+{
+	return __ovpn_aead_encrypt_gso(ctx, peer, ks, NULL, buf, len, gso_skb,
+				       offset, pktid);
 }
 
 /* Prepare the TCP prefix in reserved headroom so it participates in AEAD.

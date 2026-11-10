@@ -17,6 +17,7 @@
 #include <net/ipv6.h>
 #include <net/sock.h>
 #include <net/tcp.h>
+#include <net/tso.h>
 #include <net/udp.h>
 
 #include "ovpnpriv.h"
@@ -712,7 +713,14 @@ err:
 	return false;
 }
 
+/* allocate the UDP GSO aggregate of @segments plaintext segments of @seg_len
+ * bytes (the last one may be shorter), taking the metadata and the write
+ * ownership of @first_segment, or of the GSO input they are built from. A
+ * single segment is an ordinary packet: the stack rejects one-segment UDP GSO
+ * skbs.
+ */
 static struct sk_buff *ovpn_udp_gso_alloc(const struct sk_buff *first_segment,
+					  unsigned int seg_len,
 					  unsigned int batch_len,
 					  unsigned int segments)
 {
@@ -756,10 +764,11 @@ static struct sk_buff *ovpn_udp_gso_alloc(const struct sk_buff *first_segment,
 	gso_skb->sender_cpu = first_segment->sender_cpu;
 #endif
 
-	skb_shinfo(gso_skb)->gso_type = SKB_GSO_UDP_L4;
-	skb_shinfo(gso_skb)->gso_size = first_segment->len +
-					OVPN_DATA_V2_OVERHEAD;
-	skb_shinfo(gso_skb)->gso_segs = segments;
+	if (segments > 1) {
+		skb_shinfo(gso_skb)->gso_type = SKB_GSO_UDP_L4;
+		skb_shinfo(gso_skb)->gso_size = seg_len + OVPN_DATA_V2_OVERHEAD;
+		skb_shinfo(gso_skb)->gso_segs = segments;
+	}
 
 	return gso_skb;
 }
@@ -828,7 +837,8 @@ static void ovpn_send_gso(struct sk_buff_head *skbs, struct ovpn_peer *peer)
 			batch_len -= skb_peek(skbs)->len -
 				     skb_peek_tail(skbs)->len;
 
-		batch = ovpn_udp_gso_alloc(skb_peek(skbs), batch_len, segs);
+		batch = ovpn_udp_gso_alloc(skb_peek(skbs), skb_peek(skbs)->len,
+					   batch_len, segs);
 		if (unlikely(!batch)) {
 			ovpn_crypto_key_slot_put(ks);
 			ovpn_peer_put(peer);
@@ -960,6 +970,348 @@ static bool ovpn_send_tcp_gso(struct ovpn_peer *peer, struct sk_buff *skb)
 	return true;
 }
 
+/* A TCP or UDP GSO input segmented without skbs: each segment is built in a
+ * per-CPU page and encrypted from there into its UDP GSO aggregate. The pages
+ * are allocated at load time, from the linear map as scatterlists require.
+ */
+struct ovpn_tx_seg {
+	local_lock_t bh_lock;
+	u8 *buf;
+};
+
+static struct ovpn_tx_seg __percpu *ovpn_tx_segs;
+
+void ovpn_tx_segs_free(void)
+{
+	int cpu;
+
+	if (!ovpn_tx_segs)
+		return;
+
+	for_each_possible_cpu(cpu)
+		free_page((unsigned long)per_cpu_ptr(ovpn_tx_segs, cpu)->buf);
+
+	free_percpu(ovpn_tx_segs);
+	ovpn_tx_segs = NULL;
+}
+
+int ovpn_tx_segs_alloc(void)
+{
+	struct ovpn_tx_seg *seg;
+	struct page *page;
+	int cpu;
+
+	ovpn_tx_segs = alloc_percpu(struct ovpn_tx_seg);
+	if (!ovpn_tx_segs)
+		return -ENOMEM;
+
+	for_each_possible_cpu(cpu) {
+		seg = per_cpu_ptr(ovpn_tx_segs, cpu);
+		local_lock_init(&seg->bh_lock);
+
+		page = alloc_pages_node(cpu_to_node(cpu), GFP_KERNEL, 0);
+		if (!page) {
+			ovpn_tx_segs_free();
+			return -ENOMEM;
+		}
+		seg->buf = page_address(page);
+	}
+
+	return 0;
+}
+
+/* the state of a TCP or UDP GSO input segmented with the TSO helpers, plus
+ * what tcp_gso_segment() and __udp_gso_segment() also do and they don't:
+ * checksums, fixed IPv4 IDs and CWR on the first TCP segment only
+ */
+struct ovpn_seg_hdr {
+	struct tso_t tso;
+	unsigned int hdr_len;	/* network and transport headers */
+	unsigned int thoff;	/* transport header offset */
+	unsigned int mss;
+	unsigned int payload;	/* payload not segmented yet */
+	unsigned int oldlen;	/* ~(length of the whole transport packet) */
+	__be16 id;
+	__sum16 check;		/* the input's pseudo-header checksum */
+	bool v4;
+	bool udp;
+	bool fixedid;
+	bool cwr;		/* whether later TCP segments keep CWR */
+};
+
+/* Whether ovpn_send_segfree() can build the segments of @skb. Anything
+ * unusual is left to skb_gso_segment().
+ */
+static bool ovpn_segfree_eligible(struct sk_buff *skb, struct ovpn_seg_hdr *h)
+{
+	const struct skb_shared_info *shinfo = skb_shinfo(skb);
+	unsigned int nhlen, thlen, tcp_types, ok;
+
+	switch (skb->protocol) {
+	case htons(ETH_P_IP):
+		nhlen = sizeof(struct iphdr);
+		tcp_types = SKB_GSO_TCPV4 | SKB_GSO_TCP_FIXEDID;
+		break;
+	case htons(ETH_P_IPV6):
+		nhlen = sizeof(struct ipv6hdr);
+		tcp_types = SKB_GSO_TCPV6;
+		break;
+	default:
+		return false;
+	}
+
+	/* DODGY geometry is validated below, as the GSO handlers do */
+	h->udp = !!(shinfo->gso_type & SKB_GSO_UDP_L4);
+	if (h->udp)
+		ok = SKB_GSO_UDP_L4 | SKB_GSO_DODGY;
+	else if (shinfo->gso_type & tcp_types & ~SKB_GSO_TCP_FIXEDID)
+		ok = tcp_types | SKB_GSO_TCP_ECN | SKB_GSO_TCP_ACCECN |
+		     SKB_GSO_DODGY;
+	else
+		return false;
+
+	/* the TSO helpers walk the linear part and the frags only, through
+	 * skb_frag_address()
+	 */
+	if (IS_ENABLED(CONFIG_HIGHMEM) ||
+	    (shinfo->gso_type & ~ok) || skb->encapsulation ||
+	    skb_has_frag_list(skb) || skb->ip_summed != CHECKSUM_PARTIAL ||
+	    skb_network_offset(skb) || (shinfo->tx_flags & SKBTX_ANY_TSTAMP) ||
+	    skb_checksum_start(skb) != skb_transport_header(skb))
+		return false;
+
+	h->v4 = skb->protocol == htons(ETH_P_IP);
+	h->thoff = skb_transport_offset(skb);
+	thlen = h->udp ? sizeof(struct udphdr) : sizeof(struct tcphdr);
+	/* tso_build_hdr() doesn't account for IPv6 extension headers */
+	if (h->thoff < nhlen || (!h->v4 && h->thoff != nhlen) ||
+	    skb_headlen(skb) < h->thoff + thlen)
+		return false;
+
+	if (!h->udp) {
+		if (tcp_hdr(skb)->doff < 5)
+			return false;
+		thlen = tcp_hdrlen(skb);
+	}
+
+	h->hdr_len = h->thoff + thlen;
+	h->mss = shinfo->gso_size;
+	if (skb_headlen(skb) < h->hdr_len || !h->mss ||
+	    h->hdr_len + h->mss > PAGE_SIZE ||
+	    skb->len <= h->hdr_len + h->mss)
+		return false;
+
+	tso_start(skb, &h->tso);
+	h->payload = skb->len - h->hdr_len;
+	/* the length the input's pseudo-header checksum covers, as the GSO
+	 * handlers take it
+	 */
+	h->oldlen = ~(h->udp ? ntohs(udp_hdr(skb)->len) : skb->len - h->thoff);
+	h->check = h->udp ? udp_hdr(skb)->check : tcp_hdr(skb)->check;
+	h->id = h->v4 ? ip_hdr(skb)->id : 0;
+	h->fixedid = !!(shinfo->gso_type & SKB_GSO_TCP_FIXEDID);
+	h->cwr = !!(shinfo->gso_type & SKB_GSO_TCP_ACCECN);
+
+	return true;
+}
+
+/* Write the next segment of @skb to @buf: headers, then the payload copied
+ * with its checksum. Returns the segment length.
+ */
+static unsigned int ovpn_segfree_build(const struct sk_buff *skb,
+				       struct ovpn_seg_hdr *h, bool first,
+				       u8 *buf)
+{
+	unsigned int plen = min(h->mss, h->payload);
+	unsigned int thlen = h->hdr_len - h->thoff;
+	u8 *dst = buf + h->hdr_len;
+	void *thdr = buf + h->thoff;
+	unsigned int off, n;
+	__wsum csum = 0;
+	__sum16 *check;
+
+	h->payload -= plen;
+	tso_build_hdr(skb, buf, &h->tso, plen, !h->payload);
+	for (off = 0; off < plen; off += n) {
+		n = min_t(unsigned int, plen - off, h->tso.size);
+		csum = csum_block_add(csum,
+				      csum_partial_copy_nocheck(h->tso.data,
+								dst + off, n),
+				      off);
+		tso_build_data(skb, &h->tso, n);
+	}
+
+	if (h->udp) {
+		check = &((struct udphdr *)thdr)->check;
+	} else {
+		struct tcphdr *th = thdr;
+
+		/* tso_build_hdr() clears RST but for the last segment */
+		th->rst = tcp_hdr(skb)->rst;
+		if (!first)
+			th->cwr &= h->cwr;
+		check = &th->check;
+	}
+
+	/* the pseudo-header checksum for this length, then the full one */
+	*check = ~csum_fold(csum_add(csum_unfold(h->check),
+				     (__force __wsum)htonl(h->oldlen + thlen +
+							   plen)));
+	*check = csum_fold(csum_partial(thdr, thlen, csum));
+	if (h->udp && !*check)
+		*check = CSUM_MANGLED_0;
+
+	if (h->v4) {
+		struct iphdr *iph = (struct iphdr *)buf;
+
+		if (h->fixedid)
+			iph->id = h->id;
+		ip_send_check(iph);
+	}
+
+	return h->hdr_len + plen;
+}
+
+/* Build the next @n segments of @skb in the per-CPU buffer and encrypt each
+ * into @batch, with packet IDs from @pktid on. @first: whether the first one
+ * is the input's first segment.
+ */
+static int ovpn_segfree_encrypt(struct ovpn_aead_gso_ctx *ctx,
+				struct ovpn_peer *peer,
+				struct ovpn_crypto_key_slot *ks,
+				const struct sk_buff *skb,
+				struct ovpn_seg_hdr *h, struct sk_buff *batch,
+				unsigned int n, u32 pktid, bool first)
+{
+	unsigned int j, len, offset = 0;
+	int ret = 0;
+	u8 *buf;
+
+	/* the buffer is released before sending, which may recurse into
+	 * another ovpn device
+	 */
+	local_lock_nested_bh(&ovpn_tx_segs->bh_lock);
+	buf = this_cpu_ptr(ovpn_tx_segs)->buf;
+	for (j = 0; j < n && !ret; j++) {
+		len = ovpn_segfree_build(skb, h, first && !j, buf);
+		ret = ovpn_aead_encrypt_gso_buf(ctx, peer, ks, buf, len, batch,
+						offset, pktid + j);
+		offset += len + OVPN_DATA_V2_OVERHEAD;
+	}
+	local_unlock_nested_bh(&ovpn_tx_segs->bh_lock);
+
+	DEBUG_NET_WARN_ON_ONCE(ret == -EINPROGRESS || ret == -EBUSY);
+	return ret;
+}
+
+/* Build, encrypt and send the next @n segments of @skb as one aggregate.
+ * @first, @last: whether they include the input's first, last segment.
+ * On failure nothing is sent.
+ */
+static int ovpn_segfree_batch(struct ovpn_peer *peer, struct sk_buff *skb,
+			      struct ovpn_seg_hdr *h, unsigned int n,
+			      bool first, bool last)
+{
+	struct ovpn_aead_gso_ctx ctx = { };
+	struct ovpn_crypto_key_slot *ks;
+	unsigned int batch_len;
+	struct sk_buff *batch;
+	u32 pktid;
+	int ret;
+
+	/* h->payload is what is left: only the last segment is short */
+	batch_len = n * (h->hdr_len + OVPN_DATA_V2_OVERHEAD) +
+		    min(n * h->mss, h->payload);
+	batch = ovpn_udp_gso_alloc(skb, h->hdr_len + h->mss, batch_len, n);
+	if (unlikely(!batch))
+		return -ENOMEM;
+
+	ks = ovpn_encrypt_refs_get(peer);
+	if (unlikely(!ks)) {
+		kfree_skb(batch);
+		return -ENOKEY;
+	}
+
+	/* recheck in case the key was swapped */
+	ret = ks->async ? -EOPNOTSUPP : ovpn_aead_gso_ctx_init(&ctx, ks, batch);
+	if (likely(!ret)) {
+		ret = ovpn_pktid_xmit_range(&ks->pid_xmit, n, &pktid);
+		if (unlikely(ret))
+			ovpn_encrypt_key_exhausted(peer, ks);
+	}
+	if (likely(!ret))
+		ret = ovpn_segfree_encrypt(&ctx, peer, ks, skb, h, batch, n,
+					   pktid, first);
+	ovpn_aead_gso_ctx_free(&ctx);
+	if (unlikely(ret)) {
+		kfree_skb(batch);
+		ovpn_crypto_key_slot_put(ks);
+		ovpn_peer_put(peer);
+		return ret;
+	}
+
+	/* the last aggregate takes over the input's write charge, as in
+	 * ovpn_encrypt_gso_queue(), so that freeing the input doesn't wake TSQ
+	 * before the data has left the host
+	 */
+	if (last && batch->sk) {
+		skb->destructor = NULL;
+		skb->sk = NULL;
+		WARN_ON_ONCE(refcount_sub_and_test(skb->truesize,
+						   &batch->sk->sk_wmem_alloc));
+	}
+
+	ovpn_encrypt_send(peer, ks, batch, n);
+	return 0;
+}
+
+/* Segment a TCP or UDP GSO input like skb_gso_segment() without NETIF_F_SG
+ * would, but without allocating a skb per segment: build each segment in a
+ * per-CPU buffer and encrypt it from there into its UDP GSO aggregate. Only
+ * for synchronous AEADs, so that one buffer serves all the segments.
+ * Returning false leaves the input to the ordinary path, also on failures
+ * before the first aggregate is sent. As the TSO state can't skip segments,
+ * a later failure drops the rest of the input.
+ */
+static bool ovpn_send_segfree(struct ovpn_peer *peer, struct sk_buff *skb)
+{
+	unsigned int segs, max_segs, seg_len, done, n;
+	struct ovpn_seg_hdr h;
+
+	if (!ovpn_segfree_eligible(skb, &h) || !ovpn_peer_supports_udp_gso(peer))
+		return false;
+
+	segs = DIV_ROUND_UP(h.payload, h.mss);
+	seg_len = h.hdr_len + h.mss;
+	max_segs = min_t(unsigned int, UDP_MAX_SEGMENTS,
+			 OVPN_UDP_GSO_MAX_PAYLOAD /
+			 (seg_len + OVPN_DATA_V2_OVERHEAD));
+	if (max_segs < 2)
+		return false;
+
+	for (done = 0; done < segs; done += n) {
+		n = min(segs - done, max_segs);
+		if (unlikely(ovpn_segfree_batch(peer, skb, &h, n, !done,
+						done + n == segs))) {
+			if (!done)
+				return false;
+			goto drop;
+		}
+	}
+
+	ovpn_peer_stats_add_tx(&peer->vpn_stats,
+			       skb->len + (segs - 1) * h.hdr_len, segs);
+	consume_skb(skb);
+	return true;
+
+drop:
+	ovpn_peer_stats_add_tx(&peer->vpn_stats, done * seg_len, done);
+	ovpn_dev_dstats_tx_dropped(peer->ovpn->dev, segs - done);
+	skb_tx_error(skb);
+	kfree_skb(skb);
+	return true;
+}
+
 /* Send user data to the network
  */
 netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
@@ -1021,6 +1373,11 @@ netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
 	 * protocol, try to send it without prior segmentation
 	 */
 	if (gso_in && ovpn_send_tcp_gso(peer, skb)) {
+		ovpn_peer_put(peer);
+		return NETDEV_TX_OK;
+	}
+
+	if (gso_out && ovpn_send_segfree(peer, skb)) {
 		ovpn_peer_put(peer);
 		return NETDEV_TX_OK;
 	}
