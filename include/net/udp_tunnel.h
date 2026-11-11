@@ -211,10 +211,12 @@ static inline int udp_tunnel_handle_offloads(struct sk_buff *skb, bool udp_csum)
 #if IS_ENABLED(CONFIG_NET_UDP_TUNNEL)
 void udp_tunnel_update_gro_lookup(struct net *net, struct sock *sk, bool add);
 void udp_tunnel_update_gro_rcv(struct sock *sk, bool add);
+void udp_tunnel_detach_gro(struct sock *sk);
 #else
 static inline void udp_tunnel_update_gro_lookup(struct net *net,
 						struct sock *sk, bool add) {}
 static inline void udp_tunnel_update_gro_rcv(struct sock *sk, bool add) {}
+static inline void udp_tunnel_detach_gro(struct sock *sk) {}
 #endif
 
 static inline void udp_tunnel_cleanup_gro(struct sock *sk)
