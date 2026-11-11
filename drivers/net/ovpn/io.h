@@ -30,4 +30,10 @@ void ovpn_xmit_special(struct ovpn_peer *peer, const void *data,
 void ovpn_encrypt_post(void *data, int ret);
 void ovpn_decrypt_post(void *data, int ret);
 
+struct ovpn_crypto_key_slot *ovpn_encrypt_refs_get(struct ovpn_peer *peer);
+void ovpn_encrypt_key_exhausted(struct ovpn_peer *peer,
+				struct ovpn_crypto_key_slot *ks);
+void ovpn_encrypt_send(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
+		       struct sk_buff *skb, unsigned int packets);
+
 #endif /* _NET_OVPN_OVPN_H_ */
