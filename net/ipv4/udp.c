@@ -3023,6 +3023,9 @@ int udp_lib_setsockopt(struct sock *sk, int level, int optname,
 		case 0:
 #ifdef CONFIG_XFRM
 		case UDP_ENCAP_ESPINUDP:
+			if (udp_test_bit(GRO_RCV_DETACHABLE, sk))
+				udp_tunnel_detach_gro(sk);
+
 			set_xfrm_gro_udp_encap_rcv(val, sk->sk_family, sk);
 #if IS_ENABLED(CONFIG_IPV6)
 			if (sk->sk_family == AF_INET6)
@@ -3035,6 +3038,9 @@ int udp_lib_setsockopt(struct sock *sk, int level, int optname,
 #endif
 			fallthrough;
 		case UDP_ENCAP_L2TPINUDP:
+			if (udp_test_bit(GRO_RCV_DETACHABLE, sk))
+				udp_tunnel_detach_gro(sk);
+
 			WRITE_ONCE(up->encap_type, val);
 			udp_tunnel_encap_enable(sk);
 			break;
