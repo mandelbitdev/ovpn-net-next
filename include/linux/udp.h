@@ -67,6 +67,10 @@ enum {
 	UDP_FLAGS_ACCEPT_FRAGLIST,
 	UDP_FLAGS_ACCEPT_L4,
 	UDP_FLAGS_ENCAP_ENABLED, /* This socket enabled encap */
+	/* encap_rcv accepts UDP L4 frag-list GSO. If it does not consume such
+	 * an aggregate, it must leave it unmodified.
+	 */
+	UDP_FLAGS_ENCAP_ACCEPT_FRAGLIST,
 };
 
 /* per NUMA structure for lockless producer usage. */
@@ -209,6 +213,19 @@ static inline bool udp_encap_needed(void)
 #endif
 
 	return false;
+}
+
+static inline bool udp_encap_accepts_fraglist(struct sock *sk,
+					      struct sk_buff *skb)
+{
+	/* pairs with set_mask_bits in setup_udp_tunnel_sock, so the callbacks
+	 * published before acceptance are visible once it is observed
+	 */
+	return skb_is_gso(skb) &&
+	       skb_shinfo(skb)->gso_type ==
+		       (SKB_GSO_UDP_L4 | SKB_GSO_FRAGLIST) &&
+	       test_bit_acquire(UDP_FLAGS_ENCAP_ACCEPT_FRAGLIST,
+				&udp_sk(sk)->udp_flags);
 }
 
 static inline bool udp_unexpected_gso(struct sock *sk, struct sk_buff *skb)
