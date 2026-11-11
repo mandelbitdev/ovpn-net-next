@@ -6,9 +6,11 @@
  *  Author:	Antonio Quartulli <antonio@openvpn.net>
  */
 
+#include <linux/cache.h>
 #include <linux/netdevice.h>
 #include <linux/inetdevice.h>
 #include <linux/if_vlan.h>
+#include <linux/prefetch.h>
 #include <linux/skbuff.h>
 #include <linux/socket.h>
 #include <linux/udp.h>
@@ -32,6 +34,21 @@
 
 /* like UDP and TCP frag-list GRO */
 #define OVPN_UDP_GRO_CNT_MAX 64
+
+/* leave enough work between a cache hint and the record which consumes it */
+#define OVPN_UDP_GRO_PREFETCH_DISTANCE 2
+
+static void ovpn_udp_prefetchw_linear(const struct sk_buff *skb)
+{
+	unsigned long addr = (unsigned long)skb->data;
+	unsigned long end = addr + skb_headlen(skb);
+
+	/* crypto overwrites data in place, so request write ownership of each
+	 * linear cache line before the AEAD implementation reaches it
+	 */
+	for (; addr < end; addr = ALIGN(addr + 1, L1_CACHE_BYTES))
+		prefetchw((void *)addr);
+}
 
 static bool ovpn_udp_gro_header(struct sk_buff *skb, u32 *header)
 {
@@ -232,6 +249,7 @@ out:
 
 static void ovpn_udp_recv(struct ovpn_peer *peer, struct sk_buff *list)
 {
+	struct sk_buff *skb, *next, *prefetch;
 	const __be16 proto = list->protocol;
 	const u32 priority = list->priority;
 #ifdef CONFIG_NET_SCHED
@@ -241,9 +259,23 @@ static void ovpn_udp_recv(struct ovpn_peer *peer, struct sk_buff *list)
 	const u32 secmark = list->secmark;
 #endif
 	const int skb_iif = list->skb_iif;
-	struct sk_buff *skb, *next;
+	int i;
+
+	/* a fraglist GRO aggregate makes later ciphertext visible before the
+	 * current record is decrypted, so we prime the first two records, then
+	 * keep the cache hints the same distance ahead while draining the list
+	 */
+	prefetch = list->next ? list : NULL;
+	for (i = 0; i < OVPN_UDP_GRO_PREFETCH_DISTANCE && prefetch; i++) {
+		ovpn_udp_prefetchw_linear(prefetch);
+		prefetch = prefetch->next;
+	}
 
 	skb_list_walk_safe(list, skb, next) {
+		if (prefetch) {
+			ovpn_udp_prefetchw_linear(prefetch);
+			prefetch = prefetch->next;
+		}
 		/* propagate post-GRO metadata from the list head, and clear
 		 * the state which the receive stack consumed on the head only
 		 */
