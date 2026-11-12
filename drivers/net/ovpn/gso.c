@@ -32,11 +32,18 @@
 					 sizeof(struct ipv6hdr) -	\
 					 sizeof(struct udphdr) - 1)
 
-static bool ovpn_gso_encrypt_queue(struct sk_buff_head *skbs,
+struct ovpn_gso_source {
+	unsigned int segments;
+	unsigned int next;
+	unsigned int record_len;
+	unsigned int last_record_len;
+	struct sk_buff_head *skbs;
+};
+
+static bool ovpn_gso_encrypt_batch(struct ovpn_gso_source *src,
 				   struct ovpn_peer *peer,
 				   struct ovpn_crypto_key_slot *ks,
-				   struct sk_buff *batch,
-				   unsigned int segments)
+				   struct sk_buff *batch, unsigned int segments)
 {
 	unsigned int offset = 0, moved = 0, i, len;
 	struct ovpn_aead_gso_ctx ctx = { };
@@ -57,7 +64,8 @@ static bool ovpn_gso_encrypt_queue(struct sk_buff_head *skbs,
 	}
 
 	for (i = 0; i < segments; i++) {
-		skb = __skb_dequeue(skbs);
+		skb = __skb_dequeue(src->skbs);
+		src->next++;
 		len = skb->len + OVPN_DATA_V2_OVERHEAD;
 
 		ret = ovpn_aead_encrypt_gso(&ctx, peer, ks, skb, batch, offset,
@@ -162,6 +170,67 @@ static struct sk_buff *ovpn_gso_alloc(const struct sk_buff *first_segment,
 	return gso_skb;
 }
 
+static void ovpn_gso_send_batch(struct ovpn_gso_source *src,
+				struct ovpn_peer *peer)
+{
+	unsigned int max_segs, batch_len, batch_segs, batch_start;
+	struct ovpn_crypto_key_slot *ks;
+	struct sk_buff *batch;
+
+	max_segs = min_t(unsigned int, UDP_MAX_SEGMENTS,
+			 OVPN_GSO_MAX_PAYLOAD /
+				 (src->record_len + OVPN_DATA_V2_OVERHEAD));
+
+	/* if even two encrypted records cannot fit, leave the source for the
+	 * ordinary transmit path
+	 */
+	if (max_segs < 2)
+		return;
+
+	/* An input GSO skb might produce more than max_segs records, so
+	 * consume as many as can fit in each aggregate. A final materialized
+	 * one, or the remainder after a failure, stays for the ordinary path.
+	 */
+	while (src->segments - src->next > 1) {
+		batch_start = src->next;
+		batch_segs = min(src->segments - src->next, max_segs);
+
+		/* acquire shared state before allocating/consuming anything */
+		ks = ovpn_encrypt_refs_get(peer);
+		if (unlikely(!ks))
+			break;
+		/* recheck in case the key was swapped */
+		if (unlikely(ks->async)) {
+			ovpn_crypto_key_slot_put(ks);
+			ovpn_peer_put(peer);
+			break;
+		}
+
+		/* all but the final input record have the same length, so
+		 * start with the full-size calculation and adjust only the
+		 * final group below
+		 */
+		batch_len = batch_segs *
+			    (src->record_len + OVPN_DATA_V2_OVERHEAD);
+		if (batch_start + batch_segs == src->segments)
+			batch_len -= src->record_len - src->last_record_len;
+
+		batch = ovpn_gso_alloc(skb_peek(src->skbs), batch_len,
+				       batch_segs);
+		if (unlikely(!batch)) {
+			ovpn_crypto_key_slot_put(ks);
+			ovpn_peer_put(peer);
+			break;
+		}
+
+		if (unlikely(!ovpn_gso_encrypt_batch(src, peer, ks, batch,
+						     batch_segs))) {
+			kfree_skb(batch);
+			break;
+		}
+	}
+}
+
 /**
  * ovpn_gso_send - encrypt materialized segments into UDP GSO aggregates
  * @skbs: segments of one GSO skb, all but the last of the same length
@@ -174,61 +243,14 @@ static struct sk_buff *ovpn_gso_alloc(const struct sk_buff *first_segment,
  */
 void ovpn_gso_send(struct sk_buff_head *skbs, struct ovpn_peer *peer)
 {
-	unsigned int max_segs, seg_len, batch_len, segs;
-	struct ovpn_crypto_key_slot *ks;
-	struct sk_buff *batch;
+	struct ovpn_gso_source src = {
+		.segments = skb_queue_len(skbs),
+		.record_len = skb_peek(skbs)->len,
+		.last_record_len = skb_peek_tail(skbs)->len,
+		.skbs = skbs,
+	};
 
-	seg_len = skb_peek(skbs)->len + OVPN_DATA_V2_OVERHEAD;
-	max_segs = min_t(unsigned int, UDP_MAX_SEGMENTS,
-			 OVPN_GSO_MAX_PAYLOAD / seg_len);
-
-	/* if even two encrypted skbs cannot fit, leave the whole queue for the
-	 * ordinary transmit path
-	 */
-	if (max_segs < 2)
-		return;
-
-	/* An input GSO skb might produce more than max_segs segments, so we
-	 * consume as many as we can for each iteration. A final single skb, or
-	 * any remainder left after batching stops, stays queued and falls back
-	 * to the ordinary transmit path.
-	 */
-	while (skb_queue_len(skbs) > 1) {
-		segs = min_t(unsigned int, skb_queue_len(skbs), max_segs);
-		/* acquire shared state before allocating/consuming anything */
-		ks = ovpn_encrypt_refs_get(peer);
-		if (unlikely(!ks))
-			return;
-		/* recheck in case the key was swapped */
-		if (unlikely(ks->async)) {
-			ovpn_crypto_key_slot_put(ks);
-			ovpn_peer_put(peer);
-			return;
-		}
-
-		/* all but the final input skb have the same length, so start
-		 * with the full-size calculation and adjust only the final
-		 * group below
-		 */
-		batch_len = segs * (skb_peek(skbs)->len +
-				    OVPN_DATA_V2_OVERHEAD);
-		if (segs == skb_queue_len(skbs))
-			batch_len -= skb_peek(skbs)->len -
-				     skb_peek_tail(skbs)->len;
-
-		batch = ovpn_gso_alloc(skb_peek(skbs), batch_len, segs);
-		if (unlikely(!batch)) {
-			ovpn_crypto_key_slot_put(ks);
-			ovpn_peer_put(peer);
-			return;
-		}
-
-		if (unlikely(!ovpn_gso_encrypt_queue(skbs, peer, ks,
-						     batch, segs))) {
-			kfree_skb(batch);
-			return;
-		}
-	}
+	ovpn_gso_send_batch(&src, peer);
 }
 
 /**
