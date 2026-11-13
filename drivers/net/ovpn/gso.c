@@ -7,6 +7,7 @@
  *		Ralf Lici <ralf@mandelbit.com>
  */
 
+#include <linux/highmem.h>
 #include <linux/netdevice.h>
 #include <linux/skbuff.h>
 #include <net/sock.h>
@@ -32,6 +33,14 @@
 					 sizeof(struct ipv6hdr) -	\
 					 sizeof(struct udphdr) - 1)
 
+/* position in the linear area and page frags of an input skb */
+struct ovpn_gso_cursor {
+	const struct sk_buff *skb;
+	unsigned int head_off;
+	unsigned int frag_idx;
+	unsigned int frag_off;
+};
+
 struct ovpn_gso_source {
 	unsigned int segments;
 	unsigned int next;
@@ -39,6 +48,140 @@ struct ovpn_gso_source {
 	unsigned int last_record_len;
 	struct sk_buff_head *skbs;
 };
+
+static bool ovpn_gso_copy_chunk(struct ovpn_gso_cursor *cur, u8 *to,
+				unsigned int len, unsigned int *pos,
+				__wsum *csum)
+{
+	unsigned int head_len = skb_headlen(cur->skb);
+	const struct sk_buff *skb = cur->skb;
+	__wsum part;
+
+	/* Copy len bytes of the skb from the cursor position, first from the
+	 * linear area if the cursor has not left it yet. Each copy also sums
+	 * the copied bytes, and csum_block_add rotates that partial sum when
+	 * it starts at an odd byte position of the copied range.
+	 */
+	if (cur->head_off < head_len) {
+		unsigned int size = min(len, head_len - cur->head_off);
+
+		part = csum_partial_copy_nocheck(skb->data + cur->head_off,
+						 to, size);
+		*csum = csum_block_add(*csum, part, *pos);
+		cur->head_off += size;
+		*pos += size;
+		to += size;
+		len -= size;
+	}
+
+	/* then continue through the page frags */
+	while (len && cur->frag_idx < skb_shinfo(skb)->nr_frags) {
+		const skb_frag_t *frag = &skb_shinfo(skb)->frags[cur->frag_idx];
+		u32 p_off, p_len, copied;
+		unsigned int size;
+		struct page *p;
+		u8 *vaddr;
+
+		/* map each page separately for highmem; elsewhere the whole
+		 * range of the frag is one piece
+		 */
+		size = min(len, skb_frag_size(frag) - cur->frag_off);
+		skb_frag_foreach_page(frag, skb_frag_off(frag) + cur->frag_off,
+				      size, p, p_off, p_len, copied) {
+			vaddr = kmap_local_page(p);
+			part = csum_partial_copy_nocheck(vaddr + p_off,
+							 to + copied, p_len);
+			*csum = csum_block_add(*csum, part, *pos + copied);
+			kunmap_local(vaddr);
+		}
+
+		/* move on to the next frag once this one is used up */
+		cur->frag_off += size;
+		*pos += size;
+		to += size;
+		len -= size;
+		if (cur->frag_off == skb_frag_size(frag)) {
+			cur->frag_idx++;
+			cur->frag_off = 0;
+		}
+	}
+
+	/* the skb ended before len bytes */
+	return !len;
+}
+
+static bool ovpn_gso_copy(struct ovpn_gso_cursor *cur, struct sk_buff *batch,
+			  unsigned int offset, unsigned int len, __wsum *csum)
+{
+	unsigned int pos = 0, i;
+
+	/* Copy len bytes of the skb at the cursor into the aggregate at offset
+	 * and return their checksum in csum. The aggregate's frags come from
+	 * ovpn_gso_alloc without __GFP_HIGHMEM, so each is directly mapped:
+	 * skip those before offset, then copy into each one in turn, carrying
+	 * the byte position for the checksum.
+	 */
+	*csum = 0;
+	for (i = 0; len && i < skb_shinfo(batch)->nr_frags; i++) {
+		skb_frag_t *frag = &skb_shinfo(batch)->frags[i];
+		unsigned int size = skb_frag_size(frag), n;
+
+		if (offset >= size) {
+			offset -= size;
+			continue;
+		}
+
+		n = min(len, size - offset);
+		if (!ovpn_gso_copy_chunk(cur, skb_frag_address(frag) + offset,
+					 n, &pos, csum))
+			return false;
+		len -= n;
+		offset = 0;
+	}
+
+	return !len;
+}
+
+static int ovpn_gso_encrypt_segment(struct ovpn_aead_gso_ctx *ctx,
+				    struct ovpn_peer *peer,
+				    struct ovpn_crypto_key_slot *ks,
+				    struct sk_buff *skb, struct sk_buff *batch,
+				    unsigned int offset, u32 pktid)
+{
+	unsigned int data = offset + OVPN_DATA_V2_OVERHEAD;
+	struct ovpn_gso_cursor cur = { .skb = skb };
+	unsigned int start = 0;
+	__sum16 check;
+	__wsum csum;
+	int ret;
+
+	/* Copy the segment behind the OpenVPN header and the tag. Its L4
+	 * checksum is left partial for batching, so copy the headers in front
+	 * of it, then the rest summing it on the way, and complete it in the
+	 * aggregate as skb_checksum_help would in the segment.
+	 */
+	if (skb->ip_summed == CHECKSUM_PARTIAL)
+		start = skb_checksum_start_offset(skb);
+	if (unlikely(!ovpn_gso_copy(&cur, batch, data, start, &csum) ||
+		     !ovpn_gso_copy(&cur, batch, data + start, skb->len - start,
+				    &csum)))
+		return -EMSGSIZE;
+	if (skb->ip_summed == CHECKSUM_PARTIAL) {
+		check = csum_fold(csum) ?: CSUM_MANGLED_0;
+		ret = skb_store_bits(batch, data + start + skb->csum_offset,
+				     &check, sizeof(check));
+		if (unlikely(ret < 0))
+			return ret;
+	}
+
+	/* store the OpenVPN header in front; encryption fills in the tag */
+	ovpn_aead_encrypt_header(peer, ks, pktid, ctx->iv, ctx->head);
+	ret = skb_store_bits(batch, offset, ctx->head, OVPN_AAD_SIZE);
+	if (unlikely(ret < 0))
+		return ret;
+
+	return ovpn_aead_encrypt_gso(ctx, batch, offset, skb->len);
+}
 
 static bool ovpn_gso_encrypt_batch(struct ovpn_gso_source *src,
 				   struct ovpn_peer *peer,
@@ -68,8 +211,8 @@ static bool ovpn_gso_encrypt_batch(struct ovpn_gso_source *src,
 		src->next++;
 		len = skb->len + OVPN_DATA_V2_OVERHEAD;
 
-		ret = ovpn_aead_encrypt_gso(&ctx, peer, ks, skb, batch, offset,
-					    first_pktid + i);
+		ret = ovpn_gso_encrypt_segment(&ctx, peer, ks, skb, batch,
+					       offset, first_pktid + i);
 		if (unlikely(ret < 0)) {
 			DEBUG_NET_WARN_ON_ONCE(ret == -EINPROGRESS ||
 					       ret == -EBUSY);

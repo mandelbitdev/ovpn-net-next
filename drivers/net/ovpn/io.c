@@ -387,10 +387,10 @@ netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
 {
 	struct ovpn_priv *ovpn = netdev_priv(dev);
 	struct sk_buff *segments, *curr, *next;
+	unsigned int tx_bytes = 0, tx_packets;
 	const bool gso_in = skb_is_gso(skb);
 	struct sk_buff_head skb_list;
 	netdev_features_t features;
-	unsigned int tx_bytes = 0;
 	struct ovpn_peer *peer;
 	bool gso_out;
 	__be16 proto;
@@ -429,13 +429,18 @@ netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
 	/* dst was needed for peer selection - it can now be dropped */
 	skb_dst_drop(skb);
 
+	gso_out = gso_out && ovpn_gso_supported(peer);
+
 	if (gso_in) {
-		/* force software segmentation and calculate each checksum
-		 * while allowing safe page-backed payload fragments to remain
-		 * non-linear
+		/* force software segmentation while allowing safe page-backed
+		 * payload fragments to remain non-linear. Batching completes
+		 * the L4 checksums while copying the segments, so only
+		 * calculate them here if the segments are not batched.
 		 */
 		features = netif_skb_features(skb);
-		features &= ~(NETIF_F_GSO_MASK | NETIF_F_CSUM_MASK);
+		features &= ~NETIF_F_GSO_MASK;
+		if (!gso_out)
+			features &= ~NETIF_F_CSUM_MASK;
 		segments = skb_gso_segment(skb, features);
 		if (IS_ERR_OR_NULL(segments)) {
 			ret = PTR_ERR(segments);
@@ -463,16 +468,9 @@ netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
 			continue;
 		}
 
-		/* NETIF_F_HW_CSUM requires completing partial checksums */
-		if (unlikely(curr->ip_summed == CHECKSUM_PARTIAL &&
-			     skb_checksum_help(curr) < 0)) {
-			net_err_ratelimited("%s: skb_checksum_help failed for payload packet\n",
-					    netdev_name(dev));
-			ovpn_dev_dstats_tx_dropped(ovpn->dev, 1);
-			kfree_skb(curr);
+		/* batching copies only the linear area and page frags */
+		if (unlikely(skb_has_frag_list(curr)))
 			gso_out = false;
-			continue;
-		}
 
 		/* one aggregate can carry only one write owner, so batch only
 		 * segments that share it
@@ -498,12 +496,29 @@ netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
 		return NETDEV_TX_OK;
 	}
 
-	ovpn_peer_stats_add_tx(&peer->vpn_stats, tx_bytes,
-			       skb_queue_len(&skb_list));
-
-	if (gso_out && skb_queue_len(&skb_list) > 1 &&
-	    ovpn_gso_supported(peer))
+	tx_packets = skb_queue_len(&skb_list);
+	if (gso_out && tx_packets > 1)
 		ovpn_gso_send(&skb_list, peer);
+
+	/* NETIF_F_HW_CSUM requires completing partial checksums, which
+	 * batching does while copying, so complete those of the packets left
+	 * for the ordinary path
+	 */
+	skb_queue_walk_safe(&skb_list, curr, next) {
+		if (curr->ip_summed != CHECKSUM_PARTIAL ||
+		    likely(skb_checksum_help(curr) >= 0))
+			continue;
+
+		net_err_ratelimited("%s: skb_checksum_help failed for payload packet\n",
+				    netdev_name(dev));
+		__skb_unlink(curr, &skb_list);
+		ovpn_dev_dstats_tx_dropped(ovpn->dev, 1);
+		tx_bytes -= curr->len;
+		tx_packets--;
+		kfree_skb(curr);
+	}
+
+	ovpn_peer_stats_add_tx(&peer->vpn_stats, tx_bytes, tx_packets);
 
 	skb_list.prev->next = NULL;
 	ovpn_send(ovpn, skb_list.next, peer);
