@@ -23,7 +23,7 @@ struct ovpn_aead_gso_ctx {
 	struct scatterlist *dst;
 	void *tmp;
 	u8 *iv;
-	/* start of the record: its AAD */
+	/* start of the record: AAD, room for the tag, synthesized headers */
 	u8 *head;
 	unsigned int dst_nents;
 };
@@ -32,7 +32,8 @@ int ovpn_aead_encrypt(struct ovpn_peer *peer, struct ovpn_crypto_key_slot *ks,
 		      struct sk_buff *skb);
 int ovpn_aead_gso_ctx_init(struct ovpn_aead_gso_ctx *ctx,
 			   struct ovpn_crypto_key_slot *ks,
-			   struct sk_buff *gso_skb);
+			   struct sk_buff *gso_skb,
+			   unsigned int header_len);
 void ovpn_aead_gso_ctx_free(struct ovpn_aead_gso_ctx *ctx);
 void ovpn_aead_encrypt_header(struct ovpn_peer *peer,
 			      struct ovpn_crypto_key_slot *ks, u32 pktid,

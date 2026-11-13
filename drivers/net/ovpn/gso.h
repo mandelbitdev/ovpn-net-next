@@ -15,6 +15,7 @@
 #include "peer.h"
 
 void ovpn_gso_send(struct sk_buff_head *skbs, struct ovpn_peer *peer);
+bool ovpn_gso_send_tso(struct sk_buff *skb, struct ovpn_peer *peer);
 bool ovpn_gso_supported(struct ovpn_peer *peer);
 
 #endif /* _NET_OVPN_GSO_H_ */

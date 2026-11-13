@@ -10,7 +10,10 @@
 #include <linux/highmem.h>
 #include <linux/netdevice.h>
 #include <linux/skbuff.h>
+#include <linux/tcp.h>
+#include <net/ip6_checksum.h>
 #include <net/sock.h>
+#include <net/tso.h>
 #include <net/udp.h>
 
 #include "ovpnpriv.h"
@@ -33,6 +36,52 @@
 					 sizeof(struct ipv6hdr) -	\
 					 sizeof(struct udphdr) - 1)
 
+static void ovpn_gso_build_hdr(struct sk_buff *skb, struct tso_t *tso,
+			       void *header, unsigned int payload_len,
+			       __wsum payload_csum, bool is_last)
+{
+	u8 *transport_header = (u8 *)header + skb_transport_offset(skb);
+	unsigned int l4_len = tso->tlen + payload_len;
+	__sum16 *check;
+	__wsum csum;
+	u8 proto;
+
+	/* copy the parent's headers and set this record's IP length and ID,
+	 * TCP sequence number and flags or UDP length
+	 */
+	tso_build_hdr(skb, header, tso, payload_len, is_last);
+
+	/* the L4 checksum covers the transport header and the payload, whose
+	 * sum the caller computed while copying it
+	 */
+	if (skb_is_gso_tcp(skb)) {
+		check = &((struct tcphdr *)transport_header)->check;
+		proto = IPPROTO_TCP;
+	} else {
+		check = &((struct udphdr *)transport_header)->check;
+		proto = IPPROTO_UDP;
+	}
+	*check = 0;
+	csum = csum_partial(transport_header, tso->tlen, payload_csum);
+
+	if (tso->ipv6) {
+		struct ipv6hdr *iph = header + skb_network_offset(skb);
+
+		*check = csum_ipv6_magic(&iph->saddr, &iph->daddr, l4_len,
+					 proto, csum);
+	} else {
+		struct iphdr *iph = header + skb_network_offset(skb);
+
+		*check = csum_tcpudp_magic(iph->saddr, iph->daddr, l4_len,
+					   proto, csum);
+		/* IPv4 also checksums its own header */
+		ip_send_check(iph);
+	}
+	/* a zero UDP checksum would mean none */
+	if (proto == IPPROTO_UDP && !*check)
+		*check = CSUM_MANGLED_0;
+}
+
 /* position in the linear area and page frags of an input skb */
 struct ovpn_gso_cursor {
 	const struct sk_buff *skb;
@@ -47,6 +96,11 @@ struct ovpn_gso_source {
 	unsigned int record_len;
 	unsigned int last_record_len;
 	struct sk_buff_head *skbs;
+	/* set if the records are ranges of a parent skb instead */
+	struct sk_buff *parent;
+	struct tso_t tso;
+	struct ovpn_gso_cursor cursor;
+	unsigned int hdr_len;
 };
 
 static bool ovpn_gso_copy_chunk(struct ovpn_gso_cursor *cur, u8 *to,
@@ -183,18 +237,64 @@ static int ovpn_gso_encrypt_segment(struct ovpn_aead_gso_ctx *ctx,
 	return ovpn_aead_encrypt_gso(ctx, batch, offset, skb->len);
 }
 
+static int ovpn_gso_encrypt_record(struct ovpn_gso_source *src,
+				   struct ovpn_aead_gso_ctx *ctx,
+				   struct ovpn_peer *peer,
+				   struct ovpn_crypto_key_slot *ks,
+				   struct sk_buff *batch, unsigned int offset,
+				   u32 pktid, unsigned int *len)
+{
+	unsigned int data = offset + OVPN_DATA_V2_OVERHEAD;
+	unsigned int hdr_len = src->hdr_len;
+	unsigned int index = src->next++;
+	unsigned int payload_len;
+	u8 *record = ctx->head;
+	__wsum csum;
+	bool last;
+	int ret;
+
+	/* copy the record's payload into its final position in the aggregate,
+	 * behind the OpenVPN header, the tag and the inner headers, and sum it
+	 * on the way
+	 */
+	last = index + 1 == src->segments;
+	payload_len = (last ? src->last_record_len : src->record_len) - hdr_len;
+	if (unlikely(!ovpn_gso_copy(&src->cursor, batch, data + hdr_len,
+				    payload_len, &csum)))
+		return -EMSGSIZE;
+
+	/* stage the start of the record as it is laid out in the aggregate:
+	 * the OpenVPN header, room for the tag and the synthesized inner
+	 * headers, whose checksums cover the payload copied above
+	 */
+	ovpn_gso_build_hdr(src->parent, &src->tso,
+			   record + OVPN_DATA_V2_OVERHEAD, payload_len, csum,
+			   last);
+	tso_advance_hdr(&src->tso, payload_len);
+	ovpn_aead_encrypt_header(peer, ks, pktid, ctx->iv, record);
+
+	/* store it in front of the payload; encryption overwrites the tag */
+	ret = skb_store_bits(batch, offset, record,
+			     OVPN_DATA_V2_OVERHEAD + hdr_len);
+	if (unlikely(ret < 0))
+		return ret;
+
+	*len = hdr_len + payload_len + OVPN_DATA_V2_OVERHEAD;
+	return ovpn_aead_encrypt_gso(ctx, batch, offset, hdr_len + payload_len);
+}
+
 static bool ovpn_gso_encrypt_batch(struct ovpn_gso_source *src,
 				   struct ovpn_peer *peer,
 				   struct ovpn_crypto_key_slot *ks,
 				   struct sk_buff *batch, unsigned int segments)
 {
-	unsigned int offset = 0, moved = 0, i, len;
+	unsigned int offset = 0, moved = 0, i, len, batch_start = src->next;
 	struct ovpn_aead_gso_ctx ctx = { };
 	struct sk_buff *skb;
 	u32 first_pktid;
 	int ret;
 
-	if (unlikely(ovpn_aead_gso_ctx_init(&ctx, ks, batch)))
+	if (unlikely(ovpn_aead_gso_ctx_init(&ctx, ks, batch, src->hdr_len)))
 		goto err;
 
 	/* reserve the complete range before dequeuing any input skb so that a
@@ -207,19 +307,36 @@ static bool ovpn_gso_encrypt_batch(struct ovpn_gso_source *src,
 	}
 
 	for (i = 0; i < segments; i++) {
-		skb = __skb_dequeue(src->skbs);
-		src->next++;
-		len = skb->len + OVPN_DATA_V2_OVERHEAD;
-
-		ret = ovpn_gso_encrypt_segment(&ctx, peer, ks, skb, batch,
-					       offset, first_pktid + i);
+		if (src->parent) {
+			skb = NULL;
+			ret = ovpn_gso_encrypt_record(src, &ctx, peer, ks,
+						      batch, offset,
+						      first_pktid + i, &len);
+		} else {
+			skb = __skb_dequeue(src->skbs);
+			src->next++;
+			len = skb->len + OVPN_DATA_V2_OVERHEAD;
+			ret = ovpn_gso_encrypt_segment(&ctx, peer, ks, skb,
+						       batch, offset,
+						       first_pktid + i);
+		}
 		if (unlikely(ret < 0)) {
 			DEBUG_NET_WARN_ON_ONCE(ret == -EINPROGRESS ||
 					       ret == -EBUSY);
+			/* report the whole batch as not handled */
+			if (src->parent) {
+				src->next = batch_start;
+				break;
+			}
 			ovpn_dev_dstats_tx_dropped(peer->ovpn->dev, i + 1);
 			kfree_skb(skb);
 			break;
 		}
+
+		offset += len;
+		/* the caller releases the parent skb of TSO records */
+		if (src->parent)
+			continue;
 
 		/* pass on the TX timestamp request, which GSO segmentation
 		 * attached to the segment holding the timestamped byte
@@ -241,7 +358,17 @@ static bool ovpn_gso_encrypt_batch(struct ovpn_gso_source *src,
 			skb->sk = NULL;
 		}
 		consume_skb(skb);
-		offset += len;
+	}
+
+	/* once the last aggregate is built, the input's data lives in
+	 * aggregates which carry their own write charge, so release the
+	 * input's charge without waking TSQ before they are transmitted
+	 */
+	if (src->parent && batch->sk && i == segments &&
+	    src->next == src->segments) {
+		moved += src->parent->truesize;
+		src->parent->destructor = NULL;
+		src->parent->sk = NULL;
 	}
 
 	/* the aggregate's own charge keeps sk_wmem_alloc above zero */
@@ -263,6 +390,7 @@ err:
 
 static struct sk_buff *ovpn_gso_alloc(const struct sk_buff *first_segment,
 				      unsigned int batch_len,
+				      unsigned int record_len,
 				      unsigned int segments)
 {
 	struct sk_buff *gso_skb;
@@ -306,17 +434,16 @@ static struct sk_buff *ovpn_gso_alloc(const struct sk_buff *first_segment,
 #endif
 
 	skb_shinfo(gso_skb)->gso_type = SKB_GSO_UDP_L4;
-	skb_shinfo(gso_skb)->gso_size = first_segment->len +
-					OVPN_DATA_V2_OVERHEAD;
+	skb_shinfo(gso_skb)->gso_size = record_len + OVPN_DATA_V2_OVERHEAD;
 	skb_shinfo(gso_skb)->gso_segs = segments;
 
 	return gso_skb;
 }
 
-static void ovpn_gso_send_batch(struct ovpn_gso_source *src,
-				struct ovpn_peer *peer)
+static unsigned int ovpn_gso_send_batch(struct ovpn_gso_source *src,
+					struct ovpn_peer *peer)
 {
-	unsigned int max_segs, batch_len, batch_segs, batch_start;
+	unsigned int max_segs, batch_len, batch_segs, batch_start, remaining;
 	struct ovpn_crypto_key_slot *ks;
 	struct sk_buff *batch;
 
@@ -328,7 +455,14 @@ static void ovpn_gso_send_batch(struct ovpn_gso_source *src,
 	 * ordinary transmit path
 	 */
 	if (max_segs < 2)
-		return;
+		return 0;
+
+	/* A parent skb cannot leave one record for the ordinary path. If a
+	 * batch holds at most two records, an odd record count cannot be split
+	 * entirely into valid UDP GSO aggregates, so fall back.
+	 */
+	if (src->parent && max_segs == 2 && (src->segments & 1))
+		return 0;
 
 	/* An input GSO skb might produce more than max_segs records, so
 	 * consume as many as can fit in each aggregate. A final materialized
@@ -336,7 +470,11 @@ static void ovpn_gso_send_batch(struct ovpn_gso_source *src,
 	 */
 	while (src->segments - src->next > 1) {
 		batch_start = src->next;
-		batch_segs = min(src->segments - src->next, max_segs);
+		remaining = src->segments - src->next;
+		batch_segs = min(remaining, max_segs);
+		/* a parent skb cannot leave one record behind */
+		if (src->parent && remaining - batch_segs == 1)
+			batch_segs--;
 
 		/* acquire shared state before allocating/consuming anything */
 		ks = ovpn_encrypt_refs_get(peer);
@@ -358,13 +496,15 @@ static void ovpn_gso_send_batch(struct ovpn_gso_source *src,
 		if (batch_start + batch_segs == src->segments)
 			batch_len -= src->record_len - src->last_record_len;
 
-		batch = ovpn_gso_alloc(skb_peek(src->skbs), batch_len,
-				       batch_segs);
+		batch = ovpn_gso_alloc(src->parent ?: skb_peek(src->skbs),
+				       batch_len, src->record_len, batch_segs);
 		if (unlikely(!batch)) {
 			ovpn_crypto_key_slot_put(ks);
 			ovpn_peer_put(peer);
 			break;
 		}
+		if (src->parent && batch_start)
+			batch->ooo_okay = 0;
 
 		if (unlikely(!ovpn_gso_encrypt_batch(src, peer, ks, batch,
 						     batch_segs))) {
@@ -372,6 +512,8 @@ static void ovpn_gso_send_batch(struct ovpn_gso_source *src,
 			break;
 		}
 	}
+
+	return src->next;
 }
 
 /**
@@ -394,6 +536,103 @@ void ovpn_gso_send(struct sk_buff_head *skbs, struct ovpn_peer *peer)
 	};
 
 	ovpn_gso_send_batch(&src, peer);
+}
+
+/**
+ * ovpn_gso_send_tso - encrypt a TCP or UDP GSO skb without segmenting it
+ * @skb: GSO skb to send
+ * @peer: peer to send it to
+ *
+ * Builds each record from a range of @skb instead of materializing its
+ * segments. Only for peers which pass ovpn_gso_supported.
+ *
+ * Return: true if @skb was consumed along with the caller's reference to
+ * @peer, false if it was left for the ordinary segmenter
+ */
+bool ovpn_gso_send_tso(struct sk_buff *skb, struct ovpn_peer *peer)
+{
+	const netdev_features_t features = NETIF_F_TSO | NETIF_F_TSO6 |
+					   NETIF_F_TSO_MANGLEID |
+					   NETIF_F_GSO_ACCECN |
+					   NETIF_F_GSO_UDP_L4;
+	u8 proto = skb_is_gso_tcp(skb) ? IPPROTO_TCP : IPPROTO_UDP;
+	unsigned int hdr_len, payload_len, total_segs, handled;
+	unsigned int gso_size, last_payload_len, tx_bytes;
+	struct ovpn_gso_source src = {
+		.parent = skb,
+		.cursor.skb = skb,
+	};
+
+	if (!skb_gso_ok(skb, features))
+		return false;
+
+	/* the aggregates take over the parent's write charge, which requires
+	 * owning it alone
+	 */
+	if (unlikely(skb_shared(skb)))
+		return false;
+
+	/* let the protocol segmenter place a TX timestamp request on the
+	 * appropriate child before batching those materialized segments
+	 */
+	if (unlikely(skb_shinfo(skb)->tx_flags & SKBTX_ANY_TSTAMP))
+		return false;
+
+	/* tso_build_hdr does not account for IPv6 extension headers. On a
+	 * forwarded skb the transport header still points right behind the
+	 * IPv6 header even when extension headers follow it, so check the next
+	 * header too.
+	 */
+	if (skb->protocol == htons(ETH_P_IPV6) &&
+	    unlikely(ipv6_hdr(skb)->nexthdr != proto ||
+		     skb_network_header_len(skb) != sizeof(struct ipv6hdr)))
+		return false;
+
+	/* tso_start reads the TCP header from the linear area */
+	if (proto == IPPROTO_TCP &&
+	    unlikely(skb_headlen(skb) <
+		     skb_transport_offset(skb) + sizeof(struct tcphdr)))
+		return false;
+
+	/* tso_build_hdr copies the headers from the linear area */
+	hdr_len = tso_start(skb, &src.tso);
+	if (unlikely(skb_headlen(skb) < hdr_len))
+		return false;
+
+	gso_size = skb_shinfo(skb)->gso_size;
+	payload_len = skb->len - hdr_len;
+	total_segs = DIV_ROUND_UP(payload_len, gso_size);
+	if (unlikely(total_segs < 2))
+		return false;
+
+	last_payload_len = payload_len - (total_segs - 1) * gso_size;
+	src.segments = total_segs;
+	src.record_len = hdr_len + gso_size;
+	src.last_record_len = hdr_len + last_payload_len;
+	src.cursor.head_off = hdr_len;
+	src.hdr_len = hdr_len;
+
+	handled = ovpn_gso_send_batch(&src, peer);
+	/* if nothing was sent we can safely fall back to segmentation */
+	if (!handled)
+		return false;
+
+	tx_bytes = handled * src.record_len;
+	if (handled == total_segs)
+		tx_bytes -= src.record_len - src.last_record_len;
+	ovpn_peer_stats_add_tx(&peer->vpn_stats, tx_bytes, handled);
+	if (unlikely(handled < total_segs)) {
+		/* the remaining records cannot fall back to the segmenter
+		 * without resending those already transmitted
+		 */
+		ovpn_dev_dstats_tx_dropped(peer->ovpn->dev,
+					   total_segs - handled);
+		kfree_skb(skb);
+	} else {
+		consume_skb(skb);
+	}
+	ovpn_peer_put(peer);
+	return true;
 }
 
 /**

@@ -173,13 +173,17 @@ void ovpn_aead_encrypt_header(struct ovpn_peer *peer,
 
 int ovpn_aead_gso_ctx_init(struct ovpn_aead_gso_ctx *ctx,
 			   struct ovpn_crypto_key_slot *ks,
-			   struct sk_buff *gso_skb)
+			   struct sk_buff *gso_skb,
+			   unsigned int header_len)
 {
 	const unsigned int dst_nents = skb_shinfo(gso_skb)->nr_frags + 4;
 	unsigned int tmp_size;
 
 	tmp_size = ovpn_aead_crypto_tmp_size(ks->encrypt, dst_nents);
-	tmp_size += OVPN_AAD_SIZE;
+	/* the head buffer stages the start of a record: its AAD and, for a
+	 * TSO record, room for the tag and its synthesized headers
+	 */
+	tmp_size += OVPN_DATA_V2_OVERHEAD + header_len;
 	ctx->tmp = kmalloc(tmp_size, GFP_ATOMIC);
 	if (unlikely(!ctx->tmp))
 		return -ENOMEM;

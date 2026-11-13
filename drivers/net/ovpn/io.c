@@ -430,6 +430,8 @@ netdev_tx_t ovpn_net_xmit(struct sk_buff *skb, struct net_device *dev)
 	skb_dst_drop(skb);
 
 	gso_out = gso_out && ovpn_gso_supported(peer);
+	if (gso_out && ovpn_gso_send_tso(skb, peer))
+		return NETDEV_TX_OK;
 
 	if (gso_in) {
 		/* force software segmentation while allowing safe page-backed
