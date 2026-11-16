@@ -15,7 +15,13 @@ OVPN_ALG=${OVPN_ALG:-aes}
 OVPN_PROTO=${OVPN_PROTO:-UDP}
 OVPN_FLOAT=${OVPN_FLOAT:-0}
 OVPN_SYMMETRIC_ID=${OVPN_SYMMETRIC_ID:-0}
+OVPN_PARTIAL_CSUM=${OVPN_PARTIAL_CSUM:-0}
 OVPN_VERBOSE=${OVPN_VERBOSE:-0}
+
+OVPN_PARTIAL_CSUM_ARG=()
+if [[ "${OVPN_PARTIAL_CSUM}" == "1" ]]; then
+	OVPN_PARTIAL_CSUM_ARG=(partial-csum)
+fi
 
 export OVPN_ID_OFFSET=$(( 9 * (OVPN_SYMMETRIC_ID == 0) ))
 
@@ -225,7 +231,8 @@ ovpn_add_peer() {
 		if [ ${1} -eq 0 ]; then
 			ip netns exec "${server_ns}" ${OVPN_CLI} \
 				new_multi_peer tun0 1 ${M_ID} \
-				${OVPN_UDP_PEERS_FILE}
+				${OVPN_UDP_PEERS_FILE} \
+				"${OVPN_PARTIAL_CSUM_ARG[@]}"
 
 			for p in $(seq 1 ${OVPN_NUM_PEERS}); do
 				ip netns exec "${server_ns}" ${OVPN_CLI} \
@@ -250,7 +257,7 @@ ovpn_add_peer() {
 				${OVPN_UDP_PEERS_FILE})
 			ip netns exec "${peer_ns}" ${OVPN_CLI} new_peer \
 				tun${1} ${PEER_ID} ${TX_ID} ${LPORT} ${RADDR} \
-				${RPORT}
+				${RPORT} "${OVPN_PARTIAL_CSUM_ARG[@]}"
 			ip netns exec "${peer_ns}" ${OVPN_CLI} new_key tun${1} \
 				${PEER_ID} 1 0 ${OVPN_ALG} 1 data64.key
 		fi
@@ -258,7 +265,8 @@ ovpn_add_peer() {
 		if [ ${1} -eq 0 ]; then
 			OVPN_TCP_KEYS_LOG=$(mktemp)
 			(ip netns exec "${server_ns}" ${OVPN_CLI} listen tun0 \
-				1 ${M_ID} ${OVPN_TCP_PEERS_FILE} && {
+				1 ${M_ID} ${OVPN_TCP_PEERS_FILE} \
+				"${OVPN_PARTIAL_CSUM_ARG[@]}" && {
 				rc=0
 				for p in $(seq 1 ${OVPN_NUM_PEERS}); do
 					ip netns exec "${server_ns}" \
@@ -281,7 +289,8 @@ ovpn_add_peer() {
 				TX_ID=${1}
 			fi
 			ip netns exec "${peer_ns}" ${OVPN_CLI} connect tun${1} \
-				${PEER_ID} ${TX_ID} 10.10.${1}.1 1 data64.key
+				${PEER_ID} ${TX_ID} 10.10.${1}.1 1 data64.key \
+				"${OVPN_PARTIAL_CSUM_ARG[@]}"
 		fi
 	fi
 }

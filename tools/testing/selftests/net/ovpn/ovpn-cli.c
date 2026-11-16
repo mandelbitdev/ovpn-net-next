@@ -138,6 +138,7 @@ struct ovpn_ctx {
 
 	uint32_t mark;
 	bool asymm_id;
+	bool partial_csum;
 
 	const char *peers_file;
 };
@@ -724,6 +725,8 @@ static int ovpn_new_peer(struct ovpn_ctx *ovpn, bool is_tcp)
 	if (ovpn->asymm_id)
 		NLA_PUT_U32(ctx->nl_msg, OVPN_A_PEER_TX_ID, ovpn->tx_id);
 	NLA_PUT_U32(ctx->nl_msg, OVPN_A_PEER_SOCKET, ovpn->socket);
+	if (ovpn->partial_csum)
+		NLA_PUT_FLAG(ctx->nl_msg, OVPN_A_PEER_PARTIAL_CSUM);
 
 	if (!is_tcp) {
 		switch (ovpn->remote.in4.sin_family) {
@@ -835,6 +838,8 @@ static int ovpn_handle_peer(struct nl_msg *msg, void (*arg)__always_unused)
 	if (pattrs[OVPN_A_PEER_TX_ID])
 		fprintf(stderr, "\tTX peer ID %u\n",
 			nla_get_u32(pattrs[OVPN_A_PEER_TX_ID]));
+	if (pattrs[OVPN_A_PEER_PARTIAL_CSUM])
+		fprintf(stderr, "\tPartial checksums: enabled\n");
 
 	if (pattrs[OVPN_A_PEER_SOCKET_NETNSID])
 		fprintf(stderr, "\tsocket NetNS ID: %d\n",
@@ -1726,7 +1731,7 @@ static void usage(const char *cmd)
 	fprintf(stderr, "\tiface: ovpn interface name\n");
 
 	fprintf(stderr,
-		"* listen <iface> <lport> <id_type> <peers_file> [ipv6]: listen for incoming peer TCP connections\n");
+		"* listen <iface> <lport> <id_type> <peers_file> [ipv6] [partial-csum]: listen for incoming peer TCP connections\n");
 	fprintf(stderr, "\tiface: ovpn interface name\n");
 	fprintf(stderr, "\tlport: TCP port to listen to\n");
 	fprintf(stderr, "\tid_type:\n");
@@ -1741,7 +1746,7 @@ static void usage(const char *cmd)
 		"\tipv6: whether the socket should listen to the IPv6 wildcard address\n");
 
 	fprintf(stderr,
-		"* connect <iface> <peer_id> <tx_id> <raddr> <rport> [key_file]: start connecting peer of TCP-based VPN session\n");
+		"* connect <iface> <peer_id> <tx_id> <raddr> <rport> [key_file] [partial-csum]: start connecting peer of TCP-based VPN session\n");
 	fprintf(stderr, "\tiface: ovpn interface name\n");
 	fprintf(stderr,
 		"\tpeer_id: peer ID found in data packets received from this peer\n");
@@ -1753,7 +1758,7 @@ static void usage(const char *cmd)
 		"\tkey_file: file containing the symmetric key for encryption\n");
 
 	fprintf(stderr,
-		"* new_peer <iface> <peer_id> <tx_id> <lport> <raddr> <rport> [vpnaddr]: add new peer\n");
+		"* new_peer <iface> <peer_id> <tx_id> <lport> <raddr> <rport> [vpnaddr] [partial-csum]: add new peer\n");
 	fprintf(stderr, "\tiface: ovpn interface name\n");
 	fprintf(stderr,
 		"\tpeer_id: peer ID found in data packets received from this peer\n");
@@ -1765,7 +1770,7 @@ static void usage(const char *cmd)
 	fprintf(stderr, "\tvpnaddr: peer VPN IP\n");
 
 	fprintf(stderr,
-		"* new_multi_peer <iface> <lport> <id_type> <peers_file> [mark]: add multiple peers as listed in the file\n");
+		"* new_multi_peer <iface> <lport> <id_type> <peers_file> [mark] [partial-csum]: add multiple peers as listed in the file\n");
 	fprintf(stderr, "\tiface: ovpn interface name\n");
 	fprintf(stderr, "\tlport: local UDP port to bind to\n");
 	fprintf(stderr, "\tid_type:\n");
@@ -2076,6 +2081,7 @@ static int ovpn_run_cmd(struct ovpn_ctx *ovpn)
 			peer_ctx.ifindex = ovpn->ifindex;
 			peer_ctx.sa_family = ovpn->sa_family;
 			peer_ctx.asymm_id = ovpn->asymm_id;
+			peer_ctx.partial_csum = ovpn->partial_csum;
 
 			peer_ctx.socket = ovpn_accept(ovpn);
 			if (peer_ctx.socket < 0) {
@@ -2165,6 +2171,7 @@ static int ovpn_run_cmd(struct ovpn_ctx *ovpn)
 			peer_ctx.socket = ovpn->socket;
 			peer_ctx.sa_family = AF_UNSPEC;
 			peer_ctx.asymm_id = ovpn->asymm_id;
+			peer_ctx.partial_csum = ovpn->partial_csum;
 
 			ret = ovpn_parse_new_peer(&peer_ctx, peer_id, tx_id,
 						  raddr, rport, vpnip);
@@ -2265,6 +2272,10 @@ static int ovpn_parse_cmd_args(struct ovpn_ctx *ovpn, int argc, char *argv[])
 	case CMD_LISTEN:
 		if (argc < 6)
 			return -EINVAL;
+		if (!strcmp(argv[argc - 1], "partial-csum")) {
+			ovpn->partial_csum = true;
+			argc--;
+		}
 
 		ovpn->lport = strtoul(argv[3], NULL, 10);
 		if (errno == ERANGE || ovpn->lport > 65535) {
@@ -2290,6 +2301,10 @@ static int ovpn_parse_cmd_args(struct ovpn_ctx *ovpn, int argc, char *argv[])
 	case CMD_CONNECT:
 		if (argc < 7)
 			return -EINVAL;
+		if (!strcmp(argv[argc - 1], "partial-csum")) {
+			ovpn->partial_csum = true;
+			argc--;
+		}
 
 		ovpn->sa_family = AF_INET;
 		ovpn->asymm_id = strcmp(argv[4], "none");
@@ -2315,6 +2330,10 @@ static int ovpn_parse_cmd_args(struct ovpn_ctx *ovpn, int argc, char *argv[])
 	case CMD_NEW_PEER:
 		if (argc < 8)
 			return -EINVAL;
+		if (!strcmp(argv[argc - 1], "partial-csum")) {
+			ovpn->partial_csum = true;
+			argc--;
+		}
 
 		ovpn->asymm_id = strcmp(argv[4], "none");
 
@@ -2334,6 +2353,10 @@ static int ovpn_parse_cmd_args(struct ovpn_ctx *ovpn, int argc, char *argv[])
 	case CMD_NEW_MULTI_PEER:
 		if (argc < 6)
 			return -EINVAL;
+		if (!strcmp(argv[argc - 1], "partial-csum")) {
+			ovpn->partial_csum = true;
+			argc--;
+		}
 
 		ovpn->lport = strtoul(argv[3], NULL, 10);
 		if (errno == ERANGE || ovpn->lport > 65535) {

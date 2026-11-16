@@ -212,6 +212,42 @@ ovpn_run_iperf() {
 	ovpn_cmd_ok "run iperf throughput flow" \
 		ip netns exec ovpn_peer1 iperf3 -Z -t 3 -c 5.5.5.1
 	wait "${iperf_pid}" || return 1
+
+	if [ "${OVPN_PARTIAL_CSUM}" == "1" ]; then
+		ovpn_run_bg iperf_pid ip netns exec ovpn_peer0 iperf3 -1 -s
+		sleep 1
+		ovpn_cmd_ok "run UDP checksum-offload flow" \
+			ip netns exec ovpn_peer1 iperf3 -u -b 100M -t 1 \
+				-c 5.5.5.1
+		wait "${iperf_pid}" || return 1
+	fi
+}
+
+ovpn_setup_vxlan() {
+	local p="$1"
+	local peer_ns="ovpn_peer${p}"
+
+	ip -n "${peer_ns}" link add vx${p} type vxlan id 100 dstport 4789 \
+		local 5.5.5.$((p + 1)) remote 5.5.5.$((2 - p)) udpcsum
+	ip -n "${peer_ns}" addr add 6.6.6.$((p + 1))/24 dev vx${p}
+	ip -n "${peer_ns}" link set vx${p} mtu 1300 up
+}
+
+ovpn_run_partial_csum_encap() {
+	local iperf_pid
+
+	# VXLAN leaves the checksum of its encapsulated TCP partial behind a
+	# completed outer UDP checksum, which partial-csum cannot express
+	ovpn_cmd_ok "create VXLAN over peer0 tunnel" ovpn_setup_vxlan 0
+	ovpn_cmd_ok "create VXLAN over peer1 tunnel" ovpn_setup_vxlan 1
+
+	ovpn_run_bg iperf_pid ip netns exec ovpn_peer0 iperf3 -1 -s -B 6.6.6.1
+	sleep 1
+
+	ovpn_cmd_ok "run TCP over VXLAN over the tunnel" \
+		ip netns exec ovpn_peer1 iperf3 -t 2 --connect-timeout 3000 \
+			-c 6.6.6.1
+	wait "${iperf_pid}" || return 1
 }
 
 ovpn_run_key_rollover() {
@@ -236,6 +272,8 @@ ovpn_run_key_rollover() {
 }
 
 ovpn_run_queries() {
+	local output
+
 	ovpn_log "Querying all peers:"
 
 	ovpn_cmd_ok "query all peers from peer0" \
@@ -247,6 +285,12 @@ ovpn_run_queries() {
 
 	ovpn_cmd_ok "query peer 1 from peer0" \
 		ip netns exec ovpn_peer0 ${OVPN_CLI} get_peer tun0 1
+
+	if [ "${OVPN_PARTIAL_CSUM}" == "1" ]; then
+		output=$(ip netns exec ovpn_peer0 ${OVPN_CLI} get_peer tun0 1 \
+			2>&1)
+		grep -q "Partial checksums: enabled" <<<"${output}"
+	fi
 }
 
 ovpn_query_peer_missing() {
@@ -364,11 +408,10 @@ trap ovpn_test_exit EXIT
 trap ovpn_stage_err ERR
 
 ktap_print_header
-if [ "${OVPN_FLOAT}" == "1" ]; then
-	ktap_set_plan 14
-else
-	ktap_set_plan 13
-fi
+ovpn_plan=13
+[ "${OVPN_FLOAT}" == "1" ] && ovpn_plan=$((ovpn_plan + 1))
+[ "${OVPN_PARTIAL_CSUM}" == "1" ] && ovpn_plan=$((ovpn_plan + 1))
+ktap_set_plan "${ovpn_plan}"
 
 ovpn_cleanup
 modprobe -q ovpn || true
@@ -380,6 +423,9 @@ ovpn_run_stage "run LAN traffic behind peer1" ovpn_run_lan_traffic
 [ "${OVPN_FLOAT}" == "1" ] && ovpn_run_stage "run floating peer checks" \
 	ovpn_run_float_mode
 ovpn_run_stage "run iperf throughput" ovpn_run_iperf
+[ "${OVPN_PARTIAL_CSUM}" == "1" ] && ovpn_run_stage \
+	"run partial checksums of encapsulated packets" \
+	ovpn_run_partial_csum_encap
 ovpn_run_stage "run key rollout" ovpn_run_key_rollover
 ovpn_run_stage "query peers" ovpn_run_queries
 ovpn_run_stage "query missing peer fails" ovpn_query_peer_missing
