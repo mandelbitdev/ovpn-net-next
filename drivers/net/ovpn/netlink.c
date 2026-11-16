@@ -435,6 +435,7 @@ int ovpn_nl_peer_new_doit(struct sk_buff *skb, struct genl_info *info)
 				       peer_id, PTR_ERR(peer));
 		return PTR_ERR(peer);
 	}
+	peer->partial_csum = nla_get_flag(attrs[OVPN_A_PEER_PARTIAL_CSUM]);
 
 	/* lookup the fd in the kernel table and extract the socket object */
 	sockfd = nla_get_u32(attrs[OVPN_A_PEER_SOCKET]);
@@ -668,6 +669,8 @@ static int ovpn_nl_send_peer(struct sk_buff *skb, const struct genl_info *info,
 		goto err;
 
 	if (nla_put_u32(skb, OVPN_A_PEER_TX_ID, peer->tx_id))
+		goto err;
+	if (peer->partial_csum && nla_put_flag(skb, OVPN_A_PEER_PARTIAL_CSUM))
 		goto err;
 
 	if (peer->vpn_addrs.ipv4.s_addr != htonl(INADDR_ANY))

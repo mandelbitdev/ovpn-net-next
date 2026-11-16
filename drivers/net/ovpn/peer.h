@@ -34,6 +34,7 @@ struct ovpn_route_key {
  * @dev_tracker: reference tracker for associated dev
  * @id: unique identifier, used to match incoming packets
  * @tx_id: identifier to be used in TX packets
+ * @partial_csum: peer accepts and sends partial inner L4 checksums
  * @vpn_addrs: IP addresses assigned over the tunnel
  * @vpn_addrs.ipv4: IPv4 assigned to peer on the tunnel
  * @vpn_addrs.ipv6: IPv6 assigned to peer on the tunnel
@@ -79,6 +80,7 @@ struct ovpn_peer {
 	netdevice_tracker dev_tracker;
 	u32 id;
 	u32 tx_id;
+	bool partial_csum;
 	struct {
 		struct in_addr ipv4;
 		struct in6_addr ipv6;

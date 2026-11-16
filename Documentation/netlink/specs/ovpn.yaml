@@ -175,6 +175,15 @@ attribute-sets:
           will advertise the tx-id to be used on the link.
         checks:
           max: 0xFFFFFF
+      -
+        name: partial-csum
+        type: flag
+        doc: >-
+          Exchange partial inner TCP and UDP checksums with this peer. Each
+          endpoint may send an inner L4 checksum field holding only the
+          pseudo-header sum and rebuilds that field after authenticating a
+          received packet. Both endpoints must enable it: a peer without it
+          drops the partial checksums as corrupted.
   -
     name: peer-new-input
     subset-of: peer
@@ -205,6 +214,8 @@ attribute-sets:
         name: keepalive-timeout
       -
         name: tx-id
+      -
+        name: partial-csum
   -
     name: peer-set-input
     subset-of: peer

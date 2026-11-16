@@ -38,12 +38,13 @@
 
 static void ovpn_gso_build_hdr(struct sk_buff *skb, struct tso_t *tso,
 			       void *header, unsigned int payload_len,
-			       __wsum payload_csum, bool is_last)
+			       __wsum payload_csum, bool is_last,
+			       bool partial_csum)
 {
 	u8 *transport_header = (u8 *)header + skb_transport_offset(skb);
 	unsigned int l4_len = tso->tlen + payload_len;
+	__wsum csum = 0;
 	__sum16 *check;
-	__wsum csum;
 	u8 proto;
 
 	/* copy the parent's headers and set this record's IP length and ID,
@@ -61,8 +62,11 @@ static void ovpn_gso_build_hdr(struct sk_buff *skb, struct tso_t *tso,
 		check = &((struct udphdr *)transport_header)->check;
 		proto = IPPROTO_UDP;
 	}
-	*check = 0;
-	csum = csum_partial(transport_header, tso->tlen, payload_csum);
+
+	if (!partial_csum) {
+		*check = 0;
+		csum = csum_partial(transport_header, tso->tlen, payload_csum);
+	}
 
 	if (tso->ipv6) {
 		struct ipv6hdr *iph = header + skb_network_offset(skb);
@@ -77,8 +81,13 @@ static void ovpn_gso_build_hdr(struct sk_buff *skb, struct tso_t *tso,
 		/* IPv4 also checksums its own header */
 		ip_send_check(iph);
 	}
-	/* a zero UDP checksum would mean none */
-	if (proto == IPPROTO_UDP && !*check)
+
+	/* partial-csum peers expect the pseudo-header sum itself, while a zero
+	 * UDP checksum would mean none
+	 */
+	if (partial_csum)
+		*check = ~*check;
+	else if (proto == IPPROTO_UDP && !*check)
 		*check = CSUM_MANGLED_0;
 }
 
@@ -101,6 +110,7 @@ struct ovpn_gso_source {
 	struct tso_t tso;
 	struct ovpn_gso_cursor cursor;
 	unsigned int hdr_len;
+	bool partial_csum;
 };
 
 static bool ovpn_gso_copy_chunk(struct ovpn_gso_cursor *cur, u8 *to,
@@ -112,16 +122,20 @@ static bool ovpn_gso_copy_chunk(struct ovpn_gso_cursor *cur, u8 *to,
 	__wsum part;
 
 	/* Copy len bytes of the skb from the cursor position, first from the
-	 * linear area if the cursor has not left it yet. Each copy also sums
-	 * the copied bytes, and csum_block_add rotates that partial sum when
+	 * linear area if the cursor has not left it yet. When requested, also
+	 * sum the copied bytes; csum_block_add rotates that partial sum when
 	 * it starts at an odd byte position of the copied range.
 	 */
 	if (cur->head_off < head_len) {
 		unsigned int size = min(len, head_len - cur->head_off);
+		const u8 *from = skb->data + cur->head_off;
 
-		part = csum_partial_copy_nocheck(skb->data + cur->head_off,
-						 to, size);
-		*csum = csum_block_add(*csum, part, *pos);
+		if (csum) {
+			part = csum_partial_copy_nocheck(from, to, size);
+			*csum = csum_block_add(*csum, part, *pos);
+		} else {
+			memcpy(to, from, size);
+		}
 		cur->head_off += size;
 		*pos += size;
 		to += size;
@@ -143,9 +157,15 @@ static bool ovpn_gso_copy_chunk(struct ovpn_gso_cursor *cur, u8 *to,
 		skb_frag_foreach_page(frag, skb_frag_off(frag) + cur->frag_off,
 				      size, p, p_off, p_len, copied) {
 			vaddr = kmap_local_page(p);
-			part = csum_partial_copy_nocheck(vaddr + p_off,
-							 to + copied, p_len);
-			*csum = csum_block_add(*csum, part, *pos + copied);
+			if (csum) {
+				part = csum_partial_copy_nocheck(vaddr + p_off,
+								 to + copied,
+								 p_len);
+				*csum = csum_block_add(*csum, part,
+						       *pos + copied);
+			} else {
+				memcpy(to + copied, vaddr + p_off, p_len);
+			}
 			kunmap_local(vaddr);
 		}
 
@@ -170,12 +190,13 @@ static bool ovpn_gso_copy(struct ovpn_gso_cursor *cur, struct sk_buff *batch,
 	unsigned int pos = 0, i;
 
 	/* Copy len bytes of the skb at the cursor into the aggregate at offset
-	 * and return their checksum in csum. The aggregate's frags come from
-	 * ovpn_gso_alloc without __GFP_HIGHMEM, so each is directly mapped:
-	 * skip those before offset, then copy into each one in turn, carrying
-	 * the byte position for the checksum.
+	 * and, when csum is not NULL, return their checksum. The aggregate's
+	 * frags come from ovpn_gso_alloc without __GFP_HIGHMEM, so each is
+	 * directly mapped: skip those before offset, then copy into each one
+	 * in turn, carrying the byte position for the checksum.
 	 */
-	*csum = 0;
+	if (csum)
+		*csum = 0;
 	for (i = 0; len && i < skb_shinfo(batch)->nr_frags; i++) {
 		skb_frag_t *frag = &skb_shinfo(batch)->frags[i];
 		unsigned int size = skb_frag_size(frag), n;
@@ -200,13 +221,14 @@ static int ovpn_gso_encrypt_segment(struct ovpn_aead_gso_ctx *ctx,
 				    struct ovpn_peer *peer,
 				    struct ovpn_crypto_key_slot *ks,
 				    struct sk_buff *skb, struct sk_buff *batch,
-				    unsigned int offset, u32 pktid)
+				    unsigned int offset, u32 pktid,
+				    bool partial_csum)
 {
 	unsigned int data = offset + OVPN_DATA_V2_OVERHEAD;
 	struct ovpn_gso_cursor cur = { .skb = skb };
 	unsigned int start = 0;
+	__wsum csum = 0, *sum;
 	__sum16 check;
-	__wsum csum;
 	int ret;
 
 	/* Copy the segment behind the OpenVPN header and the tag. Its L4
@@ -214,13 +236,14 @@ static int ovpn_gso_encrypt_segment(struct ovpn_aead_gso_ctx *ctx,
 	 * of it, then the rest summing it on the way, and complete it in the
 	 * aggregate as skb_checksum_help would in the segment.
 	 */
-	if (skb->ip_summed == CHECKSUM_PARTIAL)
+	if (!partial_csum && skb->ip_summed == CHECKSUM_PARTIAL)
 		start = skb_checksum_start_offset(skb);
-	if (unlikely(!ovpn_gso_copy(&cur, batch, data, start, &csum) ||
+	sum = partial_csum ? NULL : &csum;
+	if (unlikely(!ovpn_gso_copy(&cur, batch, data, start, sum) ||
 		     !ovpn_gso_copy(&cur, batch, data + start, skb->len - start,
-				    &csum)))
+				    sum)))
 		return -EMSGSIZE;
-	if (skb->ip_summed == CHECKSUM_PARTIAL) {
+	if (!partial_csum && skb->ip_summed == CHECKSUM_PARTIAL) {
 		check = csum_fold(csum) ?: CSUM_MANGLED_0;
 		ret = skb_store_bits(batch, data + start + skb->csum_offset,
 				     &check, sizeof(check));
@@ -260,7 +283,8 @@ static int ovpn_gso_encrypt_record(struct ovpn_gso_source *src,
 	last = index + 1 == src->segments;
 	payload_len = (last ? src->last_record_len : src->record_len) - hdr_len;
 	if (unlikely(!ovpn_gso_copy(&src->cursor, batch, data + hdr_len,
-				    payload_len, &csum)))
+				    payload_len,
+				    src->partial_csum ? NULL : &csum)))
 		return -EMSGSIZE;
 
 	/* stage the start of the record as it is laid out in the aggregate:
@@ -269,7 +293,7 @@ static int ovpn_gso_encrypt_record(struct ovpn_gso_source *src,
 	 */
 	ovpn_gso_build_hdr(src->parent, &src->tso,
 			   record + OVPN_DATA_V2_OVERHEAD, payload_len, csum,
-			   last);
+			   last, src->partial_csum);
 	tso_advance_hdr(&src->tso, payload_len);
 	ovpn_aead_encrypt_header(peer, ks, pktid, ctx->iv, record);
 
@@ -318,7 +342,8 @@ static bool ovpn_gso_encrypt_batch(struct ovpn_gso_source *src,
 			len = skb->len + OVPN_DATA_V2_OVERHEAD;
 			ret = ovpn_gso_encrypt_segment(&ctx, peer, ks, skb,
 						       batch, offset,
-						       first_pktid + i);
+						       first_pktid + i,
+						       src->partial_csum);
 		}
 		if (unlikely(ret < 0)) {
 			DEBUG_NET_WARN_ON_ONCE(ret == -EINPROGRESS ||
@@ -520,18 +545,21 @@ static unsigned int ovpn_gso_send_batch(struct ovpn_gso_source *src,
  * ovpn_gso_send - encrypt materialized segments into UDP GSO aggregates
  * @skbs: segments of one GSO skb, all but the last of the same length
  * @peer: peer to send them to
+ * @partial_csum: leave partial inner L4 checksums for the receiver
  *
  * Consumes as many segments as fit into valid aggregates, each sent with its
  * own references to @peer and its key. Segments left in @skbs, if any, are
  * for the ordinary transmit path. Only for peers which pass
  * ovpn_gso_supported.
  */
-void ovpn_gso_send(struct sk_buff_head *skbs, struct ovpn_peer *peer)
+void ovpn_gso_send(struct sk_buff_head *skbs, struct ovpn_peer *peer,
+		   bool partial_csum)
 {
 	struct ovpn_gso_source src = {
 		.segments = skb_queue_len(skbs),
 		.record_len = skb_peek(skbs)->len,
 		.last_record_len = skb_peek_tail(skbs)->len,
+		.partial_csum = partial_csum,
 		.skbs = skbs,
 	};
 
@@ -542,6 +570,7 @@ void ovpn_gso_send(struct sk_buff_head *skbs, struct ovpn_peer *peer)
  * ovpn_gso_send_tso - encrypt a TCP or UDP GSO skb without segmenting it
  * @skb: GSO skb to send
  * @peer: peer to send it to
+ * @partial_csum: leave partial inner L4 checksums for the receiver
  *
  * Builds each record from a range of @skb instead of materializing its
  * segments. Only for peers which pass ovpn_gso_supported.
@@ -549,7 +578,8 @@ void ovpn_gso_send(struct sk_buff_head *skbs, struct ovpn_peer *peer)
  * Return: true if @skb was consumed along with the caller's reference to
  * @peer, false if it was left for the ordinary segmenter
  */
-bool ovpn_gso_send_tso(struct sk_buff *skb, struct ovpn_peer *peer)
+bool ovpn_gso_send_tso(struct sk_buff *skb, struct ovpn_peer *peer,
+		       bool partial_csum)
 {
 	const netdev_features_t features = NETIF_F_TSO | NETIF_F_TSO6 |
 					   NETIF_F_TSO_MANGLEID |
@@ -560,6 +590,7 @@ bool ovpn_gso_send_tso(struct sk_buff *skb, struct ovpn_peer *peer)
 	unsigned int gso_size, last_payload_len, tx_bytes;
 	struct ovpn_gso_source src = {
 		.parent = skb,
+		.partial_csum = partial_csum,
 		.cursor.skb = skb,
 	};
 
